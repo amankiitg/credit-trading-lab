@@ -12,6 +12,13 @@ from pathlib import Path
 import pandas as pd
 
 from signals.features import compute_returns, compute_spreads, compute_vol
+from signals.flags import (
+    DEFAULT_FLAG_WINDOW,
+    FLAG_NAMES,
+    RV_STUB_COLUMNS,
+    compute_flags,
+    rv_stubs,
+)
 from signals.zscore import compute_zscores
 
 RAW_DIR: Path = Path("data/raw")
@@ -58,6 +65,16 @@ def build(
         feats[c] = zs[c]
     print(f"  [features] +zscores: {len(feats.columns)} cols")
 
+    flags = compute_flags(feats, SPREADS, window=DEFAULT_FLAG_WINDOW)
+    for c in flags.columns:
+        feats[c] = flags[c]
+    print(f"  [features] +flags: {len(feats.columns)} cols")
+
+    stubs = rv_stubs(feats.index)
+    for c in stubs.columns:
+        feats[c] = stubs[c]
+    print(f"  [features] +rv_stubs: {len(feats.columns)} cols")
+
     ordered: list[str] = []
     for t in TICKERS:
         ordered.append(f"{t}_adj_close")
@@ -68,6 +85,10 @@ def build(
     for s in SPREADS:
         for w in Z_WINDOWS:
             ordered.append(f"{s}_z{w}")
+    for s in SPREADS:
+        for f in FLAG_NAMES:
+            ordered.append(f"{s}_{f}")
+    ordered += list(RV_STUB_COLUMNS)
     feats = feats[ordered]
 
     out_path.parent.mkdir(parents=True, exist_ok=True)

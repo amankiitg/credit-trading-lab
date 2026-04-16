@@ -116,3 +116,40 @@ with a validation task. Leakage check and baseline sanity are explicit tasks.
     `sprints/v1/plots/*` referenced inline.
   - Validation: fails if the notebook errors on re-run, if any plot is
     missing axes/title/legend, or if the pass/fail cell is missing.
+
+---
+
+## Amendment — added after initial v1 close
+
+- [x] **Task 11: Signal-state flags (`signals/flags.py`)**
+  - Acceptance: `compute_flags(df, spreads, window=63, thresholds)`
+    returns a bool-dtype frame with 12 columns
+    (`{spread}_{entry_long,entry_short,exit,stop}`) derived from the
+    `{spread}_z63` series; default thresholds
+    `entry=2.0, exit=0.5, stop=4.0`; NaN z-scores produce `False`,
+    never NaN; invalid thresholds (`exit ≥ entry` or `stop ≤ entry`)
+    raise `ValueError`.
+  - Files: `signals/flags.py`.
+  - Validation: `test_flag_threshold_semantics`,
+    `test_flags_handle_nan_z_score`,
+    `test_flag_thresholds_reject_bad_config` all pass.
+
+- [x] **Task 12: RV signal stubs**
+  - Acceptance: `rv_stubs(index)` returns a float64 frame with
+    `rv_pair_score`, `rv_rank_score`, `rv_composite`, all NaN; these
+    appear in `features.parquet` in the documented schema position;
+    `test_rv_stubs_are_all_nan` passes.
+  - Files: `signals/flags.py`, `signals/pipeline.py`.
+  - Validation: fails if any stub column is missing, non-float64, or
+    contains a non-NaN value in v1.
+
+- [x] **Task 13: Re-validate (schema + NaN audit)**
+  - Acceptance: `features.parquet` has shape `(N, 49)`; schema test
+    covers numeric-vs-bool dtype discipline; NaN audit passes for all
+    non-stub, non-flag columns post-warmup; flag columns are NaN-free
+    across the entire frame including warmup; full test suite is
+    **16/16 green**; flag-firing rates printed and within sane
+    bounds (< 25% of rows per flag).
+  - Files: `tests/test_signals.py`, `signals/pipeline.py`.
+  - Validation: fails if any flag fires on > 25% of rows (threshold
+    too loose) or on 0% of rows (threshold too tight / bug).

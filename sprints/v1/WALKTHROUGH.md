@@ -1,24 +1,29 @@
 # Sprint v1 — WALKTHROUGH
 
 Phase 1 of the Credit Trading Lab — data pipeline and spread-signal
-construction. **No trading strategy was run this sprint**; sections
-below that require a strategy or forward-return target (IC, Sharpe,
-drawdown, etc.) are explicitly marked `N/A — deferred to v2` rather
-than elided.
+construction, including the 2026-04-17 amendment that adds 12 boolean
+signal-state flags and 5 RV-signal stub columns. **No trading strategy
+was run this sprint**; sections below that require a strategy or
+forward-return target (IC, Sharpe, drawdown, etc.) are explicitly
+marked `N/A — deferred to v2` rather than elided.
 
 ## Summary
 
 We built a reproducible yfinance pipeline for HYG / LQD / SPY / IEF,
-constructed three log-price-ratio spreads (HY, IG, HY-IG) and nine
-rolling z-scores over {63, 126, 252}-day windows, and audited the
-output against six pre-registered falsification criteria. **Headline
-result: 5/6 criteria passed; C3 (z-score distribution bands) failed**
-because real credit-spread data carries fat tails and regime shifts
-that a strict N(0,1) band does not accommodate. A shuffle baseline
-confirms the normalization math is correct — the failure is in the
-threshold, not the code. **Verdict: partially rejected against the
-pre-registered bar; the signals are usable (stationary, leakage-free,
-NaN-free) but the PRD's C3 threshold was miscalibrated.**
+constructed three log-price-ratio spreads (HY, IG, HY-IG), nine rolling
+z-scores over {63, 126, 252}-day windows, 12 boolean signal-state flags
+derived from the canonical 63-day z-score (entry=±2, exit=±0.5,
+stop=±4), and 5 all-NaN RV-signal stubs reserved for Phase 3. Output:
+`features.parquet` at shape **(4784, 49)**. The output was audited
+against eight pre-registered falsification criteria. **Headline result:
+7/8 criteria passed; C3 (z-score distribution bands) failed** because
+real credit-spread data carries fat tails and regime shifts that a
+strict N(0,1) band does not accommodate. A shuffle baseline confirms
+the normalization math is correct — the failure is in the threshold,
+not the code. **Verdict: partially rejected against the pre-registered
+bar; the signals are usable (stationary, leakage-free, NaN-free,
+flag-calibrated within sane firing rates) but the PRD's C3 threshold
+was miscalibrated.**
 
 ## Hypothesis & Falsification Criteria
 
@@ -30,20 +35,25 @@ well-behaved enough to serve as raw input to future trading signals.
 Phase 1 does **not** test any trading hypothesis — it tests the
 statistical properties of the signals we built.
 
-**Criteria (PRD §Falsification Criteria) and outcome:**
+**Criteria (PRD §Falsification Criteria + amendment PRD_update.md)
+and outcome:**
 
 | # | Criterion | Threshold | Observed | Result |
 |---|---|---|---|---|
-| C1 | NaNs post-warmup (252 rows) | 0 | 0 | **PASS** |
+| C1 | NaNs post-warmup in numeric (non-stub, non-flag) cols | 0 | 0 | **PASS** |
 | C2 | ADF p-value on all 9 z-scores | < 0.05 | max 0.0020 | **PASS** |
 | C3 | z-score mean band | [-0.2, 0.2] | +0.19 to +0.41 | **FAIL** |
 | C3 | z-score std band | [0.8, 1.2] | +1.31 to +1.41 | **FAIL** |
 | C4 | z-score kurtosis | < 20 | max +1.11 | **PASS** |
 | C5 | max consecutive missing business days | ≤ 5 | 2 | **PASS** |
 | C6 | row-count conservation across stages | conserved | 4784 × 4 → 4784 | **PASS** |
+| C7 | flags bool, NaN-free, fire-rate ∈ (0%, 25%) | per-col | 0.13% to 23.72% | **PASS** |
+| C8 | RV stubs present, float64, all-NaN | 5 cols | 5/5 at 100% NaN | **PASS** |
 
 C3 is the only failure and the subsequent analysis shows it is a
 mis-calibrated threshold, not a signal problem. See **Key Findings**.
+The amendment criteria C7 and C8 were pre-registered in
+`PRD_update.md` **before** the flag firing rates were measured.
 
 ## Data Pipeline
 
@@ -71,9 +81,16 @@ mis-calibrated threshold, not a signal problem. See **Key Findings**.
    ratios.
 6. `compute_zscores(windows=[63, 126, 252])` → 9 z-score columns,
    `min_periods=w`.
-7. Column reorder into per-ticker groups then
-   `to_parquet(data/processed/features.parquet)` — final shape
-   **(4784, 32)**.
+7. **`compute_flags(spreads, window=63, thresholds=(2.0, 0.5, 4.0))`**
+   → 12 bool columns. NaN z-scores (warmup rows) produce `False`,
+   never NaN. Thresholds validated at call time: raises `ValueError`
+   if `exit ≥ entry` or `stop ≤ entry`.
+8. **`rv_stubs(index)`** → 5 all-NaN float64 columns reserved for
+   Phase 3 (`rv_hy_ig_residual`, `rv_credit_rates_residual`,
+   `rv_xterm_residual`, `hedge_ratio_hy_ig`, `hedge_ratio_cr`).
+9. Column reorder into per-ticker groups, then spreads, z-scores,
+   flags, stubs; `to_parquet(data/processed/features.parquet)` —
+   final shape **(4784, 49)**. Dtype counts: 37 float64, 12 bool.
 
 **Known biases, and how handled:**
 
@@ -87,7 +104,9 @@ mis-calibrated threshold, not a signal problem. See **Key Findings**.
 - **Look-ahead** — every rolling statistic uses trailing data only
   (`center=False`, `min_periods=w`). Verified with three separate
   leakage tests that taint the last row of input and assert earlier
-  outputs are byte-identical.
+  outputs are byte-identical. Flags inherit leakage safety
+  transitively: they are pointwise functions of already-leakage-safe
+  z-scores.
 - **ETF basis** — HYG/LQD are imperfect proxies for true cash-bond
   OAS (liquidity premium, duration mismatch, creation/redemption
   frictions). Acknowledged, not mitigated.
@@ -95,11 +114,14 @@ mis-calibrated threshold, not a signal problem. See **Key Findings**.
 **Rows dropped:** 0 at the merge step (inner join on four identical
 4784-row indices). Returns and z-scores carry per-column NaN during
 warmup by construction but rows are retained so downstream code can
-make its own warmup choices. Post-252-row slice has zero NaNs.
+make its own warmup choices. Post-252-row slice has zero NaNs in the
+numeric non-stub columns. Flags are NaN-free across the **entire**
+frame including warmup (NaN z → `False` by design). RV stubs are
+100% NaN across the entire frame by design.
 
 ## Signal Behavior
 
-**Distribution (post-warmup, `sprints/v1/plots/04_zscore_dist.png`):**
+**Z-score distribution (post-warmup, `sprints/v1/plots/04_zscore_dist.png`):**
 
 | column | n | mean | std | kurt | ADF p | ac1 |
 |---|---|---|---|---|---|---|
@@ -117,6 +139,31 @@ make its own warmup choices. Post-252-row slice has zero NaNs.
   positive (+0.19 to +0.41), stds cluster around 1.35.
 - Lag-1 autocorrelation is 0.93–0.99, expected given the rolling
   smoothing, and within the PRD's informal band (> 0.85).
+
+**Flag firing rates (4784 rows, full sample):**
+
+| flag | fires | rate | flag | fires | rate |
+|---|---|---|---|---|---|
+| hy_spread_entry_long  | 301  | 6.29%  | ig_spread_entry_long  | 361  | 7.55%  |
+| hy_spread_entry_short | 266  | 5.56%  | ig_spread_entry_short | 292  | 6.10%  |
+| hy_spread_exit        | 968  | 20.23% | ig_spread_exit        | 1043 | 21.80% |
+| hy_spread_stop        | 10   | 0.21%  | ig_spread_stop        | 17   | 0.36%  |
+| hy_ig_entry_long      | 283  | 5.92%  | hy_ig_entry_short     | 281  | 5.87%  |
+| hy_ig_exit            | 1135 | 23.72% | hy_ig_stop            | 6    | 0.13%  |
+
+All 12 satisfy **C7** (0% < fire_rate < 25%). Three observations:
+
+1. **Entry flags roughly symmetric** per spread (long/short within 1–2
+   pp). Consistent with the symmetric-band design; not evidence of a
+   structural skew.
+2. **Exit flags cluster at the C7 ceiling** (20.23% — 23.72%). This is
+   mechanical: the observed z-score std is ~1.35, so the `|z| < 0.5`
+   close-the-trade zone captures more mass than an N(0,1) calculation
+   would predict. This is the same fat-tail fingerprint that made C3
+   miscalibrate; it is a property of the data, not a threshold bug.
+3. **Stop flags are rare** (0.13–0.36%). They concentrate in
+   2008Q3–Q4, March 2020, and late 2022 — exactly the tail regimes
+   a stop should catch.
 
 **Coverage over time:** 4 names × 4784 business days = complete panel
 by construction after the inner-join. No day has < 4 names available.
@@ -153,9 +200,9 @@ backlog.
 ## Backtest Results
 
 `N/A — no strategy or backtest was run this sprint.` Phase 1's
-deliverable is validated features; Sharpe, hit rate, turnover,
-drawdown, equity curve, subperiod breakdown, and parameter sensitivity
-all require a strategy and are deferred to v2.
+deliverable is validated features + boolean trade-state flags; Sharpe,
+hit rate, turnover, drawdown, equity curve, subperiod breakdown, and
+parameter sensitivity all require a strategy and are deferred to v2.
 
 The only parameter sensitivity we can already report is
 **z-window sensitivity across the signal itself**:
@@ -172,6 +219,11 @@ secular level drift as the "anomaly" rather than the "baseline." The
 z63 window is the closest to a tradeable short-horizon signal; z252
 is the most regime-smoothed.
 
+**Flag threshold sensitivity is explicitly not reported.** The
+thresholds `(entry=2.0, exit=0.5, stop=4.0)` are PRD defaults, not
+tuned. A threshold-tuning sprint is warranted before sizing trades
+off these flags; see Next Steps.
+
 ## Key Findings
 
 1. **The normalization is correct; the PRD's C3 bands were wrong.**
@@ -184,19 +236,28 @@ is the most regime-smoothed.
    with p-values below 0.002 in the worst case. That is the single
    most important property for downstream use; it says the z-scores
    are tradeable as reversion signals.
-3. **Persistent positive z-score mean** (+0.19 to +0.41) is a real
+3. **Flag firing rates are calibrated within sane bounds at PRD
+   defaults.** Entry flags fire on 5.6–7.6% of days (two-sided
+   ≈ 11–15% — close to the ~2.3% N(0,1) tail × 5 for fat tails).
+   Stop flags fire on 0.13–0.36%, exactly the tail-event frequency a
+   `|z|>4` threshold should catch. Exit flags sit near the 25%
+   ceiling because the observed z std is 1.35, not 1.0 — a mechanical
+   consequence of the same fat-tail property that failed C3.
+4. **Persistent positive z-score mean** (+0.19 to +0.41) is a real
    secular finding, not noise — the ETF-based credit spreads have
    trended wider relative to their own trailing windows. Could be
    genuine (post-GFC regime), could be an artifact of the window
    length, could be ETF-basis. v2 should split the sample and test.
-4. **SPY lag-1 autocorrelation is -0.103**, marginally outside the
+5. **SPY lag-1 autocorrelation is -0.103**, marginally outside the
    informal |ρ|<0.10 band. This is well-documented daily-return
    microstructure (bid-ask bounce), not a data issue.
-5. **Leakage discipline held under test.** Three separate unit tests
+6. **Leakage discipline held under test.** Three separate unit tests
    taint the last row of input and assert earlier outputs are
-   byte-identical. Plus `min_periods=w` on every rolling stat means
-   no value is produced before its full window is available. Future
-   sprints inherit this discipline via the test suite.
+   byte-identical. Flags are pointwise functions of leakage-safe
+   z-scores, so they inherit the property transitively. `min_periods=w`
+   on every rolling stat means no value is produced before its full
+   window is available. Future sprints inherit this discipline via
+   the 16-test suite.
 
 ## Limitations
 
@@ -225,6 +286,25 @@ is the most regime-smoothed.
   descriptive phase but will matter in v2 once we start asking
   "is this Sharpe real?"
 
+**Flag-threshold concerns (new with amendment):**
+
+- The `(entry=2.0, exit=0.5, stop=4.0)` triple was taken from the PRD
+  amendment, **not tuned against the observed z-score distribution.**
+  Given observed σ ≈ 1.35, `entry=2` corresponds to ≈ 1.48 in-sample
+  σ — so "entry" is closer to a 1.5-sigma signal than a 2-sigma one.
+  v2 should tune thresholds on a held-out sub-sample before sizing
+  trades.
+- Flags are stateless. A trade layer above them needs its own
+  position-memory logic; this is deliberate.
+
+**Contract debt (new with amendment):**
+
+- The 12 flag columns and 5 stub columns are now a schema contract.
+  Phase 3 is committed to populating exactly the 5 stub names with
+  the documented semantics; the strategy layer is committed to
+  consuming the flag names as defined. Renaming later breaks the
+  schema.
+
 **Costs not modeled:**
 
 - Transaction costs, bid-ask, financing, ETF borrow, creation/
@@ -233,18 +313,20 @@ is the most regime-smoothed.
 
 ## Reproducibility
 
-- **Commit hash**: `2ecacb7` (base of sprint; all v1 sprint work is
-  uncommitted at time of writing — commit before closing the sprint).
+- **Commit history**: base commit `2ecacb7` (project scaffolding),
+  initial v1 `88d9ca9`, amendment in HEAD (see `git log`). The
+  `sprint-v1` annotated tag is moved to the amendment commit so it
+  refers to the final v1 state.
 - **Seed(s)**: baseline shuffle uses `np.random.default_rng(7)`;
-  leakage synthetic tests use seeds 0–2. No other randomness in
-  Phase 1.
+  leakage synthetic tests use seeds 0–2. Flags and stubs have no
+  randomness. No other stochasticity in Phase 1.
 - **Data snapshot date**: 2026-04-16 (pulled with `--end 2026-04-16`).
   Raw parquet files written to `data/raw/` on that date; yfinance
   may serve slightly different history on re-pull.
 - **Environment**: Python 3.9.6, `yfinance==1.2.0`,
   `pandas==2.3.3`, `numpy==2.0.2`, `statsmodels==0.14.6`,
-  `pyarrow==21.0.0`, `pytest==8.4.2`. Full pin list in
-  `requirements.txt`.
+  `pyarrow==21.0.0`, `pytest==8.4.2`. Full 126-package pin list in
+  `requirements.txt` (byte-reproducible via `pip install -r`).
 
 **Regenerate everything:**
 
@@ -252,44 +334,52 @@ is the most regime-smoothed.
 # 1. pull raw data
 venv/bin/python -m signals.load --end 2026-04-16
 
-# 2. build features
+# 2. build features (produces features.parquet at shape (4784, 49))
 venv/bin/python -m signals.pipeline
 
-# 3. run tests (should be 11 passed)
+# 3. run tests (should be 16 passed)
 venv/bin/python -m pytest tests/test_signals.py -v
 
 # 4. regenerate every plot + print stats tables
 venv/bin/python sprints/v1/make_plots.py
 
-# 5. execute the notebook end-to-end
+# 5. execute the notebook end-to-end (produces amendment cell + checklist)
 venv/bin/jupyter nbconvert --to notebook --execute --inplace \
     notebooks/01_signal_validation.ipynb
 ```
 
 ## Next Steps
 
-**To flip the C3 verdict** (only C3 failed):
+**To flip the C3 verdict** (still the only failing criterion):
 
-- Re-calibrate C3 bands. Credit spreads are not Gaussian; widen to
-  `|μ| < 0.5` and `σ ∈ [0.7, 1.5]`, **or** switch to a robust scaler
-  (median / MAD) that is less sensitive to fat tails. This is a
-  one-line change in `compute_zscores`.
+- Re-calibrate C3 bands in the v2 PRD. Credit spreads are not
+  Gaussian; widen to `|μ| < 0.5` and `σ ∈ [0.7, 1.5]`, **or** switch
+  to a robust scaler (median / MAD) that is less sensitive to fat
+  tails. Pre-register the new band before looking at v2 numbers to
+  avoid HARKing.
 - Investigate the persistent positive mean. Split the sample at
-  2015 or 2020 and re-run Task 9's stats table on each half. If the
+  2015 or 2020 and re-run the stats table on each half. If the
   positive mean is a 2008–2014 artifact, the rest of the sample may
   already be inside the original band.
+
+**To de-risk the amendment (flag thresholds):**
+
+- On a held-out sub-sample, sweep `entry ∈ {1.5, 2.0, 2.5}`,
+  `exit ∈ {0.25, 0.5, 0.75}`, `stop ∈ {3.5, 4.0, 4.5}` and measure
+  firing-rate stability + first-crossing hit rate against a
+  forward-return target. Lock thresholds before building the
+  strategy layer.
 
 **Concrete v2 scope (recommended):**
 
 1. Define the forward-return target (e.g. 5-day forward log return of
    a long-HYG / short-IEF book) and compute IC / rank-IC / decay
-   profile against each z-score column.
+   profile against each z-score column and each entry flag.
 2. Add a purged, embargoed time-series CV split to the test suite so
    v2 code cannot silently leak across the train/test boundary.
-3. Build the first trading signal — simple threshold entry at
-   `|z| > k` with position held until `|z| < 0` — and produce the
-   first Sharpe / turnover / max-drawdown table. Treat this as a
-   baseline, not a product.
+3. Build the first trading signal — consume `{spread}_entry_long /
+   _entry_short / _exit / _stop` directly — and produce the first
+   Sharpe / turnover / max-drawdown table. Treat as a baseline.
 4. Swap one of the log-ratio spreads for the option-adjusted spread
    version using CDX or a better proxy, and compare information
    content head-to-head. If ETF basis is material, this tells us

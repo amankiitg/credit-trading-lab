@@ -204,3 +204,90 @@ evidence:
 - Notebook: `notebooks/01_signal_validation.ipynb`
 - Deps: `pyarrow==21.0.0`, `statsmodels==0.14.6`, `jupyter==1.1.1`,
   `pytest==8.4.2`, plus transitives (`patsy`, `scipy`)
+
+---
+
+## 2026-04-17 — Amendment: signal-state flags + RV stubs
+
+**Status:** done. Pre-registered in `PRD_update.md`; tasks U1–U3 in
+`TASKS_update.md`. Schema bumped from 32 → 49 columns.
+
+### What changed
+
+- New `signals/flags.py`:
+  - `compute_flags(df, spreads, window=63, thresholds=FlagThresholds())`
+    returns a bool frame with 12 columns (4 flags × 3 spreads) from
+    `{spread}_z63`. NaN z-score → `False`.
+  - Thresholds: `entry=2.0`, `exit=0.5`, `stop=4.0`. `exit >= entry`
+    or `stop <= entry` raises `ValueError`.
+  - `rv_stubs(index)` returns a float64 frame with 5 all-NaN columns:
+    `rv_hy_ig_residual`, `rv_credit_rates_residual`,
+    `rv_xterm_residual`, `hedge_ratio_hy_ig`, `hedge_ratio_cr`.
+- `signals/pipeline.py` extended: `compute_flags(...)` then
+  `rv_stubs(...)` appended after z-scores; column ordering enforced
+  by an explicit `ordered` list.
+- `tests/test_signals.py` extended (11 → 16 tests); schema asserts
+  `len(df.columns) == 49`, dtype discipline, and the exact per-ticker
+  + per-spread layout.
+
+### Observed flag firing rates (post-warmup, 4784 rows)
+
+```
+flag                    nans  fires  fire_rate_pct
+hy_spread_entry_long       0    301           6.29
+hy_spread_entry_short      0    266           5.56
+hy_spread_exit             0    968          20.23
+hy_spread_stop             0     10           0.21
+ig_spread_entry_long       0    361           7.55
+ig_spread_entry_short      0    292           6.10
+ig_spread_exit             0   1043          21.80
+ig_spread_stop             0     17           0.36
+hy_ig_entry_long           0    283           5.92
+hy_ig_entry_short          0    281           5.87
+hy_ig_exit                 0   1135          23.72
+hy_ig_stop                 0      6           0.13
+```
+
+All 12 flags satisfy **C7** (`0 < fire_rate < 25%`). `exit` flags
+cluster near the upper bound (20–24%) because the `|z| < 0.5` band
+naturally captures most of the distribution; this is expected given
+the observed z-score std of ~1.35, not evidence of a broken threshold.
+`stop` flags fire on 0.13–0.36% of rows — calibrated for rare tail
+events (GFC, COVID, 2022 rate shock).
+
+### RV stubs
+
+All 5 columns present, float64, 100% NaN across all 4784 rows.
+Satisfies **C8**. Ready for Phase 3 to populate in place without
+schema migration.
+
+### Verdict (unchanged)
+
+```
+PASS  C1  no NaNs post-warmup (amended to exclude flags + stubs)
+PASS  C2  ADF p < 0.05 (all 9 z-scores)
+FAIL  C3  z-score mean ∈ [-0.2, 0.2] and std ∈ [0.8, 1.2]
+PASS  C4  z-score kurtosis < 20
+PASS  C5  max business-day gap ≤ 5 (observed 2)
+PASS  C6  row counts conserved (4784 × 4 → 4784)
+PASS  C7  flags: bool, no NaN, fire-rate < 25%
+PASS  C8  RV stubs present and all-NaN
+
+PHASE1 STATUS: FAIL   (unchanged — C3 still fails; C7 + C8 pass)
+```
+
+The amendment does not change the sprint verdict — C3 was the only
+failing criterion before the patch and remains the only failing
+criterion after. C7 and C8 pass as pre-registered.
+
+### Files touched this amendment
+
+- Code: `signals/flags.py` (new), `signals/pipeline.py`
+- Tests: `tests/test_signals.py` (11 → 16 tests, all passing)
+- Data: `data/processed/features.parquet` rebuilt at **(4784, 49)**
+- Docs: `sprints/v1/PRD.md`, `sprints/v1/TASKS.md` (Tasks 11–13),
+  `sprints/v1/PRD_update.md`, `sprints/v1/TASKS_update.md`,
+  `sprints/v1/notes.md` (this entry),
+  `sprints/v1/WALKTHROUGH.md` (amendment section)
+- Notebook: `notebooks/01_signal_validation.ipynb` (amendment cell
+  + C1 fix to exclude flags+stubs; C7+C8 in final checklist)

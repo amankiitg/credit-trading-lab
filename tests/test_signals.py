@@ -9,11 +9,13 @@ import pandas as pd
 import pytest
 
 from signals.features import compute_returns, compute_spreads, compute_vol
+from signals.flags import FLAG_NAMES, RV_STUB_COLUMNS, FlagThresholds, compute_flags
 from signals.zscore import compute_zscores
 
 RAW_DIR = Path("data/raw")
 PROCESSED_PATH = Path("data/processed/features.parquet")
 TICKERS = ["HYG", "LQD", "SPY", "IEF"]
+SPREADS = ["hy_spread", "ig_spread", "hy_ig"]
 RAW_COLUMNS = ["open", "high", "low", "close", "adj_close", "volume"]
 WARMUP = 252
 
@@ -57,24 +59,105 @@ def test_features_schema() -> None:
         expected.append(f"{t}_log_ret")
         for w in (21, 63, 126):
             expected.append(f"{t}_vol_{w}")
-    expected += ["hy_spread", "ig_spread", "hy_ig"]
-    for s in ("hy_spread", "ig_spread", "hy_ig"):
+    expected += list(SPREADS)
+    for s in SPREADS:
         for w in (63, 126, 252):
             expected.append(f"{s}_z{w}")
+    flag_cols: list[str] = []
+    for s in SPREADS:
+        for f in FLAG_NAMES:
+            flag_cols.append(f"{s}_{f}")
+    expected += flag_cols
+    expected += list(RV_STUB_COLUMNS)
     assert list(df.columns) == expected, (
         f"schema drift: missing={set(expected) - set(df.columns)} "
         f"extra={set(df.columns) - set(expected)}"
     )
-    assert len(df.columns) == 32
+    assert len(df.columns) == 49  # 32 original + 12 flags + 5 RV stubs
+
+    # Dtype discipline: numeric cols float64, flag cols bool
     for c in df.columns:
-        assert df[c].dtype == np.float64, f"{c}: {df[c].dtype}"
+        if c in flag_cols:
+            assert df[c].dtype == np.bool_, f"{c}: expected bool, got {df[c].dtype}"
+        else:
+            assert df[c].dtype == np.float64, f"{c}: {df[c].dtype}"
 
 
 def test_features_no_nan_post_warmup() -> None:
+    """Non-stub, non-flag numeric columns must have no NaN after warmup."""
     df = _features()
     post = df.iloc[WARMUP:]
-    nan_counts = post.isna().sum()
+    flag_cols = [f"{s}_{f}" for s in SPREADS for f in FLAG_NAMES]
+    stub_cols = list(RV_STUB_COLUMNS)
+    numeric = post.drop(columns=flag_cols + stub_cols)
+    nan_counts = numeric.isna().sum()
     assert (nan_counts == 0).all(), f"NaNs after warmup: {nan_counts[nan_counts > 0].to_dict()}"
+
+
+def test_flags_no_nan_and_bool_dtype() -> None:
+    """Flags must be bool and non-NaN across the *entire* frame (warmup included)."""
+    df = _features()
+    for s in SPREADS:
+        for f in FLAG_NAMES:
+            col = f"{s}_{f}"
+            assert df[col].dtype == np.bool_, f"{col}: {df[col].dtype}"
+            assert df[col].notna().all(), f"{col} has NaN"
+
+
+def test_rv_stubs_are_all_nan() -> None:
+    """RV stubs must exist, be float64, and be entirely NaN (Phase 3 populates)."""
+    df = _features()
+    for c in RV_STUB_COLUMNS:
+        assert c in df.columns, f"missing RV stub: {c}"
+        assert df[c].dtype == np.float64, f"{c}: {df[c].dtype}"
+        assert df[c].isna().all(), f"{c}: stub should be all-NaN in Phase 1"
+
+
+def test_flag_threshold_semantics() -> None:
+    """entry_long fires below -entry; entry_short above +entry; exit inside ±exit; stop outside ±stop."""
+    idx = pd.date_range("2020-01-01", periods=7, freq="B")
+    z = pd.Series([-5.0, -2.5, -1.0, 0.0, 1.0, 2.5, 5.0], index=idx, name="hy_spread_z63")
+    df = pd.DataFrame({"hy_spread_z63": z})
+    flags = compute_flags(df, ["hy_spread"], window=63)
+    # entry=2, exit=0.5, stop=4
+    np.testing.assert_array_equal(
+        flags["hy_spread_entry_long"].to_numpy(),
+        [True, True, False, False, False, False, False],
+    )
+    np.testing.assert_array_equal(
+        flags["hy_spread_entry_short"].to_numpy(),
+        [False, False, False, False, False, True, True],
+    )
+    np.testing.assert_array_equal(
+        flags["hy_spread_exit"].to_numpy(),
+        [False, False, False, True, False, False, False],
+    )
+    np.testing.assert_array_equal(
+        flags["hy_spread_stop"].to_numpy(),
+        [True, False, False, False, False, False, True],
+    )
+
+
+def test_flags_handle_nan_z_score() -> None:
+    """Rows with NaN z-score must produce False flags, never NaN."""
+    idx = pd.date_range("2020-01-01", periods=5, freq="B")
+    z = pd.Series([np.nan, np.nan, 2.5, -2.5, 0.0], index=idx, name="hy_spread_z63")
+    df = pd.DataFrame({"hy_spread_z63": z})
+    flags = compute_flags(df, ["hy_spread"], window=63)
+    assert flags.notna().all().all()
+    assert flags.dtypes.eq(np.bool_).all()
+    # First two rows (NaN z) must be all-False
+    assert not flags.iloc[:2].any().any()
+
+
+def test_flag_thresholds_reject_bad_config() -> None:
+    import pytest as _pt
+
+    df = pd.DataFrame({"hy_spread_z63": [0.0]})
+    with _pt.raises(ValueError):
+        compute_flags(df, ["hy_spread"], thresholds=FlagThresholds(entry=1.0, exit=1.0))
+    with _pt.raises(ValueError):
+        compute_flags(df, ["hy_spread"], thresholds=FlagThresholds(entry=2.0, stop=2.0))
 
 
 # ---------------------------------------------------------------- invariants

@@ -65,6 +65,11 @@ def build(
         feats[c] = zs[c]
     print(f"  [features] +zscores: {len(feats.columns)} cols")
 
+    # Buy-and-hold HYG benchmark: cumulative log return from inception.
+    # First row is 0.0 by construction (log_ret[0] is NaN → fillna → 0).
+    feats["HYG_buyhold_cum_log_ret"] = feats["HYG_log_ret"].fillna(0.0).cumsum()
+    print(f"  [features] +buyhold: {len(feats.columns)} cols")
+
     flags = compute_flags(feats, SPREADS, window=DEFAULT_FLAG_WINDOW)
     for c in flags.columns:
         feats[c] = flags[c]
@@ -85,6 +90,7 @@ def build(
     for s in SPREADS:
         for w in Z_WINDOWS:
             ordered.append(f"{s}_z{w}")
+    ordered.append("HYG_buyhold_cum_log_ret")
     for s in SPREADS:
         for f in FLAG_NAMES:
             ordered.append(f"{s}_{f}")

@@ -63,6 +63,7 @@ def test_features_schema() -> None:
     for s in SPREADS:
         for w in (63, 126, 252):
             expected.append(f"{s}_z{w}")
+    expected.append("HYG_buyhold_cum_log_ret")
     flag_cols: list[str] = []
     for s in SPREADS:
         for f in FLAG_NAMES:
@@ -73,7 +74,7 @@ def test_features_schema() -> None:
         f"schema drift: missing={set(expected) - set(df.columns)} "
         f"extra={set(df.columns) - set(expected)}"
     )
-    assert len(df.columns) == 49  # 32 original + 12 flags + 5 RV stubs
+    assert len(df.columns) == 50  # 32 core + 1 buyhold + 12 flags + 5 RV stubs
 
     # Dtype discipline: numeric cols float64, flag cols bool
     for c in df.columns:
@@ -102,6 +103,17 @@ def test_flags_no_nan_and_bool_dtype() -> None:
             col = f"{s}_{f}"
             assert df[col].dtype == np.bool_, f"{col}: {df[col].dtype}"
             assert df[col].notna().all(), f"{col} has NaN"
+
+
+def test_buyhold_identity() -> None:
+    """HYG_buyhold_cum_log_ret must be cumsum(HYG_log_ret) with first row 0.0."""
+    df = _features()
+    col = df["HYG_buyhold_cum_log_ret"]
+    assert col.notna().all(), "buy-hold column has NaN"
+    assert col.iloc[0] == 0.0
+    diffs = col.diff().iloc[1:]
+    expected = df["HYG_log_ret"].iloc[1:]
+    np.testing.assert_allclose(diffs.to_numpy(), expected.to_numpy(), atol=1e-15)
 
 
 def test_rv_stubs_are_all_nan() -> None:

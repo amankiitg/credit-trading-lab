@@ -105,3 +105,36 @@
 | Newton iterations per tenor | 2–3 |
 | ctest pass rate | 14/14 (100%) |
 | Compile warnings | 0 |
+
+## 2026-04-18 — Task V4: Fixed-coupon bond pricing (C14)
+
+**Status:** Done
+
+### Files created/modified
+- `cpp/include/credit/date.hpp` — added `<=`, `>`, `>=` operators + `add_months()` for schedule generation
+- `cpp/include/credit/rootfind.hpp` — template Newton + Brent root-finders (zero-overhead, no `std::function`)
+- `cpp/include/credit/bond.hpp` — `FixedBond` struct, `DayCountType` enum, `coupon_schedule()`, `BondPricer`
+- `cpp/src/bond.cpp` — `dirty_at_yield`, `dirty_deriv`, `accrued`, `ytm` implementations
+- `cpp/tests/test_bond.cpp` — 6 test cases: dirty-price cross-check, YTM round-trip, accrued sanity, zero-coupon spot-check, at-par identity, clean=dirty-accrued
+- `cpp/tests/ref/bond_ytm_vectors.csv` — 10 bonds (3 Treasuries + 7 corporates incl. zero-coupon, deep discount, high premium)
+
+### Design decisions
+- **`DayCountType` enum + runtime dispatch** rather than templating `BondPricer` on day count. The bond is a plain data struct; the pricer dispatches via `year_fraction(DayCountType, d1, d2)` which calls the static policy-class methods. This keeps the bond serializable and avoids template explosion.
+- **Template only `dirty(bond, curve)` on the curve's Interp/DC policies** — the rest of BondPricer lives in bond.cpp.
+- **Newton's method initial guess = coupon rate** — converges in ~3 iterations for most bonds. Brent fallback on [1e-6, 1.0] catches edge cases (zero-coupon where Newton's initial guess is far from truth).
+- **Reference vectors generated independently in Python** — dirty prices computed from reference YTMs using an independent Python implementation of 30/360 and the dirty-price formula. C++ matches Python to within 1e-8. YTM round-trip error < 1e-10 bp for all 10 bonds (far below the 1.0 bp C14 threshold).
+
+### Analytical spot-checks
+1. **Zero-coupon bond**: `dirty = 100 / (1+y)^T` verified exact to 1e-10.
+2. **At-par bond on coupon date**: `dirty = 100.0` verified exact to 1e-8.
+3. **Accrued interest**: verified non-negative and ≤ one coupon for all 10 bonds.
+
+### Key numbers
+| metric | value |
+|---|---|
+| Dirty price vs Python reference | all 10 within 1e-8 |
+| YTM round-trip error | all 10 < 1e-10 bp (threshold: 1.0 bp) |
+| Accrued interest | non-negative, ≤ one coupon for all |
+| Newton convergence | ~3 iters typical, Brent fallback not triggered |
+| ctest pass rate | 20/20 (100%) |
+| Compile warnings | 0 |

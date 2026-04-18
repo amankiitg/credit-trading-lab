@@ -41,14 +41,25 @@ TEST_CASE("C12: discount curve knot reprice within 1e-10", "[discount][C12]") {
     auto curve = Curve::bootstrap(tenors, par_yields);
 
     // For each input tenor, reprice a par bond and check it prices to 1.0
+    // Uses the same schedule logic as DiscountCurve::bootstrap:
+    //   coupon dates step backward from T by 1.0; accrual = gap between dates.
     for (std::size_t k = 0; k < tenors.size(); ++k) {
         double T = tenors[k];
         double c = par_yields[k];
-        int n = static_cast<int>(T);
+
+        // Build coupon schedule (ascending)
+        std::vector<double> cpn_dates;
+        for (double t = T; t > 1e-12; t -= 1.0) {
+            cpn_dates.push_back(t);
+        }
+        std::reverse(cpn_dates.begin(), cpn_dates.end());
 
         double price = 0.0;
-        for (int j = 1; j <= n; ++j) {
-            price += c * curve.df(static_cast<double>(j));
+        double prev = 0.0;
+        for (double t_j : cpn_dates) {
+            double accrual = t_j - prev;
+            price += c * accrual * curve.df(t_j);
+            prev = t_j;
         }
         price += curve.df(T);  // principal repayment
 

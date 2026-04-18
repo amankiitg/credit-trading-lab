@@ -3,6 +3,7 @@ add_executable(credit_tests
     test_daycount.cpp
     test_interp.cpp
     test_discount_curve.cpp
+    test_bond.cpp
 )
 target_link_libraries(credit_tests
     PRIVATE credit

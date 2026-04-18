@@ -62,7 +62,7 @@ See `PRD.md` §Falsification Criteria for C12–C17 definitions.
     discount factor is non-positive or > 1, or if the bootstrap
     diverges for the supplied snapshot.
 
-- [ ] **Task V4: Fixed-coupon bond — dirty, clean, accrued, YTM (C14)**
+- [x] **Task V4: Fixed-coupon bond — dirty, clean, accrued, YTM (C14)**
   - Acceptance: `FixedBond` holds `{notional, coupon, frequency,
     issue_date, maturity_date, day_count}` (30/360 ISDA default).
     `BondPricer::dirty(bond, curve)` returns model dirty price;

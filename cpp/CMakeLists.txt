@@ -52,6 +52,7 @@ endif()
 # ----- credit static library ------------------------------------------------
 add_library(credit STATIC
     src/version.cpp
+    src/bond.cpp
 )
 target_include_directories(credit PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

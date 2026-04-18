@@ -1,0 +1,12 @@
+# FRED DGS snapshot for discount curve bootstrap test (C12)
+# Source: Federal Reserve Economic Data, 2025-01-02
+# Par yields are in percent (e.g., 4.17 = 4.17%)
+tenor,par_yield_pct
+1,4.17
+2,4.25
+3,4.29
+5,4.38
+7,4.47
+10,4.57
+20,4.86
+30,4.79

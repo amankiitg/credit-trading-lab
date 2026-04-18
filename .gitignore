@@ -1,3 +1,15 @@
 venv/
 __pycache__/
 data/*.csv
+
+# C++ build artifacts (sprint v2)
+build/
+cpp/build/
+*.so
+*.dylib
+*.o
+*.a
+compile_commands.json
+python/credit/pycredit*.so
+python/credit/pycredit*.dylib
+python/credit/pycredit*.pyd

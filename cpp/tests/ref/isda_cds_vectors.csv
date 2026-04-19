@@ -1,0 +1,35 @@
+# ISDA CDS Standard Model reference vectors for C13
+# Discount curve: FRED DGS snapshot 2025-01-02 (discount_curve_knots.csv)
+# Source: flat-hazard and piecewise-hazard test cases computed from
+#         known survival curves using the ISDA standard discretization
+#         (midpoint DF for protection, half-period accrual-on-default).
+# Cross-checked: par spread round-trip (bootstrap -> reprice) < 1e-6 bps.
+# Cross-checked: accrual-on-default closed form vs 10-bucket/day numerical < 0.1 bps.
+#
+# case: test case name (maps to a known hazard structure in the test)
+#   flat_100 — constant hazard 100 bps/yr, R=40%
+#   flat_200 — constant hazard 200 bps/yr, R=40%
+#   pw1      — piecewise [80, 120, 200] bps on [0-2y, 2-5y, 5-10y], R=40%
+#
+# case,maturity_years,recovery,ref_par_spread_bps
+flat_100,0.5,0.40,60.3068
+flat_100,1.0,0.40,60.3068
+flat_100,2.0,0.40,60.3125
+flat_100,3.0,0.40,60.3154
+flat_100,5.0,0.40,60.3218
+flat_100,7.0,0.40,60.3282
+flat_100,10.0,0.40,60.3352
+flat_200,0.5,0.40,120.6126
+flat_200,1.0,0.40,120.6126
+flat_200,2.0,0.40,120.6240
+flat_200,3.0,0.40,120.6297
+flat_200,5.0,0.40,120.6423
+flat_200,7.0,0.40,120.6547
+flat_200,10.0,0.40,120.6683
+pw1,0.5,0.40,48.2455
+pw1,1.0,0.40,48.2455
+pw1,2.0,0.40,48.2501
+pw1,3.0,0.40,55.8832
+pw1,5.0,0.40,61.9582
+pw1,7.0,0.40,76.3780
+pw1,10.0,0.40,86.9137

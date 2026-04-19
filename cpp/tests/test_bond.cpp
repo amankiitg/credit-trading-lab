@@ -162,3 +162,126 @@ TEST_CASE("clean = dirty - accrued", "[bond]") {
         CHECK(clean < 200.0);  // sanity: no bond is worth > 200
     }
 }
+
+// ---- C15: DV01, key-rate DV01, Z-spread, convexity ----
+
+// Helper: bootstrap a discount curve from the FRED CSV.
+using Curve = credit::DiscountCurve<credit::LogLinearDF, credit::Act365F>;
+
+static Curve load_curve() {
+    std::ifstream f(CREDIT_TEST_REF_DIR "/discount_curve_knots.csv");
+    REQUIRE(f.is_open());
+
+    std::vector<double> tenors;
+    std::vector<double> yields;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.empty() || line[0] == '#' || line[0] == 't') { continue; }
+        std::istringstream ss(line);
+        std::string tok;
+        std::getline(ss, tok, ',');
+        tenors.push_back(std::stod(tok));
+        std::getline(ss, tok, ',');
+        yields.push_back(std::stod(tok) / 100.0);
+    }
+    return Curve::bootstrap(tenors, yields);
+}
+
+TEST_CASE("C15: analytic DV01 vs FD DV01 agree within 1% relative", "[bond][C15]") {
+    auto rows = load_bonds(CREDIT_TEST_REF_DIR "/bond_ytm_vectors.csv");
+    auto curve = load_curve();
+
+    for (const auto& r : rows) {
+        double analytic = BondPricer::dv01(r.bond, curve, r.settle);
+        double fd       = BondPricer::dv01_fd(r.bond, curve, r.settle);
+
+        double rel_err = std::abs(analytic - fd) / std::abs(fd);
+        INFO(r.name << ": analytic=" << analytic << "  fd=" << fd
+             << "  rel_err=" << rel_err * 100.0 << "%");
+        CHECK(analytic > 0.0);  // DV01 must be positive
+        CHECK(fd > 0.0);
+        CHECK(rel_err < 0.01);  // within 1%
+    }
+}
+
+TEST_CASE("C15: Z-spread round-trips to 0 for curve-priced bond", "[bond][C15]") {
+    auto rows = load_bonds(CREDIT_TEST_REF_DIR "/bond_ytm_vectors.csv");
+    auto curve = load_curve();
+
+    for (const auto& r : rows) {
+        // Price the bond from the curve — its Z-spread should be ~0
+        double model_dirty = BondPricer::dirty(r.bond, curve, r.settle);
+        double z = BondPricer::zspread(r.bond, curve, model_dirty, r.settle);
+
+        INFO(r.name << ": model_dirty=" << model_dirty << "  z_spread=" << z);
+        CHECK_THAT(z, WithinAbs(0.0, 1e-8));
+    }
+}
+
+TEST_CASE("C15: Z-spread is positive for bond cheaper than curve", "[bond][C15]") {
+    auto curve = load_curve();
+
+    // A corporate bond priced below par should have positive Z-spread
+    // (investors demand extra yield for credit risk).
+    FixedBond corp;
+    corp.notional     = 100.0;
+    corp.coupon       = 0.04;
+    corp.frequency    = 2;
+    corp.issue_date   = {2020, 1, 1};
+    corp.maturity_date = {2030, 1, 1};
+    corp.day_count    = DayCountType::Thirty360;
+
+    Date settle{2025, 1, 2};
+    double model_dirty = BondPricer::dirty(corp, curve, settle);
+
+    // Pretend the market prices it 3 points cheaper (credit risk)
+    double mkt_dirty = model_dirty - 3.0;
+    double z = BondPricer::zspread(corp, curve, mkt_dirty, settle);
+
+    INFO("z_spread=" << z * 10000.0 << " bps");
+    CHECK(z > 0.0);  // positive spread for cheaper bond
+
+    // Round-trip: dirty_with_zspread at the solved z should match mkt_dirty
+    double repriced = BondPricer::dirty_with_zspread(corp, curve, z, settle);
+    CHECK_THAT(repriced, WithinAbs(mkt_dirty, 1e-8));
+}
+
+TEST_CASE("C15: key-rate DV01 sum approx parallel DV01 within 2%", "[bond][C15]") {
+    auto rows = load_bonds(CREDIT_TEST_REF_DIR "/bond_ytm_vectors.csv");
+    auto curve = load_curve();
+
+    for (const auto& r : rows) {
+        // Compare against curve-based parallel DV01 (not yield-based),
+        // since krdv01 also uses curve re-bootstrap.
+        double parallel = BondPricer::dv01_parallel(r.bond, curve, r.settle);
+        auto kr = BondPricer::krdv01(r.bond, curve, r.settle);
+
+        double kr_sum = 0.0;
+        for (double v : kr) { kr_sum += v; }
+
+        double rel_err = std::abs(kr_sum - parallel) / std::abs(parallel);
+        INFO(r.name << ": parallel=" << parallel << "  kr_sum=" << kr_sum
+             << "  rel_err=" << rel_err * 100.0 << "%");
+        CHECK(rel_err < 0.02);  // within 2%
+    }
+}
+
+TEST_CASE("C15: spread convexity is positive", "[bond][C15]") {
+    auto curve = load_curve();
+
+    FixedBond bond;
+    bond.notional     = 100.0;
+    bond.coupon       = 0.05;
+    bond.frequency    = 2;
+    bond.issue_date   = {2020, 1, 1};
+    bond.maturity_date = {2035, 1, 1};
+    bond.day_count    = DayCountType::Thirty360;
+
+    Date settle{2025, 1, 2};
+    double conv = BondPricer::spread_convexity(bond, curve, 0.0, settle);
+
+    INFO("convexity=" << conv);
+    // Convexity must be positive for a plain vanilla bond (price is
+    // a convex function of yield/spread).
+    CHECK(conv > 0.0);
+}

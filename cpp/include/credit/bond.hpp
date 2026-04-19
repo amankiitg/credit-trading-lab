@@ -93,6 +93,132 @@ struct BondPricer {
     static double ytm(const FixedBond& bond,
                       double dirty_price,
                       const Date& settle);
+
+    // ---- V5: Risk measures ----
+
+    // Analytic DV01: -dP/dy * 0.0001 at the bond's YTM.
+    // This is the dollar change in dirty price per 1 bp rise in yield.
+    template <typename Interp, typename DC>
+    static double dv01(const FixedBond& bond,
+                       const DiscountCurve<Interp, DC>& curve,
+                       const Date& settle) {
+        double dp = dirty(bond, curve, settle);
+        double y  = ytm(bond, dp, settle);
+        return -dirty_deriv(bond, y, settle) * 1e-4;
+    }
+
+    // Finite-difference DV01 via ±1bp shift of the bond's YTM.
+    // Should agree with analytic DV01 to within ~1% (validates the derivative).
+    template <typename Interp, typename DC>
+    static double dv01_fd(const FixedBond& bond,
+                          const DiscountCurve<Interp, DC>& curve,
+                          const Date& settle) {
+        constexpr double bump = 1e-4;  // 1 bp
+        double dp = dirty(bond, curve, settle);
+        double y  = ytm(bond, dp, settle);
+        double p_up   = dirty_at_yield(bond, y + bump, settle);
+        double p_down = dirty_at_yield(bond, y - bump, settle);
+        return (p_down - p_up) / 2.0;
+    }
+
+    // Curve-based parallel DV01: re-bootstrap with all par yields shifted ±1bp.
+    template <typename Interp, typename DC>
+    static double dv01_parallel(const FixedBond& bond,
+                                const DiscountCurve<Interp, DC>& curve,
+                                const Date& settle) {
+        constexpr double bump = 1e-4;  // 1 bp
+        auto curve_up   = curve.parallel_shift(+bump);
+        auto curve_down = curve.parallel_shift(-bump);
+        double p_up   = dirty(bond, curve_up, settle);
+        double p_down = dirty(bond, curve_down, settle);
+        return (p_down - p_up) / 2.0;
+    }
+
+    // Key-rate DV01: sensitivity to each input tenor shifted individually.
+    // Returns a vector with one entry per curve input tenor.
+    template <typename Interp, typename DC>
+    static std::vector<double> krdv01(const FixedBond& bond,
+                                      const DiscountCurve<Interp, DC>& curve,
+                                      const Date& settle) {
+        constexpr double bump = 1e-4;  // 1 bp
+        std::size_t n = curve.num_tenors();
+        std::vector<double> kr(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            auto curve_up   = curve.key_rate_shift(i, +bump);
+            auto curve_down = curve.key_rate_shift(i, -bump);
+            double p_up   = dirty(bond, curve_up, settle);
+            double p_down = dirty(bond, curve_down, settle);
+            kr[i] = (p_down - p_up) / 2.0;
+        }
+        return kr;
+    }
+
+    // Dirty price discounted with a constant Z-spread over the curve.
+    //   DF_shifted(t) = DF(t) * exp(-z * t)
+    template <typename Interp, typename DC>
+    static double dirty_with_zspread(const FixedBond& bond,
+                                     const DiscountCurve<Interp, DC>& curve,
+                                     double zspread,
+                                     const Date& settle) {
+        auto sched = coupon_schedule(bond);
+        double pv = 0.0;
+        Date prev = bond.issue_date;
+        for (const auto& cpn_date : sched) {
+            if (cpn_date <= settle) { prev = cpn_date; continue; }
+            double delta = year_fraction(bond.day_count, prev, cpn_date);
+            double t = year_fraction(bond.day_count, settle, cpn_date);
+            pv += bond.coupon * delta * bond.notional
+                  * curve.df_with_zspread(t, zspread);
+            prev = cpn_date;
+        }
+        double t_mat = year_fraction(bond.day_count, settle, bond.maturity_date);
+        pv += bond.notional * curve.df_with_zspread(t_mat, zspread);
+        return pv;
+    }
+
+    // Z-spread: the constant zero-rate shift that makes the model dirty
+    // price match the market dirty price.  Newton-solved.
+    template <typename Interp, typename DC>
+    static double zspread(const FixedBond& bond,
+                          const DiscountCurve<Interp, DC>& curve,
+                          double mkt_dirty,
+                          const Date& settle) {
+        auto f = [&](double z) {
+            return dirty_with_zspread(bond, curve, z, settle) - mkt_dirty;
+        };
+        auto df = [&](double z) {
+            // dP/dz = sum(-t_i * CF_i * DF(t_i) * exp(-z * t_i))
+            auto sched = coupon_schedule(bond);
+            double deriv = 0.0;
+            Date prev = bond.issue_date;
+            for (const auto& cpn_date : sched) {
+                if (cpn_date <= settle) { prev = cpn_date; continue; }
+                double delta = year_fraction(bond.day_count, prev, cpn_date);
+                double t = year_fraction(bond.day_count, settle, cpn_date);
+                deriv += bond.coupon * delta * bond.notional
+                         * (-t) * curve.df_with_zspread(t, z);
+                prev = cpn_date;
+            }
+            double t_mat = year_fraction(bond.day_count, settle, bond.maturity_date);
+            deriv += bond.notional * (-t_mat) * curve.df_with_zspread(t_mat, z);
+            return deriv;
+        };
+        return newton(f, df, 0.0);
+    }
+
+    // Spread convexity: central finite difference on Z-spread.
+    //   d²P/dz² ≈ (P(z+h) - 2P(z) + P(z-h)) / h²
+    template <typename Interp, typename DC>
+    static double spread_convexity(const FixedBond& bond,
+                                   const DiscountCurve<Interp, DC>& curve,
+                                   double zspd,
+                                   const Date& settle) {
+        constexpr double h = 1e-4;  // 1 bp
+        double p_up   = dirty_with_zspread(bond, curve, zspd + h, settle);
+        double p_mid  = dirty_with_zspread(bond, curve, zspd, settle);
+        double p_down = dirty_with_zspread(bond, curve, zspd - h, settle);
+        return (p_up - 2.0 * p_mid + p_down) / (h * h);
+    }
 };
 
 }  // namespace credit

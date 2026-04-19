@@ -138,3 +138,97 @@
 | Newton convergence | ~3 iters typical, Brent fallback not triggered |
 | ctest pass rate | 20/20 (100%) |
 | Compile warnings | 0 |
+
+## 2026-04-19 — Task V5: DV01, key-rate DV01, Z-spread, convexity (C15)
+
+**Status:** Done
+
+### Files modified
+- `cpp/include/credit/discount_curve.hpp` — added par yield storage, `parallel_shift()`, `key_rate_shift()`, `df_with_zspread()`
+- `cpp/include/credit/bond.hpp` — added `dv01`, `dv01_fd`, `dv01_parallel`, `krdv01`, `zspread`, `dirty_with_zspread`, `spread_convexity`
+- `cpp/tests/test_bond.cpp` — 5 new C15 test cases
+
+### Design decisions
+- **DiscountCurve stores original par yields** — enables `parallel_shift()` and `key_rate_shift()` for re-bootstrap with perturbed inputs. This is a natural extension: the curve remembers what it was built from.
+- **Analytic DV01 vs yield-based FD** — both measure sensitivity to the bond's own YTM. The analytic uses `dirty_deriv()` (closed-form dP/dy); the FD nudges yield ±1bp. These agree to <1e-5% relative — validating the derivative is correct.
+- **Curve-based parallel DV01 (`dv01_parallel`)** — separate method that re-bootstraps with all par yields shifted ±1bp. This is ~2% different from yield-based DV01 because YTM is a single flat rate while the curve captures term structure. Key-rate DV01 sums against this (not yield-based DV01).
+- **Z-spread uses `df_with_zspread(t, z) = df(t) * exp(-z*t)`** — avoids re-bootstrapping the curve. Newton-solved with analytic derivative (dP/dz = Σ -t_i * CF_i * DF_shifted).
+- **Spread convexity via central FD** — `(P(z+h) - 2P(z) + P(z-h)) / h²` with h = 1bp. Positive for all vanilla bonds (price is convex in yield/spread).
+
+### Bug caught during testing
+- **First attempt**: FD DV01 used curve re-bootstrap (parallel shift of par yields), which disagreed with analytic DV01 by ~2%. Root cause: analytic DV01 measures dP/dy (single flat yield), curve-based FD measures dP/d(par_yield_parallel). These are different sensitivities. Fixed by making FD DV01 yield-based (matching the analytic) and adding a separate `dv01_parallel` for curve-based comparison.
+
+### Key numbers
+| metric | value |
+|---|---|
+| Analytic vs FD DV01 relative error | all 10 < 1.5e-05% (threshold: 1%) |
+| Z-spread round-trip (curve-priced bond) | all 10 exactly 0.0 (threshold: 1e-8) |
+| Z-spread for 3-pt-cheaper corporate | 67.7 bps (positive, as expected) |
+| Key-rate DV01 sum vs parallel | all 10 < 1.3e-05% (threshold: 2%) |
+| Spread convexity (15y 5% bond) | 7655.9 (positive) |
+| ctest pass rate | 25/25 (100%) |
+| Compile warnings | 0 |
+
+## 2026-04-19 — Task V6: CDS contract + hazard-bootstrap survival curve (C13)
+
+**Status:** Done
+
+### Files created
+- `cpp/include/credit/schedule.hpp` — `cds_payment_dates()` inline helper
+- `cpp/src/schedule.cpp` — translation unit stub
+- `cpp/include/credit/survival_curve.hpp` — `SurvivalCurve` class + `detail::cds_pvs` PV engine + bootstrap
+- `cpp/src/survival_curve.cpp` — `survival()`, `hazard()`, constructor
+- `cpp/include/credit/cds.hpp` — `CDSContract` struct, `CDSPricer`, `detail::aod_numerical`
+- `cpp/src/cds.cpp` — translation unit stub (pricer methods are templated)
+- `cpp/tests/test_cds.cpp` — 8 C13 test cases
+- `cpp/tests/ref/isda_cds_vectors.csv` — 21 reference vectors (flat + piecewise hazard)
+
+### Design decisions
+- **ISDA standard discretization** — protection leg uses midpoint discount factor:
+  `PV_prot_i = (1-R) * (S(t_{i-1}) - S(t_i)) * D(t_mid)`. Premium leg: scheduled
+  payment `Δ * S(t_i) * D(t_i)` + accrual-on-default approximation
+  `(Δ/2) * (S(t_{i-1}) - S(t_i)) * D(t_mid)`. This is the standard ISDA CDS Standard
+  Model discretization — second-order accurate, matches industry convention.
+- **Quarterly payment grid in year fractions** — `n = round(T * 4)` periods with
+  equal `dt = T/n`. Avoids calendar-date complexity while matching typical CDS
+  payment frequency. The `CDSContract` date-based API converts via Act/365F.
+- **Bootstrap uses Newton with numerical derivative** — central FD on `λ_k` with
+  bump = 1e-6. Initial guess `λ_0 = s / (1-R)` converges in 2-4 iterations.
+  Each iteration constructs a temporary `SurvivalCurve` — clean and correct, with
+  negligible cost (bootstrap runs once).
+- **`detail::CDSLegs` struct** — returns `{pv_protection, rpv01_scheduled, rpv01_accrual}`
+  so the accrual-on-default component is testable independently.
+- **`SurvivalCurve` stores original inputs** — `input_tenors_`, `input_par_spreads_`,
+  `input_recovery_` for V7 re-bootstrap (CS01 via `parallel_shift()`).
+- **Reference vectors self-generated** — computed from known hazard structures
+  (flat 100bps, flat 200bps, piecewise [80,120,200] bps) using our own pricer,
+  then verified via bootstrap round-trip. The PRD acknowledges this approach.
+
+### Par spread intuition
+- For flat hazard λ with recovery R, par spread ≈ (1-R)·λ plus a small correction
+  from payment timing and discount effects. At λ=100 bps, R=40%: par spread ≈ 60.3 bps
+  (vs. first-order 60.0 bps). The correction grows with λ: at 200 bps → 120.6 bps.
+- Piecewise hazard [80, 120, 200] bps gives term-structure of par spreads:
+  48.2 bps at 2y → 86.9 bps at 10y, reflecting the increasing average hazard.
+
+### Test structure (8 tests)
+1. **C13 reference match** — 21 CSV vectors, all within 0.5 bps (actually < 0.01 bps)
+2. **Flat hazard round-trip** — bootstrap from computed par spreads, reprices to < 1e-6 bps
+3. **Piecewise hazard round-trip** — same, with 7-tenor bootstrap
+4. **Survival monotonicity** — S(t) strictly decreasing over [0, 12y]
+5. **Hazard piecewise constant** — exact at knot boundaries and between
+6. **Negative hazard throws** — severely inverted spread curve triggers exception
+7. **Accrual-on-default validation** — closed form vs 10-bucket/day numerical < 0.1 bps
+8. **Survival at knots** — matches exp(-cumulative hazard) to 1e-14
+
+### Key numbers
+| metric | value |
+|---|---|
+| Par spread vs reference (flat 100bps) | all 7 < 0.01 bps error |
+| Par spread vs reference (flat 200bps) | all 7 < 0.01 bps error |
+| Par spread vs reference (piecewise) | all 7 < 0.01 bps error |
+| Bootstrap round-trip error | < 1e-6 bps (all 14 test points) |
+| Accrual-on-default closed vs numerical | < 0.1 bps (all 12 checks) |
+| Newton iterations per bootstrap tenor | 2–4 |
+| ctest pass rate | 33/33 (100%) |
+| Compile warnings | 0 |

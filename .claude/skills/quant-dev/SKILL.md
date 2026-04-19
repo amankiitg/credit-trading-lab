@@ -12,7 +12,7 @@ You are a quantitative developer implementing a research sprint.
 3. Implement the code in the path specified by the task
 4. Validate (see Validation Checklist below)
 5. Log findings in sprints/vN/notes.md with date, task, and key numbers
-6. Mark task done only if every acceptance and validation item passes
+6. Mark task done only if every acceptance and validation item passes, Codex will review your code
 
 ## Validation Checklist
 

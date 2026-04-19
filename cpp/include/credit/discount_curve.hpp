@@ -137,7 +137,10 @@ public:
             knot_dfs.push_back(x);
         }
 
-        return DiscountCurve(std::move(knot_tenors), std::move(knot_dfs));
+        DiscountCurve curve(std::move(knot_tenors), std::move(knot_dfs));
+        curve.input_tenors_ = tenors;
+        curve.input_par_yields_ = par_yields;
+        return curve;
     }
 
     // Discount factor at time t (in years).
@@ -146,15 +149,43 @@ public:
         return Interp::interp(tenors_, dfs_, t);
     }
 
+    // Discount factor with a parallel additive shift to the zero rate.
+    //   DF_shifted(t) = DF(t) * exp(-spread * t)
+    [[nodiscard]] double df_with_zspread(double t, double spread) const {
+        if (t <= 0.0) { return 1.0; }
+        return df(t) * std::exp(-spread * t);
+    }
+
     // Continuously-compounded zero rate at time t.
     [[nodiscard]] double zero_rate(double t) const {
         if (t <= 0.0) { return 0.0; }
         return -std::log(df(t)) / t;
     }
 
+    // Re-bootstrap with all par yields shifted by a parallel amount.
+    [[nodiscard]] DiscountCurve parallel_shift(double shift) const {
+        assert(!input_tenors_.empty());
+        std::vector<double> shifted(input_par_yields_.size());
+        for (std::size_t i = 0; i < shifted.size(); ++i) {
+            shifted[i] = input_par_yields_[i] + shift;
+        }
+        return bootstrap(input_tenors_, shifted);
+    }
+
+    // Re-bootstrap with a single tenor's par yield shifted.
+    [[nodiscard]] DiscountCurve key_rate_shift(std::size_t idx, double shift) const {
+        assert(idx < input_par_yields_.size());
+        auto shifted = input_par_yields_;
+        shifted[idx] += shift;
+        return bootstrap(input_tenors_, shifted);
+    }
+
     [[nodiscard]] const std::vector<double>& tenors() const { return tenors_; }
     [[nodiscard]] const std::vector<double>& dfs() const { return dfs_; }
+    [[nodiscard]] const std::vector<double>& input_tenors() const { return input_tenors_; }
+    [[nodiscard]] const std::vector<double>& input_par_yields() const { return input_par_yields_; }
     [[nodiscard]] std::size_t size() const { return tenors_.size(); }
+    [[nodiscard]] std::size_t num_tenors() const { return input_tenors_.size(); }
 
 private:
     DiscountCurve(std::vector<double> tenors, std::vector<double> dfs)
@@ -162,6 +193,8 @@ private:
 
     std::vector<double> tenors_;
     std::vector<double> dfs_;
+    std::vector<double> input_tenors_;      // original bootstrap inputs
+    std::vector<double> input_par_yields_;  // original bootstrap inputs
 };
 
 }  // namespace credit

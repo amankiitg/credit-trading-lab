@@ -79,7 +79,7 @@ See `PRD.md` §Falsification Criteria for C12–C17 definitions.
     Newton diverges on any supplied bond (Brent must catch it); fails
     if accrued is negative or > one coupon period.
 
-- [ ] **Task V5: DV01, key-rate DV01, Z-spread, convexity (C15)**
+- [x] **Task V5: DV01, key-rate DV01, Z-spread, convexity (C15)**
   - Acceptance: `BondPricer::dv01(bond, curve)` analytic; compare to
     two-sided FD (±1 bp parallel yield shift). `::krdv01(bond, curve)`
     returns an 8-vector, one per DGS tenor, via curve re-bootstrap
@@ -98,7 +98,7 @@ See `PRD.md` §Falsification Criteria for C12–C17 definitions.
     Z-spread round-trip fails, or if key-rate DV01 sum drifts more
     than 2% from parallel.
 
-- [ ] **Task V6: CDS contract + hazard-bootstrap survival curve (C13)**
+- [x] **Task V6: CDS contract + hazard-bootstrap survival curve (C13)**
   - Acceptance: `CDSContract` holds `{notional, coupon, recovery,
     effective_date, maturity_date, pay_freq=quarterly}`. `SurvivalCurve`
     bootstraps piecewise-constant `λ_k` from a par-spread term

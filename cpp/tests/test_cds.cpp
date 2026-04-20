@@ -239,6 +239,133 @@ TEST_CASE("C13: accrual-on-default closed form vs numerical integral", "[cds][C1
     }
 }
 
+// ---- V7: MTM ----
+
+TEST_CASE("V7: par-spread contract MTM is zero on its own curve", "[cds][V7]") {
+    auto disc = load_curve();
+
+    // Bootstrap a survival curve from known par spreads.
+    std::vector<double> tenors = {0.5, 1.0, 2.0, 3.0, 5.0, 7.0, 10.0};
+    SurvivalCurve flat({10.0}, {0.01});
+    std::vector<double> par_spreads;
+    for (double T : tenors) {
+        par_spreads.push_back(
+            CDSPricer::par_spread(T, 0.4, flat, disc));
+    }
+
+    auto boot = SurvivalCurve::bootstrap(tenors, par_spreads, 0.4, disc);
+
+    // For each tenor, create a CDS with coupon = par spread.
+    // Buyer-side MTM should be ~0 (you're paying exactly the fair premium).
+    for (std::size_t i = 0; i < tenors.size(); ++i) {
+        double T = tenors[i];
+        double coupon = par_spreads[i];
+        double m = CDSPricer::mtm(T, coupon, 0.4, 10'000'000.0, boot, disc);
+        INFO("T=" << T << " coupon=" << coupon * 10000.0 << " bps"
+             << " MTM=" << m);
+        CHECK_THAT(m, WithinAbs(0.0, 1e-2));  // within 0.01 dollar on 10M notional
+    }
+}
+
+TEST_CASE("V7: MTM sign — cheap protection is positive, expensive is negative", "[cds][V7]") {
+    auto disc = load_curve();
+
+    // Bootstrap from flat 100 bps hazard.
+    SurvivalCurve flat({10.0}, {0.01});
+    double T = 5.0;
+    double ps = CDSPricer::par_spread(T, 0.4, flat, disc);
+
+    std::vector<double> tenors = {0.5, 1.0, 2.0, 3.0, 5.0, 7.0, 10.0};
+    std::vector<double> spreads;
+    for (double t : tenors) {
+        spreads.push_back(CDSPricer::par_spread(t, 0.4, flat, disc));
+    }
+    auto boot = SurvivalCurve::bootstrap(tenors, spreads, 0.4, disc);
+
+    // Coupon below par spread → buyer has cheap protection → positive MTM.
+    double cheap_coupon = ps * 0.5;
+    double mtm_cheap = CDSPricer::mtm(T, cheap_coupon, 0.4, 10'000'000.0,
+                                       boot, disc);
+    INFO("par_spread=" << ps * 10000.0 << " bps"
+         << " cheap_coupon=" << cheap_coupon * 10000.0 << " bps"
+         << " MTM=" << mtm_cheap);
+    CHECK(mtm_cheap > 0.0);
+
+    // Coupon above par spread → buyer overpays → negative MTM.
+    double expensive_coupon = ps * 2.0;
+    double mtm_expensive = CDSPricer::mtm(T, expensive_coupon, 0.4,
+                                           10'000'000.0, boot, disc);
+    INFO("expensive_coupon=" << expensive_coupon * 10000.0 << " bps"
+         << " MTM=" << mtm_expensive);
+    CHECK(mtm_expensive < 0.0);
+}
+
+// ---- V7: CS01 ----
+
+TEST_CASE("V7: analytic CS01 vs FD CS01 within 1 percent", "[cds][V7]") {
+    auto disc = load_curve();
+
+    struct Case {
+        std::string name;
+        double hazard;
+        double maturity;
+        double recovery;
+    };
+
+    std::vector<Case> cases = {
+        {"flat100 5y",  0.01, 5.0,  0.40},
+        {"flat100 10y", 0.01, 10.0, 0.40},
+        {"flat200 5y",  0.02, 5.0,  0.40},
+        {"flat200 10y", 0.02, 10.0, 0.40},
+        {"flat100 2y",  0.01, 2.0,  0.40},
+        {"flat200 3y",  0.02, 3.0,  0.40},
+    };
+
+    for (const auto& c : cases) {
+        // Build survival curve from known hazard, compute par spreads, bootstrap.
+        SurvivalCurve flat({10.0}, {c.hazard});
+        std::vector<double> tenors = {0.5, 1.0, 2.0, 3.0, 5.0, 7.0, 10.0};
+        std::vector<double> spreads;
+        for (double t : tenors) {
+            spreads.push_back(
+                CDSPricer::par_spread(t, c.recovery, flat, disc));
+        }
+        auto boot = SurvivalCurve::bootstrap(tenors, spreads, c.recovery, disc);
+
+        // At-the-money: coupon = par spread.
+        // RPV01 is a first-order approximation to dMTM/ds; the correction
+        // (par - coupon) * dRPV01/ds vanishes at the money.
+        double ps = CDSPricer::par_spread(c.maturity, c.recovery, boot, disc);
+
+        double cs01_fd = CDSPricer::cs01(c.maturity, ps, c.recovery,
+                                          1.0, boot, disc);
+        double cs01_an = CDSPricer::cs01_analytic(c.maturity, c.recovery,
+                                                   1.0, boot, disc);
+
+        double rel_err = std::abs(cs01_fd - cs01_an) / std::abs(cs01_an);
+        INFO(c.name << ": FD=" << cs01_fd
+             << " analytic=" << cs01_an
+             << " rel_err=" << rel_err * 100.0 << "%");
+        CHECK(rel_err < 0.01);  // 1%
+    }
+}
+
+TEST_CASE("V7: CS01 equals CR01", "[cds][V7]") {
+    auto disc = load_curve();
+
+    SurvivalCurve flat({10.0}, {0.01});
+    std::vector<double> tenors = {0.5, 1.0, 2.0, 3.0, 5.0, 7.0, 10.0};
+    std::vector<double> spreads;
+    for (double t : tenors) {
+        spreads.push_back(CDSPricer::par_spread(t, 0.4, flat, disc));
+    }
+    auto boot = SurvivalCurve::bootstrap(tenors, spreads, 0.4, disc);
+
+    double cs = CDSPricer::cs01(5.0, 0.005, 0.4, 10'000'000.0, boot, disc);
+    double cr = CDSPricer::cr01(5.0, 0.005, 0.4, 10'000'000.0, boot, disc);
+    CHECK(cs == cr);
+}
+
 // ---- Survival probability spot-checks ----
 
 TEST_CASE("survival at knots matches exp(-cumulative hazard)", "[cds]") {

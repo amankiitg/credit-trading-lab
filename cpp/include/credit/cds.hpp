@@ -97,6 +97,68 @@ struct CDSPricer {
             .rpv01();
     }
 
+    // Buyer-side MTM = (PV_prot − coupon · RPV01) · notional.
+    // Positive when protection is worth more than the premium stream
+    // (i.e., the credit has deteriorated since trade inception).
+    template <typename Interp, typename DC>
+    static double mtm(double maturity_yf,
+                      double coupon,
+                      double recovery,
+                      double notional,
+                      const SurvivalCurve& surv,
+                      const DiscountCurve<Interp, DC>& disc,
+                      int pay_freq = 4) {
+        auto legs = detail::cds_pvs(maturity_yf, recovery, surv, disc, pay_freq);
+        return (legs.pv_protection - coupon * legs.rpv01()) * notional;
+    }
+
+    // CS01: MTM change per 1 bp parallel shift in par-spread term structure.
+    // Central FD (±0.5 bp) for accurate derivative estimation.
+    // Re-bootstraps the survival curve with shifted spreads, then reprices.
+    template <typename Interp, typename DC>
+    static double cs01(double maturity_yf,
+                       double coupon,
+                       double recovery,
+                       double notional,
+                       const SurvivalCurve& surv,
+                       const DiscountCurve<Interp, DC>& disc,
+                       int pay_freq = 4) {
+        constexpr double half_bp = 0.5e-4;  // 0.5 bp
+        auto surv_up   = surv.parallel_shift(+half_bp, disc);
+        auto surv_down = surv.parallel_shift(-half_bp, disc);
+        double mtm_up   = mtm(maturity_yf, coupon, recovery, notional,
+                              surv_up, disc, pay_freq);
+        double mtm_down = mtm(maturity_yf, coupon, recovery, notional,
+                              surv_down, disc, pay_freq);
+        return mtm_up - mtm_down;
+    }
+
+    // CR01: identical to CS01 when there is a single credit curve per name.
+    template <typename Interp, typename DC>
+    static double cr01(double maturity_yf,
+                       double coupon,
+                       double recovery,
+                       double notional,
+                       const SurvivalCurve& surv,
+                       const DiscountCurve<Interp, DC>& disc,
+                       int pay_freq = 4) {
+        return cs01(maturity_yf, coupon, recovery, notional,
+                    surv, disc, pay_freq);
+    }
+
+    // Analytic CS01 approximation: RPV01 · 1bp · notional.
+    // First-order: dMTM/ds ≈ RPV01, so ΔMTM ≈ RPV01 · Δs.
+    template <typename Interp, typename DC>
+    static double cs01_analytic(double maturity_yf,
+                                double recovery,
+                                double notional,
+                                const SurvivalCurve& surv,
+                                const DiscountCurve<Interp, DC>& disc,
+                                int pay_freq = 4) {
+        auto legs = detail::cds_pvs(maturity_yf, recovery, surv, disc, pay_freq);
+        return legs.rpv01() * 1e-4 * notional;
+    }
+
     // ---- Date-based API (for CDSContract) ----
 
     template <typename Interp, typename DC>
@@ -113,6 +175,31 @@ struct CDSPricer {
                         const DiscountCurve<Interp, DC>& disc) {
         double mat = Act365F::year_fraction(cds.effective_date, cds.maturity_date);
         return rpv01(mat, cds.recovery, surv, disc, cds.pay_freq);
+    }
+
+    template <typename Interp, typename DC>
+    static double mtm(const CDSContract& cds,
+                      const SurvivalCurve& surv,
+                      const DiscountCurve<Interp, DC>& disc) {
+        double mat = Act365F::year_fraction(cds.effective_date, cds.maturity_date);
+        return mtm(mat, cds.coupon, cds.recovery, cds.notional,
+                   surv, disc, cds.pay_freq);
+    }
+
+    template <typename Interp, typename DC>
+    static double cs01(const CDSContract& cds,
+                       const SurvivalCurve& surv,
+                       const DiscountCurve<Interp, DC>& disc) {
+        double mat = Act365F::year_fraction(cds.effective_date, cds.maturity_date);
+        return cs01(mat, cds.coupon, cds.recovery, cds.notional,
+                    surv, disc, cds.pay_freq);
+    }
+
+    template <typename Interp, typename DC>
+    static double cr01(const CDSContract& cds,
+                       const SurvivalCurve& surv,
+                       const DiscountCurve<Interp, DC>& disc) {
+        return cs01(cds, surv, disc);
     }
 };
 

@@ -119,7 +119,7 @@ See `PRD.md` §Falsification Criteria for C12–C17 definitions.
     diverges from a 10-bucket-per-day numerical integral by > 0.1
     bps on the reference set.
 
-- [ ] **Task V7: CDS MTM + CS01/CR01**
+- [x] **Task V7: CDS MTM + CS01/CR01**
   - Acceptance: `CDSPricer::mtm(contract, survival, discount)` returns
     buyer-side MTM = `PV_prot − s_c · RPV01`. `::cs01` is MTM change
     per 1 bp parallel shift in par-spread term structure (recalibrates

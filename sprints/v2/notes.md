@@ -232,3 +232,39 @@
 | Newton iterations per bootstrap tenor | 2–4 |
 | ctest pass rate | 33/33 (100%) |
 | Compile warnings | 0 |
+
+## 2026-04-20 — Task V7: CDS MTM + CS01/CR01
+
+**Status:** Done
+
+### Files modified
+- `cpp/include/credit/cds.hpp` — added `mtm()`, `cs01()`, `cr01()`, `cs01_analytic()` to CDSPricer
+- `cpp/tests/test_cds.cpp` — 4 new V7 test cases
+
+### Design decisions
+- **Buyer-side MTM = (PV_prot − coupon · RPV01) · notional** — positive when protection
+  is worth more than the premium stream (credit deteriorated since inception).
+- **CS01 uses central FD (±0.5 bp)** — re-bootstraps survival curve with shifted par
+  spreads, reprices. Central difference gives a more accurate derivative estimate
+  than one-sided bump.
+- **Analytic CS01 = RPV01 · 1bp · notional** — first-order approximation. At-the-money
+  (coupon = par spread), the second-order correction `(par - coupon) · dRPV01/ds`
+  vanishes, so the approximation is essentially exact (error < 1e-5%).
+- **CR01 = CS01** — with a single credit curve per name, these are identical by
+  definition. Separate function for API clarity / future extensibility.
+
+### Test structure (4 new tests)
+1. **Par-spread contract MTM ≈ 0** — on its own curve, all 7 tenors within 1e-10 of zero
+2. **MTM sign** — cheap protection (coupon < par) → positive MTM; expensive → negative
+3. **Analytic CS01 vs FD CS01** — 6 cases (flat100/200 at 2y/3y/5y/10y), all < 1e-5% relative error
+4. **CS01 = CR01** — exact equality confirmed
+
+### Key numbers
+| metric | value |
+|---|---|
+| Par-spread contract MTM | < 1e-10 (all 7 tenors) |
+| Analytic vs FD CS01 relative error | < 1e-05% (all 6 cases) |
+| CS01 (flat100, 5y, 10M notional) | $4,377 per bp |
+| CS01 (flat200, 10y, 10M notional) | $7,360 per bp |
+| ctest pass rate | 37/37 (100%) |
+| Compile warnings | 0 |

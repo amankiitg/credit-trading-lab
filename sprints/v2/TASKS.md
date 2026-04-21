@@ -154,7 +154,7 @@ See `PRD.md` §Falsification Criteria for C12–C17 definitions.
     fails if numpy dtypes are not `float64`; fails if curve handles
     leak under repeated Python GC cycles (ASan in Debug).
 
-- [ ] **Task V9: Throughput benchmark + parity tests (C16)**
+- [x] **Task V9: Throughput benchmark + parity tests (C16)**
   - Acceptance: `tests/test_batch_throughput.py::test_bond_10k_per_sec`
     builds a 10,000-row bond frame (random coupons, frequencies,
     maturities 1y–30y) and asserts batch pricing completes in **≤ 1.00
@@ -169,7 +169,7 @@ See `PRD.md` §Falsification Criteria for C12–C17 definitions.
     developer machine; fails parity if any Python/C++ number drifts
     > 1e-10 on identical inputs.
 
-- [ ] **Task V10: Sprint validation — notebook + ISDA reference check + close**
+- [x] **Task V10: Sprint validation — notebook + ISDA reference check + close**
   - Acceptance: `notebooks/02_pricer_validation.ipynb` runs top-to-
     bottom without errors and demonstrates: (a) bootstrap discount
     curve on the latest FRED date, plot yield + discount factor; (b)

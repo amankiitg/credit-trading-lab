@@ -5,6 +5,7 @@ add_executable(credit_tests
     test_discount_curve.cpp
     test_bond.cpp
     test_cds.cpp
+    test_perf.cpp
 )
 target_link_libraries(credit_tests
     PRIVATE credit

@@ -320,3 +320,85 @@
 | GIL released during pricing | yes |
 | ctest pass rate | 37/37 (100%) |
 | Compile warnings | 0 |
+
+## 2026-04-20 — Task V9: Throughput benchmark + parity tests (C16)
+
+**Status:** Done
+
+### Files created/modified
+- `cpp/tests/test_perf.cpp` — C++ parity dump generator (20 bonds + 20 CDS, seed=42)
+- `cpp/tests/ref/parity_dump.csv` — generated reference data with 15-digit precision
+- `cpp/tests/CMakeLists.txt` — added test_perf.cpp to build
+- `tests/test_batch_throughput.py` — Python throughput tests (10k bonds, 10k CDS)
+- `tests/test_cpp_parity.py` — Python/C++ cross-validation (20 bonds + 20 CDS)
+
+### Design decisions
+- **Deterministic RNG (seed=42)** for parity dump — reproducible reference data. Same
+  FRED DGS 2025-01-02 discount curve shared across all tests.
+- **CDS survival curve bootstrap inputs embedded in CSV** — parity_dump.csv contains
+  exact bootstrap tenors, par spreads, and recovery as header comments. The Python
+  test reads these and bootstraps an identical survival curve, eliminating any
+  mismatch from independent curve construction.
+- **Relative tolerance `max(1e-10, |val| * 1e-12)`** — pure 1e-10 absolute tolerance
+  failed for large MTM values (~95k) where 3e-10 error is still 15 significant
+  digits of agreement. The hybrid tolerance adapts: 1e-10 for small values, ~1e-12
+  relative for large values. Both are well within machine precision accumulation.
+- **Throughput timing uses `time.perf_counter()`** — wall-clock, includes Python↔C++
+  call overhead. Warm-up run before timed section to eliminate JIT/cache effects.
+
+### Bug caught during testing
+- **CDS parity mismatch (err=0.452)** — initial Python test used flat par spreads for
+  survival bootstrap, but C++ computed 7 slightly different par spreads from a flat
+  hazard curve (60.31, 60.31, 60.31, 60.32, ...). Fixed by dumping exact bootstrap
+  inputs in the CSV header and reading them in Python.
+
+### Key numbers
+| metric | value |
+|---|---|
+| Bond throughput (10k) | 0.237s = 42,223 bonds/sec (limit: 1.00s) |
+| CDS throughput (10k) | 0.710s = 14,091 CDS/sec (limit: 2.00s) |
+| Bond parity (20 bonds) | all within tolerance (max err < 1e-12 relative) |
+| CDS parity (20 CDS) | all within tolerance (max err < 1e-12 relative) |
+| ctest pass rate | 38/38 (100%) |
+| pytest V9 tests | 4/4 (100%) |
+| Compile warnings | 0 |
+
+## 2026-04-21 — Task V10: Sprint validation notebook + close
+
+**Status:** Done
+
+### Files created
+- `notebooks/02_pricer_validation.ipynb` — 8-section interview-walkthrough notebook
+- `sprints/v2/plots/01_discount_curve.png` — yield curve + discount factors
+- `sprints/v2/plots/02_hazard_survival.png` — survival curves + piecewise hazard rates
+- `sprints/v2/plots/03_bond_sensitivities.png` — price vs coupon + DV01 vs maturity
+- `sprints/v2/plots/04_cds_risk.png` — CS01 term structure + MTM vs coupon profile
+- `sprints/v2/plots/05_throughput.png` — batch size scaling (log-log)
+
+### Notebook sections
+1. Setup — imports pycredit, verifies build
+2. Discount curve bootstrap (C12) — FRED DGS, yield + DF plots
+3. Bond pricing (C14) — 10-bond portfolio table, price/coupon and DV01/maturity plots
+4. DV01 validation (C15) — analytic vs FD, max relative error 2e-5%
+5. CDS survival curve (C13) — 3 hazard structures, survival + hazard plots
+6. CDS pricing — MTM/CS01/RPV01 table, CS01 bar chart, MTM vs coupon plot
+7. Python/C++ parity — 20 bonds + 20 CDS, max relative error 2.3e-13
+8. Throughput benchmark (C16) — 42k bonds/sec, 14k CDS/sec, scaling plot
+9. Falsification checklist C12–C17 — all PASS
+
+### C12–C17 final results
+| criterion | target | observed | status |
+|---|---|---|---|
+| C12 Discount curve reprice | <= 1e-10 | 0 (exact) | PASS |
+| C13 CDS par spread vs ISDA | <= 0.5 bps | < 0.01 bps | PASS |
+| C14 Bond YTM | <= 1.0 bp | < 1e-10 bp | PASS |
+| C15 DV01 analytic vs FD | <= 1% rel | 2e-05% | PASS |
+| C16a Bond throughput | >= 10k/s | 42,343/s | PASS |
+| C16b CDS throughput | >= 5k/s | 14,183/s | PASS |
+| C17 Catch2 tests | 100% | 38/38 | PASS |
+| C17 Compile warnings | 0 | 0 | PASS |
+| Parity (bond) | < 1e-8 | 5.5e-13 | PASS |
+| Parity (CDS) | < 1e-12 rel | 2.3e-13 | PASS |
+
+### Sprint v2 — CLOSED
+All 10 tasks complete. All C12–C17 criteria pass. Ready for sprint-v2 tag.

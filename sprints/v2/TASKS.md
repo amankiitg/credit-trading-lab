@@ -135,7 +135,7 @@ See `PRD.md` §Falsification Criteria for C12–C17 definitions.
     par-spread contract MTM is not zero on its own curve; fails if
     MTM sign flips when LGD sign flips (sanity).
 
-- [ ] **Task V8: pybind11 batch API + numpy zero-copy**
+- [x] **Task V8: pybind11 batch API + numpy zero-copy**
   - Acceptance: `pycredit` exposes:
     `bootstrap_discount(tenors: np.ndarray, par_yields: np.ndarray) →
     DiscountCurve`, `price_bonds(curve, bond_frame: np.recarray) →

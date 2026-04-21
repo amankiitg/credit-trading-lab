@@ -268,3 +268,55 @@
 | CS01 (flat200, 10y, 10M notional) | $7,360 per bp |
 | ctest pass rate | 37/37 (100%) |
 | Compile warnings | 0 |
+
+## 2026-04-20 — Task V8: pybind11 batch API + numpy zero-copy
+
+**Status:** Done
+
+### Files created/modified
+- `bindings/python/pycredit.cpp` — full rewrite: bootstrap + batch pricing + curve queries
+- `python/credit/_types.py` — numpy dtype aliases for bond/CDS result recarrays
+- `python/credit/__init__.py` — re-exports `_types`
+- `cpp/CMakeLists.txt` — upgraded pybind11 from v2.11.1 → v2.13.6
+
+### API surface
+| Function | Input | Output |
+|---|---|---|
+| `bootstrap_discount(tenors, par_yields)` | float64 arrays | `DiscountCurve` handle |
+| `bootstrap_survival(tenors, spreads, recovery, disc)` | float64 arrays + handle | `SurvivalCurve` handle |
+| `price_bonds(curve, coupons, freqs, mats, dccs)` | handle + arrays | recarray: price, dv01, dv01_fd, accrued, ytm |
+| `price_cds(surv, disc, mats, cpns, recs, ntls)` | handles + arrays | recarray: mtm, par_spread, cs01, rpv01 |
+| `discount_factors(curve, times)` | handle + float64 array | float64 array |
+| `survival_probs(curve, times)` | handle + float64 array | float64 array |
+
+### Design decisions
+- **Opaque `shared_ptr` handles** — `DiscountCurveHandle` and `SurvivalCurveHandle` wrap
+  curve objects as Python-opaque types. No copying, no serialization needed. Python holds
+  the reference, C++ owns the data.
+- **`py::gil_scoped_release`** — GIL released during the batch pricing loop. All numpy I/O
+  happens before (building bonds/reading arrays) and after (fromarrays). The hot loop
+  is pure C++.
+- **`numpy.rec.fromarrays`** for structured output — avoids manual struct-packing and
+  alignment issues. The overhead is negligible vs. pricing 10k instruments.
+- **Raw `data()` pointers over `unchecked<1>()`** — pybind11 2.11.1's `unchecked` proxy
+  was broken with numpy 2.0 ABI changes. Using raw C pointers is simpler and correct.
+
+### Bug caught during testing
+- **pybind11 2.11.1 + numpy 2.0.2 ABI mismatch** — `array.data()` and `unchecked()`
+  both returned stale pointers (always element 0). Root cause: numpy 2.0 changed the
+  C array struct layout, and pybind11 2.11 reads the old offsets. Fixed by upgrading
+  pybind11 to v2.13.6.
+- **Structured array offset bug** — initial attempt used hardcoded byte offsets
+  (0, 8, 16, 24, 32) for the record fields. This produced garbled output when numpy's
+  internal alignment differed. Fixed by using `numpy.rec.fromarrays()`.
+
+### Key numbers
+| metric | value |
+|---|---|
+| pybind11 version | v2.13.6 (upgraded from v2.11.1) |
+| Output dtypes | all float64 |
+| Bond batch (4 bonds) | correct: 4 different prices, YTMs, DV01s |
+| CDS batch (3 maturities) | correct: 3 different MTMs, par spreads, CS01s |
+| GIL released during pricing | yes |
+| ctest pass rate | 37/37 (100%) |
+| Compile warnings | 0 |

@@ -38,8 +38,15 @@ C++17 library with pybind11 Python bindings for fixed-income and credit derivati
 
 38/38 Catch2 tests, 0 warnings, Python/C++ parity to 12+ significant digits. Tagged `sprint-v2`.
 
-### Sprint 3 — Relative Value Signals (planned)
+### Sprint 3 — Relative Value Signals (in progress, V1–V4 done)
 Three RV signal families (HY/IG, credit/rates, cross-term) with OLS, Kalman, and DV01-based hedging. Regime-conditional quality analysis testing the equity-credit lag thesis. Output: populated RV residuals, regime labels, `regime_signal_quality.parquet`. See `sprints/v3/PRD.md`.
+
+Status (V1–V4 of 10):
+- V1 ✓ regime classifiers (`signals/regimes.py`): vol, equity, equity-credit lag — all trailing-only
+- V2 ✓ regime tests (`tests/test_regimes.py`): 8/10 pass; 2 C18(b) failures (`equity_regime` 74% bull, `equity_credit_lag` 85% neither) accepted as honest failures of pre-registered thresholds — see `sprints/v3/notes.md`
+- V3 ✓ rolling OLS hedge (`signals/rv_signals.py::ols_hedge`): residual variance reduced 11–47× vs raw spread on all 3 pairs
+- V4 ✓ 2-state Kalman hedge (`signals/rv_signals.py::kalman_hedge`): α and β both random-walk states, residual variance ~20× smaller than OLS
+- V5–V10 pending: DV01 hedge via C++ pricer, best-method selection, half-life/cointegration tests, regime-quality table, validation notebook, sprint close
 
 ## Building
 

@@ -235,3 +235,28 @@ DV01 wins on hedge stability even though it loses on ADF.
 `data/results/regime_signal_quality.parquet`, 63 rows × 9 columns,
 schema matches PRD §Data Outputs.
 
+## V9 — Validation notebook
+
+`notebooks/03_rv_signals.ipynb`, 25 cells, executes end-to-end via
+`jupyter nbconvert --execute`. Built from `scripts/build_notebook_v3.py`.
+
+Includes ELI-10 markdown cells before each code section so the
+notebook reads top-to-bottom as a story:
+- A. Regime classifiers + shaded SPY timeline (`01_regime_labels.png`)
+- B. Hedge ratio evolution: 3 methods overlaid per pair (`02_hedge_ratios.png`)
+- C. RV residual + 63d z-score with |z|>1.5 highlighted (`03_rv_residuals.png`)
+- D. Half-life bar chart with C21 [1, 126] band (`04_halflife_comparison.png`)
+- E. Regime-conditional half-life + signal_freq heatmaps (`05_regime_quality_heatmap.png`)
+- F. C22 thesis bar chart with PASS/FAIL annotation (`06_c22_thesis.png`)
+- G. ADF p-value + half-life pivot table per (pair × method)
+- H. C18–C24 falsification checklist (executed output above)
+
+Final checklist printed by H:
+- C18: 1/3 (vol_regime) ✓, equity_regime/equity_credit_lag ✗ (option-3)
+- C19: ✓ PASS
+- C20: ✓ PASS
+- C21: ✓ PASS
+- **C22: ✓ PASS** (ratio 0.572, 43% shorter)
+- C23: ✗ FAIL (4/9 — OLS all 3 + Kalman x-term, β crosses zero)
+- C24: ✓ PASS (63 rows)
+

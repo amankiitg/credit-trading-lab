@@ -135,7 +135,7 @@ See `PRD.md` §Falsification Criteria for C18–C24 definitions.
     fails C23 if any hedge ratio CV ≥ 1.0; fails C24 if schema or row
     count wrong.
 
-- [ ] **Task V9: Sprint validation notebook — signal walkthrough**
+- [x] **Task V9: Sprint validation notebook — signal walkthrough**
   - Acceptance: `notebooks/03_rv_signals.ipynb` runs top-to-bottom and
     demonstrates: (a) Regime classification — time-series plot of all 3
     regime labels with shaded backgrounds; (b) OLS vs Kalman vs DV01
@@ -156,7 +156,7 @@ See `PRD.md` §Falsification Criteria for C18–C24 definitions.
   - Validation: fails if notebook errors on re-run; fails if any plot
     is missing; fails if C18–C24 checklist cell omits any criterion.
 
-- [ ] **Task V10: Sprint close — notes + walkthrough + all tests green**
+- [x] **Task V10: Sprint close — notes + walkthrough + all tests green**
   - Acceptance: `sprints/v3/notes.md` records per-task findings,
     observed half-lives, hedge method rankings, regime distribution,
     and the C22 thesis result with exact numbers. Full test suite

@@ -38,10 +38,10 @@ C++17 library with pybind11 Python bindings for fixed-income and credit derivati
 
 38/38 Catch2 tests, 0 warnings, Python/C++ parity to 12+ significant digits. Tagged `sprint-v2`.
 
-### Sprint 3 — Relative Value Signals (in progress, V1–V8 done)
+### Sprint 3 — Relative Value Signals (complete)
 Three RV signal families (HY/IG, credit/rates, cross-term) with OLS, Kalman, and DV01-based hedging. Regime-conditional quality analysis testing the equity-credit lag thesis. Output: populated RV residuals, regime labels, `regime_signal_quality.parquet`. See `sprints/v3/PRD.md`.
 
-Status (V1–V8 of 10):
+Status (V1–V10 complete, tagged `sprint-v3`):
 - V1 ✓ regime classifiers (`signals/regimes.py`): vol, equity, equity-credit lag — all trailing-only
 - V2 ✓ regime tests (`tests/test_regimes.py`): 8/10 pass; 2 C18(b) failures pre-registered honest failures
 - V3 ✓ rolling OLS hedge: residual variance reduced 11–47× vs raw spread on all 3 pairs
@@ -50,7 +50,8 @@ Status (V1–V8 of 10):
 - V6 ✓ best-method selection + features.parquet 56-col enrichment (`enrich_with_rv`); Kalman wins ADF on all 3 pairs; 25/25 sprint-1 tests still green
 - V7 ✓ stationarity, cointegration, half-life tests: 9/9 pass (C19/C20/C21)
 - V8 ✓ regime quality table (63 rows) + **C22 thesis PASSES** (RV1 equity_first half-life is 43–67% shorter than neither across methods); C23 fails on 4/9 (OLS β crosses zero); C24 passes
-- V9–V10 pending: validation notebook, walkthrough, sprint close
+- V9 ✓ ELI-10 validation notebook (`notebooks/03_rv_signals.ipynb`, 25 cells) with 6 plots in `sprints/v3/plots/`
+- V10 ✓ sprint close, full test suite (38 Catch2 + 48/51 pytest, 3 documented option-3 honest failures), `sprints/v3/WALKTHROUGH.md`
 
 | Falsification | Result |
 |---|---|

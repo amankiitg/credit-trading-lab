@@ -103,5 +103,83 @@ def build(
     return feats
 
 
+RAW_CREDIT_PATH: Path = Path("data/raw/credit_market_data.parquet")
+WARMUP: int = 252
+Z_RV_WINDOW: int = 63
+
+REGIME_COLS: tuple[str, ...] = ("vol_regime", "equity_regime", "equity_credit_lag")
+Z_RV_COLS: tuple[str, ...] = ("z_rv_hy_ig", "z_rv_credit_rates", "z_rv_xterm")
+
+# stub → z_rv naming
+_PAIR_TO_STUB = {
+    "rv_hy_ig": ("rv_hy_ig_residual", "hedge_ratio_hy_ig", "z_rv_hy_ig"),
+    "rv_credit_rates": ("rv_credit_rates_residual", "hedge_ratio_cr", "z_rv_credit_rates"),
+    "rv_xterm": ("rv_xterm_residual", None, "z_rv_xterm"),
+}
+
+
+def enrich_with_rv(
+    feats: pd.DataFrame,
+    credit_data_path: Path = RAW_CREDIT_PATH,
+    out_path: Path = PROCESSED_PATH,
+) -> pd.DataFrame:
+    """Populate the 5 RV stub columns with the best-method residuals,
+    add 3 regime label columns and 3 z_rv columns. Writes the
+    56-column feature frame and returns it.
+    """
+    print("[pipeline] enrich_with_rv()")
+
+    import pycredit  # noqa: F401  - imported lazily; required for V5 sweep
+
+    from signals.regimes import equity_credit_lag, equity_regime, vol_regime
+    from signals.rv_signals import (
+        build_all_residuals,
+        select_best_method,
+        trailing_zscore,
+    )
+
+    cmd = pd.read_parquet(credit_data_path)
+
+    # ---- regimes
+    feats["vol_regime"] = pd.Categorical(vol_regime(feats), categories=["low", "high"])
+    feats["equity_regime"] = pd.Categorical(equity_regime(feats), categories=["bear", "bull"])
+    feats["equity_credit_lag"] = pd.Categorical(
+        equity_credit_lag(feats),
+        categories=["credit_first", "neither", "equity_first"],
+    )
+    print(f"  [enrich] +regimes: {feats.shape[1]} cols")
+
+    # ---- 9 residuals + best-method selection
+    results = build_all_residuals(feats, cmd, pycredit)
+    best = select_best_method(results, warmup=WARMUP)
+    for pair, (m, scores) in best.items():
+        adf_str = " ".join(f"{k}={v:.3f}" for k, v in scores.items())
+        print(f"  [select] {pair}: best={m}  (ADF p: {adf_str})")
+
+    # ---- write best-method residuals + hedge ratios + z_rv
+    for pair, (best_method, _) in best.items():
+        resid, hr = results[pair][best_method]
+        resid_col, hr_col, z_col = _PAIR_TO_STUB[pair]
+        feats[resid_col] = resid
+        if hr_col is not None:
+            feats[hr_col] = hr
+        feats[z_col] = trailing_zscore(resid, window=Z_RV_WINDOW)
+    print(f"  [enrich] +rv populated + z_rv: {feats.shape[1]} cols")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    feats.to_parquet(out_path)
+    print(f"  [write] {out_path}: {feats.shape}")
+    return feats
+
+
+def build_with_rv(
+    raw_dir: Path = RAW_DIR,
+    credit_data_path: Path = RAW_CREDIT_PATH,
+    out_path: Path = PROCESSED_PATH,
+) -> pd.DataFrame:
+    feats = build(raw_dir=raw_dir, out_path=out_path)
+    return enrich_with_rv(feats, credit_data_path=credit_data_path, out_path=out_path)
+
+
 if __name__ == "__main__":
-    build()
+    build_with_rv()

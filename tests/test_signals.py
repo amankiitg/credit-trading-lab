@@ -70,16 +70,29 @@ def test_features_schema() -> None:
             flag_cols.append(f"{s}_{f}")
     expected += flag_cols
     expected += list(RV_STUB_COLUMNS)
+    # Sprint 3 (V6) appends 3 regime + 3 z_rv columns.
+    sprint3_cols = [
+        "vol_regime",
+        "equity_regime",
+        "equity_credit_lag",
+        "z_rv_hy_ig",
+        "z_rv_credit_rates",
+        "z_rv_xterm",
+    ]
+    expected += sprint3_cols
     assert list(df.columns) == expected, (
         f"schema drift: missing={set(expected) - set(df.columns)} "
         f"extra={set(df.columns) - set(expected)}"
     )
-    assert len(df.columns) == 50  # 32 core + 1 buyhold + 12 flags + 5 RV stubs
+    assert len(df.columns) == 56  # 50 sprint-1 + 6 sprint-3
 
-    # Dtype discipline: numeric cols float64, flag cols bool
+    # Dtype discipline: numeric cols float64, flag cols bool, regime cols category
+    regime_cols = {"vol_regime", "equity_regime", "equity_credit_lag"}
     for c in df.columns:
         if c in flag_cols:
             assert df[c].dtype == np.bool_, f"{c}: expected bool, got {df[c].dtype}"
+        elif c in regime_cols:
+            assert isinstance(df[c].dtype, pd.CategoricalDtype), f"{c}: {df[c].dtype}"
         else:
             assert df[c].dtype == np.float64, f"{c}: {df[c].dtype}"
 
@@ -116,13 +129,14 @@ def test_buyhold_identity() -> None:
     np.testing.assert_allclose(diffs.to_numpy(), expected.to_numpy(), atol=1e-15)
 
 
-def test_rv_stubs_are_all_nan() -> None:
-    """RV stubs must exist, be float64, and be entirely NaN (Phase 3 populates)."""
+def test_rv_columns_populated() -> None:
+    """After Sprint 3 V6, RV stub columns are populated with the best-method
+    residuals; no stub may be entirely NaN, and dtype remains float64."""
     df = _features()
     for c in RV_STUB_COLUMNS:
-        assert c in df.columns, f"missing RV stub: {c}"
+        assert c in df.columns, f"missing RV column: {c}"
         assert df[c].dtype == np.float64, f"{c}: {df[c].dtype}"
-        assert df[c].isna().all(), f"{c}: stub should be all-NaN in Phase 1"
+        assert df[c].notna().any(), f"{c}: should be populated post-V6"
 
 
 def test_flag_threshold_semantics() -> None:

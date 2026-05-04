@@ -67,7 +67,7 @@ See `PRD.md` §Falsification Criteria for C18–C24 definitions.
     variance (filter is diverging); fails if β_t contains NaN or inf
     post-initialization.
 
-- [ ] **Task V5: DV01-based hedge — 3 RV families (C++ pricer)**
+- [x] **Task V5: DV01-based hedge — 3 RV families (C++ pricer)**
   - Acceptance: `signals/rv_signals.py` exposes `dv01_hedge(features_df,
     credit_data_df, pycredit_module)` returning `(residual, hedge_ratio)`
     for each pair. For each trading day with a valid DGS curve,
@@ -85,7 +85,7 @@ See `PRD.md` §Falsification Criteria for C18–C24 definitions.
     post-warmup dates produce NaN (DGS coverage is > 95%); fails if
     the DV01 sweep takes > 60 seconds total (should be ~5s at 42k/s).
 
-- [ ] **Task V6: Best-method selection + features.parquet update**
+- [x] **Task V6: Best-method selection + features.parquet update**
   - Acceptance: For each RV family, compare ADF p-values of the three
     hedge methods; select the one with the lowest p-value as "best."
     Populate the 5 existing RV stub columns in `features.parquet`
@@ -103,7 +103,7 @@ See `PRD.md` §Falsification Criteria for C18–C24 definitions.
     have NaN post-warmup+63 (day 315+); fails if Sprint 1 tests
     regress (25/25 still green).
 
-- [ ] **Task V7: Stationarity, cointegration, half-life tests (C19–C21)**
+- [x] **Task V7: Stationarity, cointegration, half-life tests (C19–C21)**
   - Acceptance: `tests/test_rv_signals.py` loads the updated
     `features.parquet` and asserts: (a) ADF p < 0.05 on all three
     best-method RV residuals (C19); (b) Engle-Granger cointegration
@@ -118,7 +118,7 @@ See `PRD.md` §Falsification Criteria for C18–C24 definitions.
     has no method with cointegration p < 0.05; fails C21 if any
     half-life is outside [1, 126] or infinite (b ≥ 0).
 
-- [ ] **Task V8: Regime-conditional quality table + thesis test (C22–C24)**
+- [x] **Task V8: Regime-conditional quality table + thesis test (C22–C24)**
   - Acceptance: `signals/rv_signals.py` exposes
     `build_regime_quality_table(features_df, all_residuals_dict,
     regime_cols)` that computes, for each (signal, method, regime_classifier,

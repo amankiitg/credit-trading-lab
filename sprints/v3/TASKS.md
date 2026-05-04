@@ -12,7 +12,7 @@ See `PRD.md` §Falsification Criteria for C18–C24 definitions.
 
 ---
 
-- [ ] **Task V1: Regime classifiers — vol, equity, equity-credit lag (C18)**
+- [x] **Task V1: Regime classifiers — vol, equity, equity-credit lag (C18)**
   - Acceptance: `signals/regimes.py` exposes three pure functions:
     `vol_regime(df, window=63)`, `equity_regime(df, window=63)`,
     `equity_credit_lag(df, xcorr_window=21, max_lag=5, noise_floor=0.15)`.
@@ -27,7 +27,7 @@ See `PRD.md` §Falsification Criteria for C18–C24 definitions.
     data; fails if labels include NaN inside the post-warmup window;
     fails if the function is not pure (no disk I/O, no side effects).
 
-- [ ] **Task V2: Regime tests — coverage + non-degeneracy (C18)**
+- [x] **Task V2: Regime tests — coverage + non-degeneracy (C18)**
   - Acceptance: `tests/test_regimes.py` loads `features.parquet`,
     computes all three regime classifiers, and asserts: (a) > 95%
     non-null coverage post-warmup for each classifier; (b) no single
@@ -39,7 +39,7 @@ See `PRD.md` §Falsification Criteria for C18–C24 definitions.
   - Files: `tests/test_regimes.py`.
   - Validation: fails C18 if any assertion fails.
 
-- [ ] **Task V3: OLS rolling hedge — 3 RV families**
+- [x] **Task V3: OLS rolling hedge — 3 RV families**
   - Acceptance: `signals/rv_signals.py` exposes `ols_hedge(y, x,
     window=126)` returning `(residual, hedge_ratio)` as two Series.
     Applied to: (1) `hy_spread ~ ig_spread` → `rv_hy_ig_ols`;
@@ -53,7 +53,7 @@ See `PRD.md` §Falsification Criteria for C18–C24 definitions.
     residual variance > spread variance (hedge is amplifying, not
     reducing).
 
-- [ ] **Task V4: Kalman filter hedge — 3 RV families**
+- [x] **Task V4: Kalman filter hedge — 3 RV families**
   - Acceptance: `signals/rv_signals.py` exposes `kalman_hedge(y, x,
     Q=1e-5, init_window=63)` returning `(residual, hedge_ratio)`.
     Implements a univariate linear Kalman filter: state `β_t` follows

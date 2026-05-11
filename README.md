@@ -38,6 +38,21 @@ C++17 library with pybind11 Python bindings for fixed-income and credit derivati
 
 38/38 Catch2 tests, 0 warnings, Python/C++ parity to 12+ significant digits. Tagged `sprint-v2`.
 
+### Sprint 4 — Signal Visualizer + Today View (complete)
+Streamlit dashboard over `features.parquet` with three views: (1) **Today View** — 6 horizontal cards (3 directional + 3 RV) with conviction tier HIGH/MED/LOW (HIGH iff `equity_credit_lag == 'equity_first' AND |z| > 2`); (2) Historical Directional — 3 synced panels with entry/exit/stop markers; (3) Historical RV — legs + hedge ratio + residual+z + stats strip. Regime shading (vol or equity-credit-lag) on both historical views. Threshold sliders redraw in 60–112 ms p95 (8× under the 500 ms gate). No P&L. Run with `streamlit run dashboard/app.py`. See `sprints/v4/PRD.md` + `WALKTHROUGH.md`. Tagged `sprint-v4`.
+
+| Falsification | Result |
+|---|---|
+| D1 — Conviction truth table (63 cells) | ✓ |
+| D2 — HIGH border = green | ✓ |
+| D3 — Slider redraw < 500ms p95 | ✓ 60ms / 112ms |
+| D4 — Panel x-axis sync | ✓ |
+| D5 — Marker fidelity | ✓ |
+| D6 — Regime span boundaries | ✓ |
+| D7 — Today View persistence | ✓ |
+| D8 — No-crash render | ✓ |
+| D9 — HIGH count sanity baseline | ✓ 178 ∈ [50,1500] |
+
 ### Sprint 3 — Relative Value Signals (complete)
 Three RV signal families (HY/IG, credit/rates, cross-term) with OLS, Kalman, and DV01-based hedging. Regime-conditional quality analysis testing the equity-credit lag thesis. Output: populated RV residuals, regime labels, `regime_signal_quality.parquet`. See `sprints/v3/PRD.md`.
 

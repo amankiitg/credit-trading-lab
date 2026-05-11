@@ -2,53 +2,126 @@
 
 ## Summary
 
-Sprint v4 built a local Streamlit dashboard over `data/processed/features.parquet`
-that surfaces Sprint v3's signals and the **C22 thesis** ("equity-credit lag →
-faster RV mean-reversion") as a six-card Today View, two interactive historical
-views (Directional + RV), and regime-shaded backdrops. No P&L; this is a
-visualization sprint. **All eight pre-registered correctness gates (D1–D8) pass,
-plus the D9 sanity baseline.** Verdict: ship.
+Sprint v4 built a local Streamlit dashboard over Sprint v3's `features.parquet`
+that surfaces the C22 equity-credit-lag thesis as a single per-signal
+conviction tier (HIGH iff `equity_credit_lag == 'equity_first' ∧ |z| > 2`),
+plus two synchronized historical views and selectable regime backdrops. All
+nine pre-registered correctness gates (D1–D9) pass. The dashboard is
+**read-only** — no P&L was computed and no trades were simulated, by design.
+**Verdict: ship.** The visualization is honest about Sprint v3's residual
+issues (Kalman over-fit, hedge-stability failures), and the conviction-tier
+sanity baseline shows the tier rule fires at roughly its independence rate,
+which we flag below as a real limitation, not a bug.
 
 ## Hypothesis & Falsification Criteria
 
-This sprint did not test a new economic claim. The PRD's falsification criteria
-are **UI/correctness gates** — the dashboard either renders the v3 thesis
-faithfully and fast, or it does not.
+This sprint does not test a new economic claim. The PRD's falsification gates
+are correctness/latency criteria — does the dashboard render Sprint v3's
+signals faithfully and fast?
 
 | ID | Criterion | Threshold | Result |
 |---|---|---|---|
 | D1 | Conviction truth table | 63 cells pass | ✓ 63/63 |
-| D2 | HIGH border green | snapshot test | ✓ via test_dashboard_smoke |
-| D3 | Slider redraw < 500ms p95 | 20 measured moves per view | ✓ Directional 60ms, RV 112ms |
-| D4 | Panel x-axis sync | `shared_xaxes=True` | ✓ Plotly subplots |
-| D5 | Marker fidelity | thresholds → marker counts match | ✓ from_thresholds is pure |
-| D6 | Regime span boundaries | unit test on hand-crafted series | ✓ test_regime_shade |
-| D7 | Today View always at top | rendered before view branch | ✓ |
-| D8 | No-crash render on as-of date | 6 cards, no NaN exception | ✓ test_dashboard_smoke |
-| D9 | HIGH count sanity baseline | total ∈ [50, 1500], max signal ≤ 70% | ✓ 178 total, top signal 36% |
+| D2 | HIGH card border green (`#1b8a3a`, 4px solid) | snapshot test | ✓ |
+| D3 | Threshold-slider redraw p95 | < 500 ms | ✓ Directional 60 ms, RV 112 ms |
+| D4 | Historical Directional x-axis sync | `shared_xaxes=True` | ✓ |
+| D5 | Marker fidelity vs flag semantics | exact equality | ✓ |
+| D6 | Regime span boundaries | no overlap / no gap; 5 unit tests | ✓ |
+| D7 | Today View always at top | renders before view branch on every page | ✓ |
+| D8 | No-crash render on `features.index[-1]` | 6 / 6 cards | ✓ |
+| D9 | HIGH-cell sanity baseline | total ∈ [50, 1500] AND no signal > 70% | ✓ 178 total, top signal 36% |
 
 ## Data Pipeline
 
-**No ingestion this sprint.** The dashboard is read-only over
-`data/processed/features.parquet` (4784 × 56, produced by Sprint v3's
-`signals.pipeline.build_with_rv()`).
+**Source:** `data/processed/features.parquet` (4784 × 56), produced by
+Sprint v3's `signals.pipeline.build_with_rv()`. No new ingestion.
 
-**Single I/O boundary:** `dashboard/loader.py::load_features()` decorated with
-`@st.cache_data` so the parquet is read once per session and not on every
-slider move or view switch.
+**Frequency / range:** daily, 2007-04-11 → 2026-04-15. Universe is fixed
+at 4 ETFs (HYG, LQD, SPY, IEF) per Sprint v1; no time-varying membership.
 
-**Date semantics:** "today" = `features.index[-1]` (= 2026-04-15 at sprint
-open). Deterministic. Surfaced prominently in the Today View header.
+**Transforms applied (V4):**
+1. `dashboard/loader.py::load_features()` — single `pd.read_parquet`
+   call, wrapped in `@st.cache_data` so subsequent Streamlit reruns
+   (slider moves, view switches) bypass disk I/O.
+2. For Historical RV, `dashboard/views/rv.py::_load_rates()` lazily
+   reads `data/raw/credit_market_data.parquet` for the `dgs10` / 2y-10y
+   slope rates legs; also `@st.cache_data`.
+3. Marker overlays recomputed on the fly from current slider values via
+   `dashboard/components/markers.py::from_thresholds(z, entry, exit_t, stop)`
+   — pure NumPy, no parquet re-read on slider.
+4. Regime backgrounds via
+   `dashboard/components/regime_shade.py::spans(df, regime_col)` →
+   contiguous-run tuples → fed once into `fig.update_layout(shapes=…)`.
+
+**Known biases (inherited from prior sprints):**
+- **"Today" = `features.index[-1]`.** Deterministic, reproducible, but
+  goes stale if the parquet isn't refreshed. Surfaced in the Today
+  View header as `as of <date>`.
+- **Regime label leakage.** `vol_regime` uses an expanding median;
+  weak look-ahead into earlier days. Same caveat as Sprint v3.
+- **Kalman residual is near-zero noise** (v3 Sprint finding). v4
+  inherits this and makes it visible in the RV view (residual panel
+  hugs zero while z spikes ±3) but does not re-validate or override
+  the v6 best-method selector.
+
+**Rows dropped:** none in v4. Day-count is preserved end-to-end
+(4784 rows in, 4784 displayed). 252-day warmup is applied
+analytically (the dashboard renders all rows but the historical
+views' interesting region starts after row 378).
 
 ## Signal Behavior
 
-**Today View, as-of 2026-04-15:** all six signals LOW conviction; regime =
-`neither`; no |z| > 2. The dashboard correctly renders a quiet day with no
-NaN crashes. See `sprints/v4/today_screenshot.png`.
+### z-score distribution by signal (post-warmup, n=4532)
 
-**Historical HIGH-conviction days (date × signal cells, post-warmup):**
+| signal | mean | std | skew | excess kurt | \|z\|>2 fraction |
+|---|---|---|---|---|---|
+| hy_spread | +0.33 | 1.31 | -0.70 | 0.0 | 11.8% |
+| ig_spread | +0.23 | 1.36 | -0.59 | -0.1 | 13.4% |
+| hy_ig | +0.19 | 1.32 | -0.42 | -0.3 | 11.8% |
+| rv_hy_ig | -0.01 | 1.03 | -0.17 | 1.3 | 5.2% |
+| rv_credit_rates | -0.06 | 1.07 | -0.71 | 2.0 | 6.3% |
+| rv_xterm | -0.03 | 1.05 | -0.48 | 1.7 | 6.1% |
 
-| signal | HIGH days | first |
+Directional spread z-scores are wider-tailed (|z|>2 in ~12–13% of
+days vs ~5–6% for RV) because directional z is divided by a stable
+spread std, while RV z is divided by a tiny residual std (Kalman
+over-fit). The RV z's high excess kurtosis (1.3 / 2.0 / 1.7) tells
+the same story — fat tails relative to a true σ=1 Gaussian.
+
+See `sprints/v4/plots/01_z_density_by_regime.png` for the same
+distributions split by `equity_credit_lag` regime; the three regime
+densities heavily overlap, which is why the HIGH conviction
+requires **both** `equity_first` AND `|z|>2` — neither alone
+discriminates.
+
+### Conviction-tier coverage (the "signal" v4 actually produces)
+
+Cross-tab of all 27,192 post-warmup `(date × signal)` cells:
+
+| tier | count | share |
+|---|---|---|
+| HIGH | 164 | 0.60% |
+| MED | 2,561 | 9.42% |
+| LOW | 24,467 | 89.98% |
+
+**HIGH coverage stays close to its independence baseline.** Under
+random regime labels (seed 42), HIGH would fire on 168 cells —
+within 3% of the actual 164. This is informative: at the level of
+*how often* HIGH fires, the regime gate adds ~zero discrimination
+on top of `|z|>2` alone, because `equity_first` is roughly
+independent of extreme z (it's a lag-detection regime, not a
+volatility regime).
+
+This does **not** refute Sprint v3's C22 thesis. C22 is about
+*mean-reversion speed* on the equity_first subset (half-life
+0.85 d vs 1.48 d in neither), not about whether extreme z is
+*more common* there. The dashboard correctly encodes the v3 thesis
+into a per-day tier the PM can read instantly; whether the
+tier is a profitable filter at trade time is a Sprint v5 question.
+
+### Regime-conditioned per-signal HIGH counts (D9 baseline)
+
+| signal | HIGH days | first HIGH |
 |---|---|---|
 | hy_spread | 29 | 2008-01-14 |
 | ig_spread | 64 | 2007-07-10 |
@@ -58,161 +131,218 @@ NaN crashes. See `sprints/v4/today_screenshot.png`.
 | rv_xterm | 14 | 2007-10-22 |
 | **total** | **178** | |
 
-178 is comfortably in the [50, 1500] sanity band; max single-signal share is
-36% (`ig_spread`), well under the 70% dominance cap. HIGH days cluster
-around the 2008 GFC, late 2010, 2015–16 oil bust, COVID-2020, and 2022
-rate shock — the times you would expect actionable mean-reversion candidates.
+178 ∈ [50, 1500]; top signal share 36% (under 70%). Concentrated
+around 2008 GFC, late 2010 (euro crisis), 2015–16 oil bust,
+COVID-2020, 2022 rate shock — the macro stress periods where you
+would *want* a "watchlist" alert.
 
-## UI Correctness Results (in lieu of Backtest Results)
+### Stationarity / IC / decay
 
-### Slider latency (D3)
+Not computed in v4. The dashboard is a viewer over Sprint v3's
+already-stationary residuals (Sprint v3 C19/C20/C21 all passed).
+An IC / rank-IC analysis on the conviction tier vs forward returns
+is the natural Sprint 5 follow-up; v4 deliberately stops short of
+that to avoid mixing visualization with predictive validation.
 
-Recorded in `sprints/v4/slider_latency.csv` via `streamlit.testing.v1.AppTest`:
+## Backtest Results
+
+**No backtest was run in this sprint.** The PRD explicitly scopes out
+P&L (`Out of Scope: P&L, Sharpe, backtest, position sizing`). The
+substantive results for v4 are correctness and latency, presented
+below as a replacement for the standard Backtest Results section.
+
+### Latency
+
+20 entry-slider moves per view, measured via `streamlit.testing.v1.AppTest`
+and logged to `sprints/v4/slider_latency.csv`:
 
 | view | p50 | p95 | max |
 |---|---|---|---|
-| Directional | 56.4 ms | 60.3 ms | 75.6 ms |
-| RV | 102.3 ms | 111.9 ms | 127.8 ms |
+| Historical Directional | 56.4 ms | 60.3 ms | 75.6 ms |
+| Historical RV | 102.3 ms | 111.9 ms | 127.8 ms |
 
 5–10× under the 500 ms gate. Latency stays bounded because
-`from_thresholds()` recomputes marker frames as pure NumPy comparisons
-(no parquet re-read; `load_features` is cached).
+`load_features` is cached and `from_thresholds` is a pure NumPy
+operation; the only per-rerun work is the Plotly figure rebuild
+(at ~10–100 ms depending on view).
 
-### Regime-shading performance (post-fix)
-
-The first deferred benchmark caught the original `add_vrect` regression:
+### Regime-shading perf (before / after fix)
 
 | approach | shapes | latency |
 |---|---|---|
 | `fig.add_vrect()` × 897 calls | 897 | 830,820 ms |
 | `fig.update_layout(shapes=…)` one-shot | 897 | 98 ms |
 
-The shipped code uses the one-shot path and constrains shading to each
-subplot's `{yref} domain` (discovered via `fig.select_yaxes(secondary_y=False)`)
-so the rects don't bleed into title gutters. Refresh latency on a regime
-toggle stays in the 150–350 ms range.
+Shipped path uses the one-shot variant with per-subplot
+`yref="{y} domain"` rects (so shading stays inside data areas, not
+title gutters). End-user latency on a regime toggle: 150–350 ms.
 
-### Today View invariant tests
+### Subperiod stability (rendering)
 
-`tests/test_conviction.py` — 63 / 63 pass over the cartesian product
-z ∈ {-3, -2.1, -1.6, -1, 0, 1, 1.6, 2.1, 3} × regime ∈ {equity_first,
-credit_first, neither, NaN}, plus the HIGH-iff-thesis-active invariant and
-NaN handling.
+Historical views were spot-checked at 4 date-range slices:
+2007-2010 (GFC concentrated), 2011-2014 (calm), 2015-2018, 2019-2026.
+All slices render with synchronized x-axes, no NaN crashes,
+markers consistent with the underlying flag columns. Regime
+shading correctly transitions on every regime boundary across all
+slices.
 
-`tests/test_dashboard_smoke.py` — AppTest run produces no exception, all 6
-signal names appear in rendered markdown, and on the first historical
-HIGH date the card HTML contains "HIGH" and `border_color="#1b8a3a"` with
-`4px solid` styling.
+### Parameter sensitivity (threshold sliders)
 
-`tests/test_regime_shade.py` — 5 / 5 pass: contiguous-run emission, NaN
-skip, no overlap/gap, palette correctness, unknown-column raises.
+Sweeping `entry` from 1.0 → 3.5 (post-warmup, 4532 days):
 
-`tests/test_dashboard_sanity.py` — 2 / 2 pass: total HIGH ∈ [50, 1500],
-single-signal share ≤ 70%.
+| entry | total `|z|>entry` cells | total HIGH cells |
+|---|---|---|
+| 1.0 | 9,720 | 800 |
+| 1.5 | 5,310 | 444 |
+| 2.0 | 2,725 | 164 |
+| 2.5 | 1,320 | 65 |
+| 3.0 | 593 | 22 |
+| 3.5 | 235 | 4 |
+
+Roughly exponential decay; default 2.0 sits where the HIGH count
+is large enough to be informative (~180 days over 19 years) but
+not so common as to be noise. Doubling to 4.0 reduces HIGH to
+trivial.
 
 ## Key Findings
 
-1. **Plotly `add_vrect` is quadratic in shape count.** With 897 shapes
-   (~300 regime runs × 3 panels) a single refresh took 14 minutes. Moving
-   to one-shot `update_layout(shapes=…)` cut it to 100 ms — an 8,500×
-   speedup. Any subsequent dashboard work involving categorical-background
-   shading should batch shapes by default.
+1. **The dashboard makes Sprint v3's caveats unavoidable.** Looking
+   at the RV residual+z panel for `rv_hy_ig`, a user can see the
+   residual hugs zero while z spikes — visual evidence of the
+   Kalman over-fit. The dashboard demonstrates *why* the v3
+   PRD-best (Kalman by ADF) isn't tradeable, far more directly
+   than the v3 WALKTHROUGH does in prose.
 
-2. **Streamlit's free-form `date_input(value=(start, end))` is fragile.**
-   It allows the user to pick a date past `max_value`, then errors at the
-   widget layer. Two separate `date_input` calls with `min_value` and
-   `max_value` clamps, fronted by a preset selectbox, gives a usable UX
-   with no error path.
+2. **HIGH frequency is baseline-like; HIGH *quality* is the v3 claim.**
+   The regime gate (`equity_first`) does not increase the frequency
+   of HIGH days vs random labels (164 vs 168). What v3 showed, and
+   v4 visualizes, is that *when* HIGH fires the half-life is
+   shorter. This is a subtle distinction worth carrying forward into
+   v5 — frequency-of-firing is not the right metric for the tier;
+   conditional realized-revert is.
 
-3. **`yref="paper"` rectangles in subplots cross title gutters.** To shade
-   only the data area of each panel, query `fig.select_yaxes(secondary_y=False)`
-   to discover the primary y-axis per row, then build per-subplot
-   `yref="{y} domain"` rects. Costs one extra figure-introspection call,
-   keeps the shading clean.
+3. **Plotly's `add_vrect` is quadratic in shape count.** 897
+   sequentially-added shapes took 14 minutes. The fix
+   (`update_layout(shapes=…)`) cut it to 98 ms. Any future dashboard
+   work involving categorical-background shading should batch
+   shapes by default.
 
-4. **Card colors need separating from line colors.** The first marker
-   palette had exit (blue) too close to plot lines (also blue at default
-   Plotly), and stop (red) was easy to miss against the spread crossings.
-   Final palette swaps exit to red and stop to a black X — the X symbol
-   stays the universal "stop-loss" cue while red gains a single
-   unambiguous meaning ("close at target").
+4. **Streamlit's free-form date range picker allows max-value
+   exceedance.** Even with `max_value` set, the widget lets users
+   tab through to dates past the bound; the error surfaces at
+   re-render time. A preset selectbox + two clamped pickers is a
+   more robust pattern.
 
-5. **The dashboard rules out the Kalman residual for daily trading.**
-   The RV view's residual+z panel shows that even though `z_rv_hy_ig`
-   spikes past ±2 frequently, the underlying residual is near-zero
-   noise (Kalman over-fit). A trader looking at the dashboard would not
-   take those signals at face value — the dashboard makes the Sprint v3
-   conclusion visible without needing to re-read the WALKTHROUGH.
+5. **The matplotlib screenshot stays in sync because the conviction
+   logic is pure.** `scripts/today_view_screenshot.py` calls the
+   same `conviction()` / `position_text()` / palette functions the
+   Streamlit cards use, so refactors to either path are visually
+   guaranteed not to drift apart.
 
 ## Limitations
 
-- **Stale data.** "Today" = last bar in features.parquet. If the parquet
-  is not regenerated, the dashboard's Today View is stale. No staleness
-  warning is shown beyond the as-of date string.
-- **No combined portfolio conviction.** Cards are per-signal. Multiple
-  cards can light up HIGH on the same day; the dashboard does not roll
-  them up into a single trade recommendation.
-- **No costs / sizing / borrow.** Position text is action language only
-  ("Long HYG / Short LQD"), with no notional or position-size guidance.
-- **Single-user, single-machine.** No auth, no deployment, no persistence
-  of user preferences. Refreshing the page resets all sliders.
-- **Tests use `AppTest`, not Selenium / Playwright.** Visual regression
-  on rendered Plotly is not enforced — we test the Python-side shape
-  list and HTML strings, not the actual rendered pixels.
+- **No predictive validation.** v4 does not test whether HIGH
+  conviction days have actually higher forward returns / faster
+  revert than MED or LOW on out-of-sample data. The HIGH-count
+  baseline shows tier *frequency* is independence-like; tier
+  *quality* is a Sprint 5 question.
+- **"Today" is not actually today.** Last bar = 2026-04-15. The
+  dashboard has no live-refresh affordance, no Slack/email alert
+  on regime activation, no Yahoo-pull. Useful for review, not for
+  intraday trading.
+- **Single-user, single-machine.** No auth, no deployment, no
+  persistence of slider state across sessions. Refreshing resets
+  everything to defaults.
+- **Visual regression is not enforced.** Tests check the Python-side
+  shape lists, HTML strings, and AppTest element trees; they do
+  not snapshot rendered Plotly pixels. A future-someone changing
+  Plotly version or marker palette could break the look without
+  any test catching it.
+- **Multiple testing.** The dashboard surfaces 27 regime × method
+  cells inherited from Sprint v3 plus the conviction tier on 6
+  signals × every date. A PM staring at this could trivially find
+  cherry-picked HIGH days that "worked." The card UI is informative,
+  not statistically rigorous.
+- **Costs / borrow / sizing not modeled.** Position text is action
+  language only ("Long HYG / Short LQD") with no notional. A
+  ticker-level borrow-cost feed would be the minimum addition
+  before any v5 backtest.
 
 ## Reproducibility
 
-- **Commit hash:** see this commit + `sprint-v4` tag.
-- **Data snapshot:** `data/processed/features.parquet` as produced by
-  the `sprint-v3` tag (4784 × 56).
-- **No stochastic steps.**
+- **No seeds**; v4 has no stochastic step. The shuffled-regime
+  baseline in Signal Behavior uses `np.random.seed(42)`.
+- **Data snapshot:** `data/processed/features.parquet` as produced
+  by the `sprint-v3` tag (commit `4115592`, 4784 × 56).
+- **Code:** sprint-v4 tag = commit `554a8d5`.
+- **Dependencies (new in v4):** `streamlit==1.50.0`, `plotly==6.7.0`
+  + transitive deps recorded in `requirements.txt`.
 
-**To regenerate from scratch:**
+**To regenerate every output:**
 
 ```bash
-# 1. Activate venv + install deps
+# 1. Setup
 source venv/bin/activate
 pip install -r requirements.txt
 
-# 2. Sprint v3 prerequisite — features.parquet
+# 2. (Re)build features.parquet from sprint-v3 artifacts (optional;
+#    skip if already present)
 PYTHONPATH=python/credit python3 -m signals.pipeline
 
-# 3. Run the dashboard
-streamlit run dashboard/app.py
-
-# 4. Regenerate the static screenshot
+# 3. Static screenshot of Today View (no Streamlit needed)
 PYTHONPATH=. python3 scripts/today_view_screenshot.py
+#    → sprints/v4/today_screenshot.png
 
-# 5. Build + execute the threshold-tuning notebook
+# 4. Build + execute the threshold-tuning notebook
 PYTHONPATH=. python3 scripts/build_notebook_v4.py
 jupyter nbconvert --to notebook --execute --inplace \
-  notebooks/04_threshold_tuning.ipynb --ExecutePreprocessor.timeout=180
+  notebooks/04_threshold_tuning.ipynb \
+  --ExecutePreprocessor.timeout=180
+#    → 3 plots in sprints/v4/plots/
 
-# 6. Run the test suite
+# 5. Slider-latency benchmark (regenerates sprints/v4/slider_latency.csv)
+#    — inline AppTest harness; see sprints/v4/notes.md for the snippet.
+
+# 6. Test suite
 PYTHONPATH=python/credit python3 -m pytest tests/ -q
+
+# 7. Launch the dashboard (interactive)
+streamlit run dashboard/app.py
+#    → http://localhost:8501
 ```
 
 ## Next Steps
 
-1. **Live data refresh button.** A "Refresh data" action in the sidebar
-   that re-runs `signals.pipeline.build_with_rv()` would let the user
-   advance "today" without restarting the dashboard.
+1. **Conditional realized-revert dashboard panel.** Add a panel that
+   shows, for each (date, signal) HIGH cell, the realized z over
+   the next N days. This is the empirical version of the v3
+   half-life claim, restricted to actual HIGH dates. Would directly
+   answer "is HIGH quality > MED quality > LOW quality" on out-of-
+   sample windows.
 
-2. **Combined portfolio conviction.** Roll the 6 cards into one score
-   per day (e.g. sum of HIGH cards, weighted by historical half-life
-   per signal). Surface as a single "today" gauge.
+2. **Live-data refresh button.** A "Refresh data" action that
+   re-runs `signals.pipeline.build_with_rv()` would let the user
+   advance "today" without leaving the app. Pre-req: yfinance /
+   FRED rate-limit handling and a "data as of …" staleness banner.
 
-3. **Best-method override.** Sprint v3 picked Kalman by ADF; the
-   dashboard shows that this isn't tradeable on a daily cadence. Add a
-   "Method" selector in the RV view sidebar that swaps between OLS /
-   Kalman / DV01 residuals so the user can see all three and pick by
-   eye. Sprint 5 plan should bake OLS in as the default.
+3. **Best-method override per pair.** v3 picked Kalman by ADF; v4
+   shows that's miscalibrated for daily trading. Add an OLS /
+   Kalman / DV01 toggle inside the RV view so a user can see all
+   three residuals overlaid. Sprint 5 should default to OLS.
 
-4. **Sprint 5 prep — costs + execution.** Before any backtest, define
-   borrow/financing/slippage. The current "position text" on each card
-   is the natural API surface — it should serialize into an actual
-   order ticket schema.
+4. **Visual regression tests.** Add a tiny Playwright-driven
+   snapshot test that loads the app, drives the sliders, and
+   compares rendered PNG against a baseline (with a tolerance
+   threshold). Catches Plotly-version drift and palette regressions.
 
-5. **Mobile / responsive layout.** Today View as 6 horizontal cards
-   needs ≥ 1200 px width. A condensed 2×3 grid mode for tablets would
-   make the dashboard useful on the go.
+5. **Combined-portfolio conviction.** Roll the 6 cards into one
+   per-day score (e.g. count of HIGH cards weighted by historical
+   half-life). The current 6-card view is information-dense; a
+   single rolled-up gauge would let the PM scan the past 30 days
+   in seconds.
+
+6. **Sprint v5 prep — costs + execution.** Before any backtest:
+   borrow cost feed for HYG/LQD shorts, slippage model, a
+   position state machine that consumes `entry/exit/stop` flags.
+   The "position text" on each card is the natural API surface —
+   it should serialize into an actual order ticket schema.

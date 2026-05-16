@@ -13,8 +13,10 @@ credit-trading-lab/
   bindings/python/      pybind11 bridge (pycredit module)
   python/credit/        Python package wrapping pycredit
   signals/              data pipeline + spread signals + RV signal generators
+  dashboard/            Streamlit signal visualizer (Today View + historical views)
   data/                 raw + processed parquet files
-  notebooks/            validation notebooks (01: signals, 02: pricer, 03: RV)
+  notebooks/            validation notebooks (01: signals, 02: pricer, 03: RV, 04: thresholds)
+  scripts/              notebook/screenshot generators
   sprints/              sprint PRDs, tasks, walkthroughs, plots
   tests/                Python test suite (pytest)
 ```
@@ -37,21 +39,6 @@ C++17 library with pybind11 Python bindings for fixed-income and credit derivati
 | C16b: CDS throughput | > 5k/sec | 14,183/sec |
 
 38/38 Catch2 tests, 0 warnings, Python/C++ parity to 12+ significant digits. Tagged `sprint-v2`.
-
-### Sprint 4 — Signal Visualizer + Today View (complete)
-Streamlit dashboard over `features.parquet` with three views: (1) **Today View** — 6 horizontal cards (3 directional + 3 RV) with conviction tier HIGH/MED/LOW (HIGH iff `equity_credit_lag == 'equity_first' AND |z| > 2`); (2) Historical Directional — 3 synced panels with entry/exit/stop markers; (3) Historical RV — legs + hedge ratio + residual+z + stats strip. Regime shading (vol or equity-credit-lag) on both historical views. Threshold sliders redraw in 60–112 ms p95 (8× under the 500 ms gate). No P&L. Run with `streamlit run dashboard/app.py`. See `sprints/v4/PRD.md` + `WALKTHROUGH.md`. Tagged `sprint-v4`.
-
-| Falsification | Result |
-|---|---|
-| D1 — Conviction truth table (63 cells) | ✓ |
-| D2 — HIGH border = green | ✓ |
-| D3 — Slider redraw < 500ms p95 | ✓ 60ms / 112ms |
-| D4 — Panel x-axis sync | ✓ |
-| D5 — Marker fidelity | ✓ |
-| D6 — Regime span boundaries | ✓ |
-| D7 — Today View persistence | ✓ |
-| D8 — No-crash render | ✓ |
-| D9 — HIGH count sanity baseline | ✓ 178 ∈ [50,1500] |
 
 ### Sprint 3 — Relative Value Signals (complete)
 Three RV signal families (HY/IG, credit/rates, cross-term) with OLS, Kalman, and DV01-based hedging. Regime-conditional quality analysis testing the equity-credit lag thesis. Output: populated RV residuals, regime labels, `regime_signal_quality.parquet`. See `sprints/v3/PRD.md`.
@@ -77,6 +64,21 @@ Status (V1–V10 complete, tagged `sprint-v3`):
 | C22 — equity-credit lag thesis | ✓ 43–67% shorter |
 | C23 — hedge ratio CV < 1.0 | partial: DV01 ✓, OLS/Kalman fail on regime shifts |
 | C24 — quality parquet schema | ✓ |
+
+### Sprint 4 — Signal Visualizer + Today View (complete)
+Streamlit dashboard over `features.parquet` with three views: (1) **Today View** — 6 horizontal cards (3 directional + 3 RV) with conviction tier HIGH/MED/LOW (HIGH iff `equity_credit_lag == 'equity_first' AND |z| > 2`); (2) Historical Directional — 3 synced panels with entry/exit/stop markers; (3) Historical RV — legs + hedge ratio + residual+z + stats strip. Regime shading (vol or equity-credit-lag) on both historical views. Threshold sliders redraw in 60–112 ms p95 (8× under the 500 ms gate). No P&L. Run with `streamlit run dashboard/app.py`. See `sprints/v4/PRD.md` + `WALKTHROUGH.md`. Tagged `sprint-v4`.
+
+| Falsification | Result |
+|---|---|
+| D1 — Conviction truth table (63 cells) | ✓ |
+| D2 — HIGH border = green | ✓ |
+| D3 — Slider redraw < 500ms p95 | ✓ 60ms / 112ms |
+| D4 — Panel x-axis sync | ✓ |
+| D5 — Marker fidelity | ✓ |
+| D6 — Regime span boundaries | ✓ |
+| D7 — Today View persistence | ✓ |
+| D8 — No-crash render | ✓ |
+| D9 — HIGH count sanity baseline | ✓ 178 ∈ [50,1500] |
 
 ## Building
 
@@ -104,8 +106,8 @@ cmake --build build -j
 # C++ tests (38 Catch2)
 ctest --test-dir build --output-on-failure
 
-# Python tests (Sprint 1 + Sprint 2 parity/throughput)
-venv/bin/python3 -m pytest tests/ -v
+# Python tests (all sprints; pycredit must be importable)
+PYTHONPATH=python/credit venv/bin/python3 -m pytest tests/ -q
 ```
 
 ### Notebooks
@@ -117,6 +119,12 @@ venv/bin/python3 -m ipykernel install --user --name credit-lab
 jupyter nbconvert --to notebook --execute \
   notebooks/01_signal_validation.ipynb \
   --ExecutePreprocessor.kernel_name=credit-lab
+```
+
+### Dashboard (Sprint 4)
+```bash
+# Launch the Streamlit signal visualizer → http://localhost:8501
+streamlit run dashboard/app.py
 ```
 
 ## C++ Library Overview
@@ -143,7 +151,8 @@ jupyter nbconvert --to notebook --execute \
 |---|---|---|---|
 | `data/raw/{HYG,LQD,SPY,IEF}.parquet` | ~4784 rows | yfinance | Daily OHLCV + adj close |
 | `data/raw/credit_market_data.parquet` | 7639 x 15 | FRED | DGS1-30, BAML OAS, synthetic CDS |
-| `data/processed/features.parquet` | 4784 x 50 | Pipeline | Spreads, z-scores, flags, RV stubs |
+| `data/processed/features.parquet` | 4784 x 56 | Pipeline | Spreads, z-scores, flags, RV residuals, regime labels, z_rv |
+| `data/results/regime_signal_quality.parquet` | 63 x 9 | Sprint 3 | Per-regime half-life / z-magnitude / signal-freq |
 | `data/benchmarks/random_baseline.parquet` | 3000 x 8 | MC sim | 1000-path random-entry baseline |
 | `cpp/tests/ref/*.csv` | small | Static | ISDA/bond reference vectors |
 
@@ -151,7 +160,7 @@ jupyter nbconvert --to notebook --execute \
 
 **C++ (Catch2):** 38 tests covering day-count conventions, interpolation, discount curve bootstrap (C12), bond pricing/YTM (C14), DV01/Z-spread/key-rate DV01 (C15), CDS par spread vs ISDA (C13), hazard bootstrap, CDS MTM/CS01, and throughput benchmarks.
 
-**Python (pytest):** 29 tests covering Sprint 1 data pipeline (schema, NaN, stationarity, flags, FRED coverage, benchmarks) and Sprint 2 parity/throughput (Python/C++ cross-check, 10k batch timing).
+**Python (pytest):** 124 tests across all sprints — Sprint 1 data pipeline (schema, NaN, stationarity, flags, FRED coverage, benchmarks), Sprint 2 parity/throughput (Python/C++ cross-check, 10k batch timing), Sprint 3 regimes / RV signals / regime-quality (C18–C24), and Sprint 4 dashboard (conviction truth table, regime shading, AppTest smoke, HIGH-count sanity). 121/124 pass; the 3 failures are pre-registered Sprint 3 honest failures (C18 regime non-degeneracy ×2, C23 hedge-ratio CV ×1) documented in `sprints/v3/notes.md`.
 
 ## License
 

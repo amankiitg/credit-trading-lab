@@ -14,8 +14,11 @@ credit-trading-lab/
   python/credit/        Python package wrapping pycredit
   signals/              data pipeline + spread signals + RV signal generators
   dashboard/            Streamlit signal visualizer (Today View + historical views)
+  execution/            cost model + position state machine
+  backtest/             backtest engine, metrics, A/B test, benchmarks, failure analysis
+  risk/                 multi-signal portfolio combination
   data/                 raw + processed parquet files
-  notebooks/            validation notebooks (01: signals, 02: pricer, 03: RV, 04: thresholds)
+  notebooks/            validation notebooks (01: signals, 02: pricer, 03: RV, 04: thresholds, 05: backtest)
   scripts/              notebook/screenshot generators
   sprints/              sprint PRDs, tasks, walkthroughs, plots
   tests/                Python test suite (pytest)
@@ -79,6 +82,21 @@ Streamlit dashboard over `features.parquet` with three views: (1) **Today View**
 | D7 — Today View persistence | ✓ |
 | D8 — No-crash render | ✓ |
 | D9 — HIGH count sanity baseline | ✓ 178 ∈ [50,1500] |
+
+### Sprint 5 — Backtest + Thesis Test + Portfolio (complete, final Tier-1 sprint)
+A backtest engine (cost model, position state machine, mark-to-market P&L, metrics) runs the equity-credit-lag thesis as an A/B test: Strategy A trades the RV1 residual unconditionally, Strategy B only on `equity_first` days. Pre-registered costs (1.5bp half-spread + 0.5bp slippage + 0.40%/yr borrow), fixed $1M DV01-hedged notional. **The thesis is rejected at the trading level.** See `sprints/v5/PRD.md` + `WALKTHROUGH.md`. Tagged `sprint-v5`.
+
+| Falsification | Result |
+|---|---|
+| C25 — engine correct, no leakage | ✓ PASS |
+| C26 — control strategy real (≥30 trades) | ✓ PASS |
+| C27 — **thesis**: incremental Sharpe ΔS>0, CI excludes 0 | ✗ FAIL (ΔS −0.41, CI [−0.82,−0.01]) |
+| C28 — out-of-sample ΔS>0 | ✗ FAIL (OOS ΔS −0.61) |
+| C29 — Strategy B beats random p95 | ✗ FAIL |
+| C30 — robust across grid + subperiods | ✗ FAIL (0/27 cells) |
+| C31 — no single trade >25% of P&L | ✗ FAIL (B: 49%) |
+
+**Headline finding.** The equity-credit lag is a real *statistical* effect (Sprint 3 C22: ~43% faster mean-reversion on `equity_first` days) but **not a tradeable regime filter** — gating discards ~85% of trades and the lost diversification outweighs the faster reversion. The unfiltered Strategy A (net Sharpe 0.59, 81% hit rate) is the better strategy and the genuine Tier-1 deliverable. Engine gates pass, so this is a correctly-measured, pre-registered rejection.
 
 ## Building
 
@@ -160,7 +178,7 @@ streamlit run dashboard/app.py
 
 **C++ (Catch2):** 38 tests covering day-count conventions, interpolation, discount curve bootstrap (C12), bond pricing/YTM (C14), DV01/Z-spread/key-rate DV01 (C15), CDS par spread vs ISDA (C13), hazard bootstrap, CDS MTM/CS01, and throughput benchmarks.
 
-**Python (pytest):** 124 tests across all sprints — Sprint 1 data pipeline (schema, NaN, stationarity, flags, FRED coverage, benchmarks), Sprint 2 parity/throughput (Python/C++ cross-check, 10k batch timing), Sprint 3 regimes / RV signals / regime-quality (C18–C24), and Sprint 4 dashboard (conviction truth table, regime shading, AppTest smoke, HIGH-count sanity). 121/124 pass; the 3 failures are pre-registered Sprint 3 honest failures (C18 regime non-degeneracy ×2, C23 hedge-ratio CV ×1) documented in `sprints/v3/notes.md`.
+**Python (pytest):** 190 tests across all sprints — Sprint 1 data pipeline, Sprint 2 parity/throughput, Sprint 3 regimes / RV signals / regime-quality (C18–C24), Sprint 4 dashboard (conviction, regime shading, AppTest smoke, sanity), and Sprint 5 backtest (cost model, position state machine, engine + leakage, metrics, A/B bootstrap, benchmarks, failure analysis, regime table, portfolio). 187/190 pass; the 3 failures are pre-registered Sprint 3 honest failures (C18 regime non-degeneracy ×2, C23 hedge-ratio CV ×1) documented in `sprints/v3/notes.md`.
 
 ## License
 

@@ -73,7 +73,7 @@ See `PRD.md` §Falsification Criteria for C25–C31 definitions.
     on P&L instead of the cumulative equity curve; fails if an
     all-zero P&L series raises instead of returning 0 / NaN-safe.
 
-- [ ] **Task W5: A/B comparison + bootstrap CI (C26, C27)**
+- [x] **Task W5: A/B comparison + bootstrap CI (C26, C27)**
   - Acceptance: `backtest/ab_test.py` exposes `compare(pnl_a,
     pnl_b, n=1000, block=21, seed=20260516)` returning ΔS, the
     2.5/97.5 percentile CI, and the fraction of resamples with
@@ -89,7 +89,7 @@ See `PRD.md` §Falsification Criteria for C25–C31 definitions.
     pass/fail logged in `notes.md` whatever the result; fails if
     the bootstrap is not seeded or block length ≠ 21.
 
-- [ ] **Task W6: Walk-forward out-of-sample test (C28)**
+- [x] **Task W6: Walk-forward out-of-sample test (C28)**
   - Acceptance: `backtest/ab_test.py` extended with
     `walk_forward(...)` — grid-search entry/exit/stop on
     2007-01-01→2018-12-31 by net Sharpe of Strategy B, lock the
@@ -101,7 +101,7 @@ See `PRD.md` §Falsification Criteria for C25–C31 definitions.
     data touched the threshold calibration (leakage); fails if the
     train/test boundary is not the pre-registered `2018-12-31`.
 
-- [ ] **Task W7: Benchmarks — buy-hold + random p95 (C29)**
+- [x] **Task W7: Benchmarks — buy-hold + random p95 (C29)**
   - Acceptance: `backtest/benchmarks.py` exposes `vs_random(
     strategy_sharpe, random_baseline_df, spread="hy_spread")`
     returning the random-baseline 95th-percentile Sharpe and the
@@ -115,7 +115,7 @@ See `PRD.md` §Falsification Criteria for C25–C31 definitions.
     HYG log-return, matching `HYG_buyhold_cum_log_ret`); fails if
     the random p95 is taken from the wrong `spread` rows.
 
-- [ ] **Task W8: Failure slide (C31)**
+- [x] **Task W8: Failure slide (C31)**
   - Acceptance: for each of Strategy A and B, extract the worst 5
     trades by `net_pnl`; record entry/exit date, net_pnl (bps of
     notional), z at entry/exit, **all four regime labels** at
@@ -130,7 +130,7 @@ See `PRD.md` §Falsification Criteria for C25–C31 definitions.
     strategy's total P&L; fails if the parquet lacks any required
     column or the post-mortem field is empty.
 
-- [ ] **Task W9: Robustness — parameter grid + subperiod + regime table (C30)**
+- [x] **Task W9: Robustness — parameter grid + subperiod + regime table (C30)**
   - Acceptance: re-run the A/B comparison over the 27-cell grid
     (entry∈{1.5,2.0,2.5} × exit∈{0.25,0.5,1.0} × stop∈{3,4,5}) and
     over the two halves split at 2016-09-15; report the fraction of
@@ -154,7 +154,7 @@ See `PRD.md` §Falsification Criteria for C25–C31 definitions.
     threshold set for all cells; fails if the regime table omits
     any (strategy × regime) cell or any of the 4 metrics.
 
-- [ ] **Task W10: Multi-signal portfolio + sprint close**
+- [x] **Task W10: Multi-signal portfolio + sprint close**
   - Acceptance: `risk/portfolio.py` combines Strategy-B-style
     backtests of RV1, RV2, RV3 (OLS hedge, `equity_first` gate)
     into one book under **two weighting schemes — equal-weight and

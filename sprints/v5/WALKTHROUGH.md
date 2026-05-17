@@ -71,10 +71,15 @@ applied analytically (positions forced flat, not rows deleted).
 
 ## Signal Behavior
 
-The traded signal is the RV1 OLS residual and its 63-day z-score.
-Distribution and stationarity were characterised in Sprint v3
-(C19–C21 all passed: ADF p < 0.05, half-life ≈ 18–26 days for OLS).
-Sprint v5 adds the *trading* behaviour:
+The traded signal is the RV1 OLS residual and its 63-day z-score
+(`z_rv_hy_ig`). Distribution of the z-score over the post-warmup
+sample (n = 4532): mean −0.01, std 1.03, skew −0.17, excess kurtosis
+1.3 — near-symmetric, mildly fat-tailed; |z| > 2 on 5.2% of days.
+Coverage is 100% post-warmup (single time series, not a
+cross-section — one value per day, no missing names). Stationarity
+was established in Sprint v3 (C19–C21 all passed: ADF p < 0.05,
+OU half-life ≈ 18–26 days for the OLS hedge). Sprint v5 adds the
+*trading* behaviour:
 
 **Trade counts and holding.** Strategy A takes 94 round-trips over
 19 years (turnover ≈ 5/yr, avg hold 15.7 days). Strategy B, gated to
@@ -248,7 +253,8 @@ inverse-vol 0.13 — neither beats the best single signal (RV2_B,
   fixed `np.random.default_rng` seeds. No other stochastic step.
 - **Data snapshot:** `features.parquet` from the `sprint-v3` tag
   (4784 × 56); `random_baseline.parquet` from `sprint-v1`.
-- **Code:** `sprint-v5` tag. Foundation committed at `a9306a1`.
+- **Code:** `sprint-v5` tag = commit `719689a` (W1–W4 engine
+  foundation committed separately at `a9306a1`).
 - **Dependencies:** no new packages — the block bootstrap is
   hand-rolled.
 

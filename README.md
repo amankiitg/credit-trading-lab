@@ -2,6 +2,12 @@
 
 Research platform for credit relative-value trading strategies. Combines a Python data pipeline with a C++17 pricing engine to build duration-hedged RV signals for HY/IG credit spreads. The central thesis: equity markets incorporate risk faster than credit, creating predictable lag-driven dislocations.
 
+## Tier 1 — complete (5 sprints, tagged `sprint-v1` … `sprint-v5`)
+
+Tier 1 built the full research stack — data pipeline, C++ pricer, RV signals, regime analytics, a visualizer, and a costed backtest — and put the central thesis on trial under pre-registered falsification criteria.
+
+**Bottom line.** The equity-credit lag is a genuine *statistical* effect (Sprint 3: mean-reversion is ~43% faster on `equity_first` regime days) but **not a tradeable regime filter** (Sprint 5: gating trades on it gives a negative incremental Sharpe, ΔS = −0.41 with a bootstrap CI entirely below zero, and the rejection holds out-of-sample and across every robustness cut). The genuine deliverable is the **unfiltered RV1 signal** — Strategy A, net Sharpe 0.59, 81% hit rate after costs. The honest negative on the regime overlay is itself a Tier-1 result: a pre-registered hypothesis, falsified cleanly and documented. Tier 2 would test the lag as a position-*sizing* input rather than an entry *gate*, and harden Strategy A toward paper trading.
+
 ## Architecture
 
 ```

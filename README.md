@@ -6,7 +6,7 @@ Research platform for credit relative-value trading strategies. Combines a Pytho
 
 Tier 1 built the full research stack — data pipeline, C++ pricer, RV signals, regime analytics, a visualizer, and a costed backtest — and put the central thesis on trial under pre-registered falsification criteria.
 
-**Bottom line.** The equity-credit lag is a genuine *statistical* effect (Sprint 3: mean-reversion is ~43% faster on `equity_first` regime days) but **not a tradeable regime filter** (Sprint 5: gating trades on it gives a negative incremental Sharpe, ΔS = −0.41 with a bootstrap CI entirely below zero, and the rejection holds out-of-sample and across every robustness cut). The genuine deliverable is the **unfiltered RV1 signal** — Strategy A, net Sharpe 0.59, 81% hit rate after costs. The honest negative on the regime overlay is itself a Tier-1 result: a pre-registered hypothesis, falsified cleanly and documented. Tier 2 would test the lag as a position-*sizing* input rather than an entry *gate*, and harden Strategy A toward paper trading.
+**Bottom line.** The equity-credit lag is a genuine *statistical* effect (Sprint 3, restated in Sprint 5.5: mean-reversion is ~67% faster on `equity_first` regime days on the tradeable OLS residual) but **not a tradeable regime filter** (Sprint 5: gating trades on it gives a negative incremental Sharpe, ΔS = −0.41 with a bootstrap CI entirely below zero, and the rejection holds out-of-sample and across every robustness cut). The genuine deliverable is the **unfiltered RV1 signal** — Strategy A, net Sharpe 0.59, 81% hit rate after costs. The honest negative on the regime overlay is itself a Tier-1 result: a pre-registered hypothesis, falsified cleanly and documented. Tier 2 would test the lag as a position-*sizing* input rather than an entry *gate*, and harden Strategy A toward paper trading.
 
 ## Architecture
 
@@ -58,9 +58,9 @@ Status (V1–V10 complete, tagged `sprint-v3`):
 - V3 ✓ rolling OLS hedge: residual variance reduced 11–47× vs raw spread on all 3 pairs
 - V4 ✓ 2-state Kalman hedge: α/β random-walk states, residual variance ~20× smaller than OLS
 - V5 ✓ DV01 hedge via C++ pricer (`dv01_hedge`): full 4784-day sweep in 0.45s; pair-1 ratio mean 0.46 matches theoretical 4y/9y duration ratio
-- V6 ✓ best-method selection + features.parquet 56-col enrichment (`enrich_with_rv`); Kalman wins ADF on all 3 pairs; 25/25 sprint-1 tests still green
+- V6 ✓ best-method selection + features.parquet 56-col enrichment (`enrich_with_rv`); Kalman wins ADF on all 3 pairs; 25/25 sprint-1 tests still green — **⚠ superseded by Sprint 5.5: ADF selection rewards whitening; the tradeability selector picks OLS for all 3 pairs**
 - V7 ✓ stationarity, cointegration, half-life tests: 9/9 pass (C19/C20/C21)
-- V8 ✓ regime quality table (63 rows) + **C22 thesis PASSES** (RV1 equity_first half-life is 43–67% shorter than neither across methods); C23 fails on 4/9 (OLS β crosses zero); C24 passes
+- V8 ✓ regime quality table (63 rows) + **C22 thesis PASSES** (RV1 equity_first half-life is 43–67% shorter than neither across methods); C23 fails on 4/9 (OLS β crosses zero); C24 passes — **⚠ Sprint 5.5 errata: "across methods" retired (43% leg was whitened Kalman); honest claim is 67% on OLS only; table now 56 rows**
 - V9 ✓ ELI-10 validation notebook (`notebooks/03_rv_signals.ipynb`, 25 cells) with 6 plots in `sprints/v3/plots/`
 - V10 ✓ sprint close, full test suite (38 Catch2 + 48/51 pytest, 3 documented option-3 honest failures), `sprints/v3/WALKTHROUGH.md`
 
@@ -70,7 +70,7 @@ Status (V1–V10 complete, tagged `sprint-v3`):
 | C19 — RV residual stationarity | ✓ all 3 |
 | C20 — cointegration via best method | ✓ all 3 |
 | C21 — half-life ∈ [1, 126] | ✓ all 3 |
-| C22 — equity-credit lag thesis | ✓ 43–67% shorter |
+| C22 — equity-credit lag thesis | ✓ 67% shorter (OLS; v5.5 restated, was "43–67% across methods") |
 | C23 — hedge ratio CV < 1.0 | partial: DV01 ✓, OLS/Kalman fail on regime shifts |
 | C24 — quality parquet schema | ✓ |
 
@@ -102,7 +102,22 @@ A backtest engine (cost model, position state machine, mark-to-market P&L, metri
 | C30 — robust across grid + subperiods | ✗ FAIL (0/27 cells) |
 | C31 — no single trade >25% of P&L | ✗ FAIL (B: 49%) |
 
-**Headline finding.** The equity-credit lag is a real *statistical* effect (Sprint 3 C22: ~43% faster mean-reversion on `equity_first` days) but **not a tradeable regime filter** — gating discards ~85% of trades and the lost diversification outweighs the faster reversion. The unfiltered Strategy A (net Sharpe 0.59, 81% hit rate) is the better strategy and the genuine Tier-1 deliverable. Engine gates pass, so this is a correctly-measured, pre-registered rejection.
+**Headline finding.** The equity-credit lag is a real *statistical* effect (Sprint 3 C22, restated in Sprint 5.5: ~67% faster mean-reversion on `equity_first` days on the tradeable OLS residual) but **not a tradeable regime filter** — gating discards ~85% of trades and the lost diversification outweighs the faster reversion. The unfiltered Strategy A (net Sharpe 0.59, 81% hit rate) is the better strategy and the genuine Tier-1 deliverable. Engine gates pass, so this is a correctly-measured, pre-registered rejection.
+
+### Sprint 5.5 — Foundation Repair (pre-Tier-2 gate, complete)
+
+A **corrective** sprint, not new research. Auditing the signal-generation layer before Tier 2 surfaced that **three different residuals travelled under the name `rv_hy_ig`**: the pipeline's `select_best_method` ranked hedge methods by *lowest ADF p-value* — which rewards whitening — so `features.parquet` and the dashboard published the **Kalman posterior** residual (std 0.005, half-life ~1.5 days = whitened noise), while the v5 backtest correctly traded the **OLS** residual it deliberately chose. v5.5 collapses these to one honest, consistently-consumed residual and restates the affected claims. **Strategy A is unchanged — net Sharpe 0.591, bit-identical to v5** (the winner always traded the clean OLS residual; the rot was in the layer around it). See `sprints/v5.5/{PRD,TASKS,WALKTHROUGH,notes}.md` and `notebooks/06_foundation_repair.ipynb`.
+
+| Falsification (errata namespace) | Result |
+|---|---|
+| E1 — features / dashboard / backtest read **bit-identical** residual | ✓ PASS |
+| E2 — no stored residual has half-life < 5d (no whitened residual survives) | ✓ PASS |
+| E3 — Kalman residual is the one-step-ahead innovation, not the posterior | ✓ PASS |
+| E4 — `rv_xterm` DV01 (a copy of pair-1's ratio) removed | ✓ PASS |
+| E5 — C22 restated on the canonical OLS residual only | ✓ PASS |
+| E6 — Strategy A re-validated through the unchanged v5 engine | ✓ PASS (Sharpe 0.591, Δ +0.001) |
+
+**Corrections to the Sprint 3 record:** (1) the "best method = Kalman" claim was an artifact of the ADF selector — the tradeability selector (stationary **and** half-life ∈ [5, 63] days) picks **OLS** for all three pairs; (2) the C22 "43–67% shorter *across methods*" framing is retired — the 43% end was the whitened Kalman residual (0.85d vs 1.46d = noise vs noise) and the DV01 leg is non-stationary; the honest number is **67% shorter on OLS only**, and C22 still passes. The `regime_signal_quality.parquet` schema is 56 rows (was 63; the 7 `rv_xterm/dv01` rows removed).
 
 ## Building
 

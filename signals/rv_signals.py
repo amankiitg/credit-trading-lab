@@ -69,8 +69,15 @@ def kalman_hedge(
     Initial state from OLS on the first ``init_window`` valid rows.
     R estimated from that OLS residual variance.
 
-    Returns (residual, β_t) Series aligned to y.index. Values prior
-    to init_window are NaN.
+    Returns (residual, β_t) Series aligned to y.index. The residual is
+    the **one-step-ahead innovation** e_t = y_t − [1, x_t] · s_{t|t-1}:
+    the prediction error formed from the *prior* state (β estimated
+    through t-1) and today's x_t. This uses only information available
+    at t and is the tradeable deviation. (v5.5 fix — previously this
+    returned the *posterior* residual y_t − [1, x_t] · s_{t|t}, measured
+    after the filter absorbed y_t, which shrinks it toward zero and
+    whitens it; see sprints/v5.5/PRD.md E3.) Values prior to
+    init_window are NaN.
     """
     if not y.index.equals(x.index):
         x = x.reindex(y.index)
@@ -104,11 +111,11 @@ def kalman_hedge(
         H = np.array([1.0, xv[t]])
         S = float(H @ P_pred @ H + R)
         K = (P_pred @ H) / S
-        innov = yv[t] - H @ s
+        innov = yv[t] - H @ s  # one-step-ahead prediction error (prior state)
+        resid[t] = innov       # store the innovation — tradeable, past-data-only
         s = s + K * innov
         P = (np.eye(2) - np.outer(K, H)) @ P_pred
         beta[t] = s[1]
-        resid[t] = yv[t] - H @ s
 
     return (
         pd.Series(resid, index=y.index, name="kalman_residual"),
@@ -214,14 +221,17 @@ def dv01_hedge(
     hr2 = cs01_norm / dv01_norm
     res2 = features_df["hy_spread"] - hr2 * (cmd["dgs10"] / 100.0)
 
-    # Pair 3: X-term — duration adjustment ratio
-    hr3 = dv01_4y_s / dv01_9y_s
-    res3 = features_df["hy_ig"] - hr3 * ((cmd["dgs10"] - cmd["dgs2"]) / 100.0)
-
+    # Pair 3: X-term — NO DV01 hedge. (v5.5 fix, E4.) The pre-v5.5 code
+    # set hr3 = dv01_4y/dv01_9y, a verbatim copy of pair-1's bond-duration
+    # ratio that has nothing to do with hedging hy_ig against the 2s10s
+    # slope. There is no clean bond-DV01 interpretation for that pair, so
+    # the DV01 method is marked unavailable for rv_xterm; it selects among
+    # {OLS, Kalman} only. (The selector rejected the copy anyway — its
+    # half-life was ~250d, far outside the tradeable band — but a silent
+    # mislabelled hedge ratio must not be published regardless.)
     return {
         "rv_hy_ig": (res1, hr1),
         "rv_credit_rates": (res2, hr2),
-        "rv_xterm": (res3, hr3),
     }
 
 
@@ -255,8 +265,10 @@ def build_all_residuals(
             "kalman": kalman_hedge(y, x),
         }
 
+    # DV01 hedge is only defined for pairs hedged by bond/CDS instruments
+    # (rv_hy_ig, rv_credit_rates). rv_xterm has no DV01 method (v5.5 E4).
     dv = dv01_hedge(features_df, credit_data_df, pycredit)
-    for name in pairs:
+    for name in dv:
         results[name]["dv01"] = dv[name]
     return results
 
@@ -267,6 +279,13 @@ def select_best_method(
 ) -> dict[str, tuple[str, dict[str, float]]]:
     """For each pair pick the method whose residual has the lowest ADF p-value
     on post-warmup data. Returns ``{pair: (best_method, {method: p_value})}``.
+
+    DEPRECATED (v5.5). ADF p-value is a whitening detector: a residual that
+    the filter has shrunk to near-noise (e.g. the old Kalman posterior) wins
+    trivially while having no tradeable mean reversion. Use
+    ``select_tradeable_method`` instead, which gates on a tradeable half-life
+    band and tiebreaks on hedge-ratio stability. Retained only so the old v3
+    selection can be reproduced for the errata. See sprints/v5.5/PRD.md.
     """
     from statsmodels.tsa.stattools import adfuller
 
@@ -287,10 +306,131 @@ def select_best_method(
     return best
 
 
+def select_tradeable_method(
+    results: dict[str, dict[str, tuple[pd.Series, pd.Series]]],
+    warmup: int = 252,
+    hl_min: float = 5.0,
+    hl_max: float = 63.0,
+    adf_alpha: float = 0.05,
+    cv_window: int = 63,
+) -> dict[str, tuple[str | None, dict[str, dict[str, float]]]]:
+    """Select the hedge method that yields a *tradeable* residual per pair.
+
+    A method **qualifies** for a pair iff, on post-warmup data, its residual
+    is both:
+      - stationary: ADF p-value < ``adf_alpha``, AND
+      - mean-reverting on a tradeable horizon: OU half-life ∈
+        ``[hl_min, hl_max]`` trading days.
+
+    The half-life band is the key discriminator that ADF alone lacks: it
+    rejects whitened residuals (half-life below ~1 day — already reverted
+    before you can act) *and* too-slow residuals (half-life beyond a quarter
+    — indistinguishable from a non-stationary drift over a real holding
+    period).
+
+    Among qualifiers, the **tiebreak** is the most stable hedge ratio:
+    lowest median rolling-``cv_window`` coefficient of variation
+    (std/|mean|) of the hedge-ratio series — the most economically grounded,
+    least overfit hedge. (Often only one method qualifies, in which case the
+    band alone decides and the tiebreak does not bind.)
+
+    Returns ``{pair: (chosen_method | None, diagnostics)}`` where
+    ``diagnostics[method] = {adf_p, half_life, hedge_cv, qualified}``. A pair
+    with **no** qualifying method returns ``(None, diagnostics)`` — it is
+    reported as not tradeable rather than forced to a disqualified pick.
+    """
+    from statsmodels.tsa.stattools import adfuller
+
+    from signals.halflife import ou_halflife
+
+    out: dict[str, tuple[str | None, dict[str, dict[str, float]]]] = {}
+    for pair, methods in results.items():
+        diag: dict[str, dict[str, float]] = {}
+        for m, (resid, hr) in methods.items():
+            r = resid.iloc[warmup:].dropna()
+            if len(r) < 50:
+                diag[m] = dict(
+                    adf_p=1.0, half_life=float("inf"),
+                    hedge_cv=float("inf"), qualified=False,
+                )
+                continue
+            try:
+                adf_p = float(adfuller(r, autolag="AIC")[1])
+            except Exception:
+                adf_p = 1.0
+            hl = ou_halflife(r)
+            if hr is None:
+                hedge_cv = float("inf")
+            else:
+                cv = hedge_ratio_cv(hr, window=cv_window).iloc[warmup:].dropna()
+                hedge_cv = float(cv.median()) if len(cv) else float("inf")
+            qualified = bool(adf_p < adf_alpha and hl_min <= hl <= hl_max)
+            diag[m] = dict(
+                adf_p=adf_p, half_life=hl, hedge_cv=hedge_cv, qualified=qualified,
+            )
+        qualifiers = {m: d for m, d in diag.items() if d["qualified"]}
+        chosen = min(qualifiers, key=lambda m: qualifiers[m]["hedge_cv"]) if qualifiers else None
+        out[pair] = (chosen, diag)
+    return out
+
+
 def trailing_zscore(series: pd.Series, window: int = 63) -> pd.Series:
     mu = series.rolling(window, min_periods=window).mean()
     sd = series.rolling(window, min_periods=window).std()
     return (series - mu) / sd
+
+
+# -------------------------------------------------------------- V5.5
+# Single source of truth. Every consumer (pipeline → features.parquet,
+# dashboard, backtest) imports the canonical residual from here, so the
+# residual that is published, visualized, and traded is one and the same.
+
+
+def canonical_residuals(
+    features_df: pd.DataFrame,
+    credit_data_df: pd.DataFrame,
+    pycredit: Any,
+    warmup: int = 252,
+    z_window: int = 63,
+) -> dict[str, dict[str, Any]]:
+    """The one place a residual is chosen and computed for each pair.
+
+    Builds every (pair, method) residual, runs ``select_tradeable_method``,
+    and returns the **selected** residual/hedge/z per pair:
+
+        {pair: {"method": str | None,
+                "residual": pd.Series,
+                "hedge_ratio": pd.Series,
+                "z": pd.Series,
+                "diagnostics": {method: {adf_p, half_life, hedge_cv, qualified}}}}
+
+    A pair with no qualifying method gets ``method=None`` and all-NaN
+    residual/hedge/z — it is published as *not tradeable*, never
+    back-filled with a disqualified method. ``z`` is the trailing
+    ``z_window``-day z-score of the chosen residual, computed once here so
+    every consumer uses the identical signal.
+    """
+    results = build_all_residuals(features_df, credit_data_df, pycredit)
+    selection = select_tradeable_method(results, warmup=warmup)
+
+    nan = pd.Series(np.nan, index=features_df.index)
+    out: dict[str, dict[str, Any]] = {}
+    for pair, (chosen, diag) in selection.items():
+        if chosen is None:
+            out[pair] = dict(
+                method=None, residual=nan.copy(), hedge_ratio=nan.copy(),
+                z=nan.copy(), diagnostics=diag,
+            )
+            continue
+        resid, hr = results[pair][chosen]
+        out[pair] = dict(
+            method=chosen,
+            residual=resid,
+            hedge_ratio=hr,
+            z=trailing_zscore(resid, window=z_window),
+            diagnostics=diag,
+        )
+    return out
 
 
 # ---------------------------------------------------------------- V8

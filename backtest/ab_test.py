@@ -17,7 +17,11 @@ import pandas as pd
 from backtest.engine import BacktestResult, run
 from backtest.metrics import Summary, sharpe, summary
 from execution.position import run_state_machine
-from signals.rv_signals import build_all_residuals, trailing_zscore
+from signals.rv_signals import (
+    build_all_residuals,
+    select_tradeable_method,
+    trailing_zscore,
+)
 
 WARMUP: int = 378
 Z_WINDOW: int = 63
@@ -37,6 +41,30 @@ class StrategySpec:
     entry: float = 2.0
     exit_t: float = 0.5
     stop: float = 4.0
+
+
+def _resolve_method(
+    residuals: dict[str, dict[str, tuple[pd.Series, pd.Series]]],
+    pair: str,
+    method: str | None,
+) -> str:
+    """Resolve the hedge method for a headline run.
+
+    ``method=None`` (the default for the headline entry points) means "use
+    whatever the v5.5 tradeability selector picks" — the same method written
+    to features.parquet — so the backtest follows the selector rather than a
+    hardcoded 'ols' that merely happens to match today. An explicit method
+    (e.g. the robustness panel's 'kalman'/'dv01') is passed through unchanged.
+    """
+    if method is not None:
+        return method
+    chosen = select_tradeable_method(residuals)[pair][0]
+    if chosen is None:
+        raise ValueError(
+            f"{pair}: no method passes the tradeability selector — pair is "
+            f"not tradeable, cannot run a headline strategy on it."
+        )
+    return chosen
 
 
 def build_strategy(
@@ -146,7 +174,7 @@ def compare(
     features: pd.DataFrame,
     residuals: dict[str, dict[str, tuple[pd.Series, pd.Series]]],
     pair: str = "rv_hy_ig",
-    method: str = "ols",
+    method: str | None = None,
     entry: float = 2.0,
     exit_t: float = 0.5,
     stop: float = 4.0,
@@ -154,7 +182,12 @@ def compare(
     block: int = 21,
     seed: int = BOOTSTRAP_SEED,
 ) -> ABResult:
-    """Run the A/B comparison and bootstrap the incremental Sharpe."""
+    """Run the A/B comparison and bootstrap the incremental Sharpe.
+
+    ``method=None`` uses the canonical (tradeability-selected) hedge for
+    the pair — the residual published to features.parquet.
+    """
+    method = _resolve_method(residuals, pair, method)
     spec_a = StrategySpec(pair, method, gated=False, entry=entry, exit_t=exit_t, stop=stop)
     spec_b = StrategySpec(pair, method, gated=True, entry=entry, exit_t=exit_t, stop=stop)
     res_a = build_strategy(features, residuals, spec_a)
@@ -195,7 +228,7 @@ def walk_forward(
     features: pd.DataFrame,
     residuals: dict[str, dict[str, tuple[pd.Series, pd.Series]]],
     pair: str = "rv_hy_ig",
-    method: str = "ols",
+    method: str | None = None,
     oos_split: str = OOS_SPLIT,
 ) -> WalkForwardResult:
     """Grid-calibrate thresholds on the train window, lock, test OOS.
@@ -203,8 +236,10 @@ def walk_forward(
     Thresholds are chosen to maximise Strategy B's net Sharpe on
     2007-01-01 → ``oos_split``. They are then frozen and the A/B
     incremental Sharpe is reported on ``oos_split`` → end. No
-    test-window data touches the calibration.
+    test-window data touches the calibration. ``method=None`` uses the
+    canonical (tradeability-selected) hedge.
     """
+    method = _resolve_method(residuals, pair, method)
     split = pd.Timestamp(oos_split)
 
     best: tuple[float, float, float, float] | None = None  # (entry, exit, stop, train_sharpe)
@@ -275,9 +310,13 @@ def parameter_grid(
     features: pd.DataFrame,
     residuals: dict[str, dict[str, tuple[pd.Series, pd.Series]]],
     pair: str = "rv_hy_ig",
-    method: str = "ols",
+    method: str | None = None,
 ) -> pd.DataFrame:
-    """ΔS over the 27-cell entry × exit × stop grid (C30)."""
+    """ΔS over the 27-cell entry × exit × stop grid (C30).
+
+    ``method=None`` uses the canonical (tradeability-selected) hedge.
+    """
+    method = _resolve_method(residuals, pair, method)
     rows = []
     for entry in GRID_ENTRY:
         for exit_t in GRID_EXIT:
@@ -295,13 +334,17 @@ def subperiod_split(
     features: pd.DataFrame,
     residuals: dict[str, dict[str, tuple[pd.Series, pd.Series]]],
     pair: str = "rv_hy_ig",
-    method: str = "ols",
+    method: str | None = None,
     entry: float = 2.0,
     exit_t: float = 0.5,
     stop: float = 4.0,
     split: str = SUBPERIOD_SPLIT,
 ) -> dict[str, float]:
-    """ΔS in each half of the sample (C30)."""
+    """ΔS in each half of the sample (C30).
+
+    ``method=None`` uses the canonical (tradeability-selected) hedge.
+    """
+    method = _resolve_method(residuals, pair, method)
     sp = pd.Timestamp(split)
     first = (features.index[0], sp)
     second = (sp + pd.Timedelta(days=1), features.index[-1])

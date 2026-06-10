@@ -260,3 +260,29 @@ Final checklist printed by H:
 - C23: ✗ FAIL (4/9 — OLS all 3 + Kalman x-term, β crosses zero)
 - C24: ✓ PASS (63 rows)
 
+---
+
+## ⚠ Sprint 5.5 errata (2026-06-10) — read before trusting the above
+
+A pre-Tier-2 audit found a defect in this sprint's **method selection**.
+`select_best_method` ranked hedge methods by **lowest ADF p-value**, which
+is a *whitening detector*: it picked the **Kalman posterior** residual (a
+near-noise series shrunk to ~1.5-day half-life) and wrote it to
+`features.parquet` / the dashboard — while the v5 backtest correctly traded
+the **OLS** residual. Corrections:
+
+- The checklist's **"C22 ✓ PASS, ratio 0.572, 43% shorter"** is the
+  **whitened Kalman** leg (0.85d vs 1.46d = noise vs noise). The
+  "thesis supported across all three methods" claim above is misleading —
+  2 of 3 legs are degenerate (Kalman whitened, DV01 non-stationary/slow).
+  Restated on the canonical **OLS** residual: **67% shorter** (5.3d vs
+  16.2d); C22 still passes. The honest headline is **67%, OLS only**.
+- "**Kalman wins ADF**" is an artifact of the wrong objective. The v5.5
+  tradeability selector (stationary **and** half-life ∈ [5, 63]) picks
+  **OLS** for all three pairs.
+- `rv_xterm`'s DV01 hedge was a verbatim copy of pair-1's 4y/9y ratio —
+  **removed**. `regime_signal_quality.parquet` is now **56 rows** (was 63).
+
+See `sprints/v5.5/{PRD,WALKTHROUGH,notes}.md`. Strategy A was unaffected —
+it always traded OLS; net Sharpe 0.591, bit-identical to v5.
+

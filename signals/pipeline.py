@@ -123,20 +123,24 @@ def enrich_with_rv(
     credit_data_path: Path = RAW_CREDIT_PATH,
     out_path: Path = PROCESSED_PATH,
 ) -> pd.DataFrame:
-    """Populate the 5 RV stub columns with the best-method residuals,
+    """Populate the 5 RV stub columns with the **canonical** residuals,
     add 3 regime label columns and 3 z_rv columns. Writes the
     56-column feature frame and returns it.
+
+    v5.5: residuals come from ``canonical_residuals`` (the single source
+    of truth), not the deprecated ADF-based ``select_best_method``. The
+    selector qualifies a method only if its residual is stationary *and*
+    has a tradeable OU half-life ∈ [5, 63] days, so the whitened Kalman
+    residual that the old selector published is no longer stored. A pair
+    with no qualifying method is written as all-NaN (not tradeable), never
+    back-filled. See sprints/v5.5/PRD.md.
     """
     print("[pipeline] enrich_with_rv()")
 
     import pycredit  # noqa: F401  - imported lazily; required for V5 sweep
 
     from signals.regimes import equity_credit_lag, equity_regime, vol_regime
-    from signals.rv_signals import (
-        build_all_residuals,
-        select_best_method,
-        trailing_zscore,
-    )
+    from signals.rv_signals import canonical_residuals
 
     cmd = pd.read_parquet(credit_data_path)
 
@@ -149,21 +153,26 @@ def enrich_with_rv(
     )
     print(f"  [enrich] +regimes: {feats.shape[1]} cols")
 
-    # ---- 9 residuals + best-method selection
-    results = build_all_residuals(feats, cmd, pycredit)
-    best = select_best_method(results, warmup=WARMUP)
-    for pair, (m, scores) in best.items():
-        adf_str = " ".join(f"{k}={v:.3f}" for k, v in scores.items())
-        print(f"  [select] {pair}: best={m}  (ADF p: {adf_str})")
+    # ---- canonical residual per pair (single source of truth)
+    canon = canonical_residuals(feats, cmd, pycredit, warmup=WARMUP, z_window=Z_RV_WINDOW)
+    for pair, info in canon.items():
+        d = info["diagnostics"].get(info["method"]) if info["method"] else None
+        if d is None:
+            print(f"  [select] {pair}: NOT TRADEABLE (no method qualified) -> NaN")
+        else:
+            print(
+                f"  [select] {pair}: canonical={info['method']}  "
+                f"(adf_p={d['adf_p']:.2e}  half_life={d['half_life']:.1f}d  "
+                f"hedge_cv={d['hedge_cv']:.3f})"
+            )
 
-    # ---- write best-method residuals + hedge ratios + z_rv
-    for pair, (best_method, _) in best.items():
-        resid, hr = results[pair][best_method]
+    # ---- write canonical residuals + hedge ratios + z_rv
+    for pair, info in canon.items():
         resid_col, hr_col, z_col = _PAIR_TO_STUB[pair]
-        feats[resid_col] = resid
+        feats[resid_col] = info["residual"]
         if hr_col is not None:
-            feats[hr_col] = hr
-        feats[z_col] = trailing_zscore(resid, window=Z_RV_WINDOW)
+            feats[hr_col] = info["hedge_ratio"]
+        feats[z_col] = info["z"]
     print(f"  [enrich] +rv populated + z_rv: {feats.shape[1]} cols")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)

@@ -207,6 +207,7 @@ def render(
     st.plotly_chart(fig, use_container_width=True)
 
     # Static stats strip
+    st.caption("Residual diagnostics · computed on selected date range · threshold-independent")
     stats = _stats_strip(pair, sub)
     cols = st.columns(4)
     cols[0].metric("OU half-life (days)",

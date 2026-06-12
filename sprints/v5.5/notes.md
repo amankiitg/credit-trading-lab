@@ -332,7 +332,7 @@ shrank.
 
 ## R8.5 — Before/after notebook (2026-06-10)
 
-`notebooks/06_foundation_repair.ipynb` (generator
+`notebooks/55_foundation_repair.ipynb` (generator
 `scripts/build_notebook_v5_5.py`) — executes clean via nbconvert (exit 0,
 5/5 code cells, 0 errors). Four sections, each with a saved plot:
 

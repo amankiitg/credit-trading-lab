@@ -1,4 +1,4 @@
-"""Build notebooks/06_foundation_repair.ipynb — Sprint v5.5 before/after story."""
+"""Build notebooks/55_foundation_repair.ipynb — Sprint v5.5 before/after story."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from pathlib import Path
 
 import nbformat as nbf
 
-OUT = Path("notebooks/06_foundation_repair.ipynb")
+OUT = Path("notebooks/55_foundation_repair.ipynb")
 nb = nbf.v4.new_notebook()
 cells: list = []
 

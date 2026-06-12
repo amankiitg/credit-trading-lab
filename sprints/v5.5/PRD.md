@@ -229,7 +229,7 @@ tests/
   test_canonical.py    -- NEW: E1 equality, E2 half-life floor, E3 Kalman innovation, E4 xterm
   test_ab_test.py      -- EDIT: assert Strategy A consumes canonical residual
 notebooks/
-  06_foundation_repair.ipynb       -- NEW: before/after story (residual, selector, dashboard, Strategy A)
+  55_foundation_repair.ipynb       -- NEW: before/after story (residual, selector, dashboard, Strategy A)
 sprints/v5.5/
   PRD.md, TASKS.md, notes.md, WALKTHROUGH.md, plots/
 ```

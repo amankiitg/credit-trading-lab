@@ -138,7 +138,7 @@ PYTHONPATH=python/credit python -c "import pandas as pd; from signals.pipeline i
 
 # before/after notebook (4 sections, 4 plots)
 python scripts/build_notebook_v5_5.py
-PYTHONPATH=python/credit jupyter nbconvert --to notebook --execute --inplace notebooks/06_foundation_repair.ipynb
+PYTHONPATH=python/credit jupyter nbconvert --to notebook --execute --inplace notebooks/55_foundation_repair.ipynb
 
 # full suite — 202 pass, 3 documented honest failures (C18 ×2, C23 ×1)
 PYTHONPATH=python/credit python -m pytest tests/ -q

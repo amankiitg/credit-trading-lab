@@ -133,7 +133,7 @@ before/after notebook; R9 guards leakage; R10 documents.
   - Validation: fails if the restated claim still leans on a sub-5-day
     half-life leg; fails if the old framing is left unretired in any doc.
 
-- [x] **Task R8.5: Before/after notebook `06_foundation_repair.ipynb`**
+- [x] **Task R8.5: Before/after notebook `55_foundation_repair.ipynb`**
   - Acceptance: a runnable notebook that tells the repair story end to
     end, reading the `_pre_v5_5/` backups for "before" and the
     regenerated artifacts for "after". Four sections, each with a saved
@@ -145,7 +145,7 @@ before/after notebook; R9 guards leakage; R10 documents.
     `z_rv` series and the HIGH-conviction count vs the v4 baseline (178);
     (4) **Strategy A** — old vs new equity curve + headline metrics from
     R7. Notebook executes top-to-bottom without error via `nbconvert`.
-  - Files: `notebooks/06_foundation_repair.ipynb`,
+  - Files: `notebooks/55_foundation_repair.ipynb`,
     `sprints/v5.5/plots/*.png`.
   - Validation: fails if any cell errors on execute; fails if a plot is
     missing an axis label, units, or the date range/universe in the

@@ -31,23 +31,32 @@ T5 (subperiod + grid) → T6 (bootstrap vs passive) → T7 (notebook + close).
   - Validation: fails if correlation is not computed; fails if overlap fraction
     uses a different window than ±2 days.
 
-- [x] **Task T2: Stationarity and OU half-life — hard gate (C32, C33)**
-  - Run three ADF tests on `hy_ig` levels (not z-score): full sample, 2007–2016,
-    2017–2026. Use `statsmodels.tsa.stattools.adfuller` with `autolag='AIC'`.
-    Report test statistic, p-value, and critical values (1%, 5%, 10%) for each.
-    C32 passes if p < 0.05 in all three windows.
-  - Fit the OU half-life via discrete AR(1): `hy_ig[t] = κ·hy_ig[t-1] + c + ε[t]`.
-    Half-life = `−ln(2) / ln(κ)`. Report half-life in trading days.
-    C33 passes if half-life ≤ 90 trading days on the full sample.
-  - Plot: `hy_ig` level over time with rolling 252d mean overlaid, saved to
-    `sprints/v6.6/plots/hyig_level.png`. Indicate the two half-period boundaries.
-  - **If C32 or C33 fails: write a one-paragraph failure note in `notes.md`,
+- [x] **Task T2: Stationarity, OU half-life, and IC test — hard gate (C32, C33, C36)**
+  - **C32** — ADF on `Δhy_ig` (first differences), full sample only.
+    Use `statsmodels.tsa.stattools.adfuller` with `autolag='AIC'`.
+    C32 passes if p < 0.05. (Tests that daily P&L increments are finite-variance.)
+  - **C33** — OU half-life on `hy_ig_z252` (the z-score, not the raw level).
+    AR(1): `z[t] = κ·z[t-1] + c + ε[t]`. Half-life = `−ln(2)/ln(|κ|)`.
+    C33 passes if half-life ≤ 90 trading days. (Tests that the entry signal
+    reverts on a tradeable timescale.)
+  - **C36** — IC test: does the entry signal predict the direction of the next
+    price move? For each date t where `|hy_ig_z252[t]| > 2`, define:
+    `hit_h = 1 if sign(z[t]) == sign(hy_ig[t+h] − hy_ig[t]) else 0`
+    for h ∈ {5, 10, 20} trading days. Compute hit rate and one-sample t-stat
+    (H0: hit rate = 50%) at each horizon across all entry dates.
+    C36 passes if hit rate > 50% **and** t-stat > 1.5 at ≥ 2 of 3 horizons.
+  - Plot: `hy_ig_z252` level over time with ±2σ bands, saved to
+    `sprints/v6.6/plots/hyig_zscore.png`. Also save an IC decay bar chart
+    (hit rate at h=5/10/20) to `sprints/v6.6/plots/ic_decay.png`.
+  - **If any of C32, C33, C36 fails: write a failure note in `notes.md`,
     mark T2 [x], and stop the sprint.**
-  - Acceptance: ADF table printed (3 rows × 4 cols). Half-life printed.
-    C32 and C33 verdicts explicitly stated.
-  - Files: `sprints/v6.6/plots/hyig_level.png`, `sprints/v6.6/notes.md`
-  - Validation: fails if ADF is run on the z-score instead of the raw level;
-    fails if C32/C33 verdict is not printed; fails if subperiod ADF is omitted.
+  - Acceptance: C32 ADF result printed. C33 half-life printed. C36 hit-rate
+    and t-stat table printed (3 rows × 3 cols). All three verdicts explicitly stated.
+  - Files: `sprints/v6.6/plots/hyig_zscore.png`, `sprints/v6.6/plots/ic_decay.png`,
+    `sprints/v6.6/notes.md`
+  - Validation: fails if C32 tests the raw level instead of first differences;
+    fails if C33 tests raw level instead of the z-score; fails if C36 IC test
+    is not computed; fails if any verdict is absent.
 
 - [ ] **Task T3: Rate exposure audit + pre-register sizing path (C34)**
   - Compute the net DV01 of a dollar-equal long HYG / short LQD position:

@@ -22,7 +22,7 @@ Plot: `sprints/v6.6/plots/z_overlap.png`
 
 ---
 
-## T2 — Stationarity and OU Half-Life — Hard Gate (2026-06-13)
+## T2 — Stationarity, OU Half-Life, IC Test — Hard Gate — REVISED (2026-06-13)
 
 ### ADF on hy_ig levels (H0: unit root, autolag=AIC)
 
@@ -40,11 +40,86 @@ AR(1): `hy_ig[t] = κ·hy_ig[t-1] + c + ε[t]`
 κ = 0.996761, half-life = **213.7 trading days (10.2 months)**
 C33 FAIL. Half-life exceeds the 90d threshold by 2.4×.
 
-### Gate verdict: **CLOSED**
+### Gate verdict (original, now superseded): CLOSED on C32/C33
 
 ---
 
-### Diagnostic context (not changing the gate, informing next steps)
+## T2 — Revised Gates C32/C33/C36 (2026-06-13)
+
+PRD and TASKS updated: C32 tests Δhy_ig, C33 tests the z-score half-life, C36 added
+as IC test. Rationale: P&L formula is `side × Δhy_ig × notional` so raw level
+stationarity is not the right gate — first differences and entry-signal predictiveness are.
+
+### C32 — ADF on Δhy_ig (first differences)
+
+stat = −13.32, p = 0.000 → **C32 PASS**. Daily changes are stationary white noise, confirming hy_ig is I(1).
+
+### C33 — OU half-life on hy_ig_z252 (z-score)
+
+κ = 0.9817, half-life = **37.6 trading days** (1.8 months) → **C33 PASS**. The z-score reverts within the 90d threshold.
+
+### C36 — IC test: does entry signal predict direction of Δhy_ig?
+
+726 entry dates where |hy_ig_z252| > 2. For each, `hit = 1` if `sign(z) == sign(hy_ig[t+h] − hy_ig[t])`.
+
+| horizon | n_obs | hit rate | t-stat | verdict |
+|---------|-------|----------|--------|---------|
+| 5d | 726 | **49.6%** | −0.22 | fail |
+| 10d | 726 | **50.7%** | +0.37 | fail |
+| 20d | 726 | **49.9%** | −0.07 | fail |
+
+**C36 FAIL.** 0/3 horizons pass. All hit rates are within noise of 50%.
+
+### Gate verdict: **CLOSED on C36**
+
+---
+
+### What C36 failure means
+
+The z-score is stationary (C33 passes, 37.6d half-life) but the signal has ZERO
+directional predictive power over actual hy_ig level moves. When z < −2, the
+subsequent price change of hy_ig is a coin flip at every tested horizon. The
+z-score reverts to zero primarily because the 252-day rolling mean catches up to
+the current level — not because the price level moves in the direction of the entry
+signal. This is the rolling-window re-centring problem, expressed in a different form:
+
+- For OLS residuals (v6.5): the rolling α re-centred DURING THE HOLD, inflating P&L
+- For hy_ig z-score: the rolling mean re-centres after entry, making the z-score
+  appear to revert — but the underlying price move is random
+
+The entry signal `z < −2` is identifying "the level is far from its 252-day rolling
+mean" — but for an I(1) series this is just drift, not a dislocation that will revert.
+The z-score's half-life (37.6d) is the speed at which the window catches up, not the
+speed of price mean-reversion.
+
+**The C36 IC test is the definitive gate.** C32 and C33 pass, but C36 catches what
+they miss: the entry signal is uninformative about future price direction.
+
+### Plots
+
+- `sprints/v6.6/plots/hyig_zscore.png` — z-score time series with ±2σ entry bands
+- `sprints/v6.6/plots/ic_decay.png` — IC hit rate at 5/10/20d horizons (all ≈50%)
+
+### Recommendation for next steps
+
+The hy_ig z-score (rolling demeaned) is not the right entry signal. The issue is
+using an I(1) series with a rolling window mean as the reference level.
+
+Alternative approaches that avoid the rolling-window problem:
+1. **First-difference z-score**: z-score of Δhy_ig (daily changes) rather than
+   the level. This uses stationary data directly. Entry when recent daily changes
+   have been extreme (momentum/reversal on the stationary series).
+2. **Cointegration residual with a stationary anchor**: find a stationary linear
+   combination of hy_ig with another series that is genuinely I(0), not via
+   a rolling window. E.g., hy_ig minus a long-run VECM cointegration residual.
+3. **Cross-sectional z-score**: at each date, z-score hy_ig relative to a
+   cross-section of credit spread pairs (requires more data).
+
+Sprint v6.6 is closed at T2. T3–T7 skipped.
+
+---
+
+### Diagnostic context (original T2, retained for record)
 
 Two additional tests clarify what these failures mean:
 

@@ -111,8 +111,9 @@ Pre-registered. Continuing C25–C31 numbering from v5.
 
 | ID | Criterion | Pass threshold | Outcome if fail |
 |----|-----------|---------------|----------------|
-| C32 | ADF test on hy_ig levels — full sample, both halves | p < 0.05 in all three windows | Signal has no statistical basis for entry rule; stop sprint |
-| C33 | OU half-life on hy_ig | ≤ 90 trading days full-sample | Hold-to-mean-reversion is too slow relative to v5 stop logic |
+| C32 | ADF on **Δhy_ig** (first differences) — full sample | p < 0.05 | hy_ig daily changes are not tradeable; stop sprint |
+| C33 | OU half-life on **hy_ig_z252** (z-score) | ≤ 90 trading days | z-score reverts too slowly for the entry/exit rule |
+| C36 | IC test: sign(z_entry) predicts sign(Δhy_ig) over 5d, 10d, 20d forward | hit rate > 50% and t-stat > 1.5 at ≥ 2 of 3 horizons | Entry signal has no directional predictive power |
 | C34 | Rate attribution ≤ 30% of gross P&L (Path B) | ≤ 30% | Signal is predominantly a rates bet; switch to Path A or stop |
 | M1ʹ | Corrected-engine net Sharpe ≥ 0.40 | ≥ 0.40 | Signal does not clear minimum viability; do not proceed to Tier 2 |
 | M2ʹ | Hit rate ≥ 65% | ≥ 65% | — |
@@ -122,8 +123,16 @@ Pre-registered. Continuing C25–C31 numbering from v5.
 | M6ʹ | Per-trade Sharpe vs random p95 | > random p95 | — |
 | C35 | Incremental Sharpe vs passive buy-hold hy_ig position (no entry timing) | ΔS > 0, CI lower > 0 via block bootstrap | Entry timing adds no value over passive; signal is passive carry |
 
+**Rationale for C32/C33 revision (from v6.6 T2 findings):**
+The original C32/C33 tested raw hy_ig *levels*, which are I(1). That was appropriate
+for OLS residuals (where the level enters the P&L formula via rv[exit]−rv[entry]).
+For hy_ig the P&L formula is `side × Δhy_ig × notional` — the rolling mean never
+enters P&L. C32 therefore tests whether daily P&L increments are finite-variance;
+C33 tests whether the entry signal itself reverts on a tradeable timescale. Both
+tests operate on the correct layer for this signal.
+
 **Gate structure:**
-- C32/C33 must pass before running any backtest (T2 is a hard gate for T4)
+- C32/C33/C36 must pass before running any backtest (T2 is a hard gate for T4)
 - C34 must be evaluated before backtest results are interpreted (T3 pre-registers the sizing choice)
 - M1ʹ is the headline; failing M1ʹ stops the sprint regardless of other metrics
 

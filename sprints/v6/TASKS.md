@@ -10,7 +10,7 @@ T5 (beta audit) → T6 (plots) → T7 (notebook) → T8 (summary + close).
 
 ---
 
-- [ ] **Task T1: Load and enrich trade ledger**
+- [x] **Task T1: Load and enrich trade ledger**
   - Build the attribution table: run `build_strategy(features, residuals,
     StrategySpec('rv_hy_ig','ols',gated=False))` to get the 94-trade ledger.
     Join `features.parquet` on `entry_fill_date` and `exit_fill_date` to attach:
@@ -25,7 +25,7 @@ T5 (beta audit) → T6 (plots) → T7 (notebook) → T8 (summary + close).
   - Validation: fails if any NaN in delta_hy or delta_ig (would silently zero out
     decomposition); fails if row count ≠ 94.
 
-- [ ] **Task T2: Per-trade P&L decomposition — FA1, FA2**
+- [x] **Task T2: Per-trade P&L decomposition — FA1, FA2**
   - Compute per-trade (sign convention: hy_spread = ln(HYG/IEF), log price ratio,
     not OAS — rising value = credit rally):
     ```
@@ -48,7 +48,7 @@ T5 (beta audit) → T6 (plots) → T7 (notebook) → T8 (summary + close).
     the mean ratio without the aggregate sum ratio; fails if hedge_ratio_exit is used
     instead of hedge_ratio_entry.
 
-- [ ] **Task T3: Regime breakdown — FA3**
+- [x] **Task T3: Regime breakdown — FA3**
   - Slice trades by `vol_regime` (high/low), `equity_regime` (bull/bear), and
     `equity_credit_lag` (equity_first/credit_first/neither) based on value at
     entry date. For each slice report: n_trades, mean net_pnl, hit rate,
@@ -65,7 +65,7 @@ T5 (beta audit) → T6 (plots) → T7 (notebook) → T8 (summary + close).
     verdict is missing; fails if a bucket with n_trades < 5 reports hit rate
     without a "too few to conclude" caveat.
 
-- [ ] **Task T4: Holding-period concentration — FA4**
+- [x] **Task T4: Holding-period concentration — FA4**
   - Bucket trades by holding_days:
     - very_short: < 5d
     - short: 5–10d
@@ -86,7 +86,7 @@ T5 (beta audit) → T6 (plots) → T7 (notebook) → T8 (summary + close).
   - Validation: fails if bucket thresholds differ from PRD; fails if
     correlation between holding_days and net_pnl is not reported.
 
-- [ ] **Task T5: Net credit beta audit**
+- [x] **Task T5: Net credit beta audit**
   - Check whether Strategy A runs systematic directional credit exposure.
     For each calendar date in the backtest, compute the net HY spread sensitivity
     of all open positions: `net_hy_beta(t) = Σ side_i × 1` for all open trades.
@@ -104,7 +104,7 @@ T5 (beta audit) → T6 (plots) → T7 (notebook) → T8 (summary + close).
   - Validation: fails if only entry dates are used — exposure must span all
     active holding days, not just the day a trade opens.
 
-- [ ] **Task T6: Cumulative attribution curves**
+- [x] **Task T6: Cumulative attribution curves**
   - Build the time-series view of attribution:
     (a) For each trade, assign the P&L components (hy_leg_pnl, ig_hedge_pnl,
         cost, net_pnl) to a single date (exit_fill_date — when the P&L is realised).
@@ -121,7 +121,7 @@ T5 (beta audit) → T6 (plots) → T7 (notebook) → T8 (summary + close).
   - Validation: fails if net_pnl cumulative final value doesn't match v5 within
     $5k; fails if axes are unlabelled.
 
-- [ ] **Task T7: Notebook assembly — `06_factor_attribution.ipynb`**
+- [x] **Task T7: Notebook assembly — `06_factor_attribution.ipynb`**
   - Write `scripts/build_attribution.py` (generator) and produce
     `notebooks/06_factor_attribution.ipynb`. Four sections:
     (1) Data enrichment (T1 — show enriched table head, assert no NaNs)
@@ -138,7 +138,7 @@ T5 (beta audit) → T6 (plots) → T7 (notebook) → T8 (summary + close).
   - Validation: fails if any cell has an error output; fails if any FA
     verdict is not printed in the notebook output.
 
-- [ ] **Task T8: Attribution summary + sprint close**
+- [x] **Task T8: Attribution summary + sprint close**
   - Write `sprints/v6/attribution_summary.md`. Required content:
     (a) FA1–FA4 scorecard table with stored numbers for every criterion
     (b) Narrative: what the decomposition says about the source of edge

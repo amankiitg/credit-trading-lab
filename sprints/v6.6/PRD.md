@@ -1,6 +1,6 @@
-# Sprint v5.7 — hy_ig Signal: Tier 1 Validation (Fresh Hypothesis)
+# Sprint v6.6 — hy_ig Signal: Tier 1 Validation (Fresh Hypothesis)
 
-## Context: Why v5.7 and Not a Tier 2 Sprint
+## Context: Why v6.6 and Not a Tier 2 Sprint
 
 Sprint v6.5 disqualified all three Tier 1 signals (RV1_A, RV2_A, RV3_A) under
 fixed-entry accounting. The rolling OLS intercept α was booking model re-centring
@@ -245,7 +245,7 @@ features.parquet (hy_ig, hy_ig_z252)
       ↓
 [T6] Bootstrap vs passive buy-hold hy_ig (C35)
       ↓
-[T7] Notebook notebooks/05_7_hyig_validation.ipynb + sprint close
+[T7] Notebook notebooks/06_6_hyig_validation.ipynb + sprint close
 ```
 
 ---
@@ -292,4 +292,4 @@ features.parquet (hy_ig, hy_ig_z252)
   bypass (no OLS call needed)
 - `sprints/v5/PRD.md` — C25–C31 definitions (C32–C35 continue that numbering)
 - `sprints/v5.6/signal_selection.md` — M1–M8 definitions (M1ʹ–M6ʹ mirror these)
-- `sprints/v6.5/correction_summary.md` — withdrawal statement; v5.7 is the response
+- `sprints/v6.5/correction_summary.md` — withdrawal statement; v6.6 is the response

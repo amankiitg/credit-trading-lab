@@ -1,4 +1,4 @@
-# Sprint v5.7 — Tasks
+# Sprint v6.6 — Tasks
 
 Seven tasks. Hard gates at T2 (C32/C33 stationarity) and T4 (M1ʹ Sharpe).
 If either gate fails, stop and write a failure note; do not proceed further.
@@ -25,9 +25,9 @@ T5 (subperiod + grid) → T6 (bootstrap vs passive) → T7 (notebook + close).
         entry ±2 days — these are the "new" signals hy_ig would fire that RV1_A missed.
     Print the four results. No trade/backtest in this task.
   - Acceptance: all four metrics printed. Scatter plot of `z_rv_hy_ig` vs
-    `hy_ig_z252` saved to `sprints/v5.7/plots/z_overlap.png`. Overlap fraction
+    `hy_ig_z252` saved to `sprints/v6.6/plots/z_overlap.png`. Overlap fraction
     and correlation explicitly stated.
-  - Files: `sprints/v5.7/plots/z_overlap.png`, `sprints/v5.7/notes.md`
+  - Files: `sprints/v6.6/plots/z_overlap.png`, `sprints/v6.6/notes.md`
   - Validation: fails if correlation is not computed; fails if overlap fraction
     uses a different window than ±2 days.
 
@@ -40,12 +40,12 @@ T5 (subperiod + grid) → T6 (bootstrap vs passive) → T7 (notebook + close).
     Half-life = `−ln(2) / ln(κ)`. Report half-life in trading days.
     C33 passes if half-life ≤ 90 trading days on the full sample.
   - Plot: `hy_ig` level over time with rolling 252d mean overlaid, saved to
-    `sprints/v5.7/plots/hyig_level.png`. Indicate the two half-period boundaries.
+    `sprints/v6.6/plots/hyig_level.png`. Indicate the two half-period boundaries.
   - **If C32 or C33 fails: write a one-paragraph failure note in `notes.md`,
     mark T2 [x], and stop the sprint.**
   - Acceptance: ADF table printed (3 rows × 4 cols). Half-life printed.
     C32 and C33 verdicts explicitly stated.
-  - Files: `sprints/v5.7/plots/hyig_level.png`, `sprints/v5.7/notes.md`
+  - Files: `sprints/v6.6/plots/hyig_level.png`, `sprints/v6.6/notes.md`
   - Validation: fails if ADF is run on the z-score instead of the raw level;
     fails if C32/C33 verdict is not printed; fails if subperiod ADF is omitted.
 
@@ -61,15 +61,15 @@ T5 (subperiod + grid) → T6 (bootstrap vs passive) → T7 (notebook + close).
     × notional` for the same trades. Report mean and total rate_pnl vs quality_pnl.
     C34 passes if `|total rate_pnl / total quality_pnl| ≤ 0.30`.
   - **Pre-register sizing choice before running T4:** write one line in `notes.md`:
-    "v5.7 backtest uses Path A (DV01-neutral)" or "Path B (dollar-equal, explicit
+    "v6.6 backtest uses Path A (DV01-neutral)" or "Path B (dollar-equal, explicit
     attribution)". This must be written before T4 executes. The recommendation from
     the PRD is to start with Path B for comparability, but the choice is yours.
     If C34 fails (rate attribution > 30%), Path A must be used in T4.
   - Acceptance: DV01_net printed. Rate vs quality P&L table printed.
     C34 verdict stated. Sizing path pre-registered in notes.md.
     Bar chart of mean rate_pnl vs mean quality_pnl per trade saved to
-    `sprints/v5.7/plots/dv01_audit.png`.
-  - Files: `sprints/v5.7/plots/dv01_audit.png`, `sprints/v5.7/notes.md`
+    `sprints/v6.6/plots/dv01_audit.png`.
+  - Files: `sprints/v6.6/plots/dv01_audit.png`, `sprints/v6.6/notes.md`
   - Validation: fails if DV01_net is not computed before the backtest runs;
     fails if the sizing path is not pre-registered in notes.md before T4;
     fails if Δdgs10 is computed using exit date only (must span the hold period).
@@ -90,8 +90,8 @@ T5 (subperiod + grid) → T6 (bootstrap vs passive) → T7 (notebook + close).
   - **If M1ʹ (Sharpe ≥ 0.40) fails: write a failure note in `notes.md`,
     mark T4 [x], and stop the sprint.**
   - Acceptance: all M1ʹ–M6ʹ metrics printed. M1ʹ verdict explicitly stated.
-    Equity curve saved to `sprints/v5.7/plots/equity_hyig.png`.
-  - Files: `sprints/v5.7/plots/equity_hyig.png`, `sprints/v5.7/notes.md`
+    Equity curve saved to `sprints/v6.6/plots/equity_hyig.png`.
+  - Files: `sprints/v6.6/plots/equity_hyig.png`, `sprints/v6.6/notes.md`
   - Validation: fails if the engine uses a rolling β (OLS residual) instead of
     the raw hy_ig series; fails if Path A/B mismatch with T3 pre-registration;
     fails if the daily P&L assigns P&L to entry date (must be daily MTM).
@@ -104,10 +104,10 @@ T5 (subperiod + grid) → T6 (bootstrap vs passive) → T7 (notebook + close).
     {0.3, 0.5, 0.75} × stop ∈ {3.0, 4.0, 5.0}). For each cell report Sharpe.
     Count cells with Sharpe > 0 (M4ʹ: must be ≥ 60% = 17/27 cells).
     Save heatmap of Sharpe by entry×exit (averaging over stop) to
-    `sprints/v5.7/plots/param_grid.png`.
+    `sprints/v6.6/plots/param_grid.png`.
   - Acceptance: subperiod table printed, M5ʹ verdict stated. Grid heatmap saved,
     M4ʹ verdict (N/27 cells > 0) printed.
-  - Files: `sprints/v5.7/plots/param_grid.png`, `sprints/v5.7/notes.md`
+  - Files: `sprints/v6.6/plots/param_grid.png`, `sprints/v6.6/notes.md`
   - Validation: fails if the subperiod split uses a different date than 2016-12-31;
     fails if the grid uses the biased engine (must match T4's engine choice).
 
@@ -121,22 +121,22 @@ T5 (subperiod + grid) → T6 (bootstrap vs passive) → T7 (notebook + close).
     Report ΔS, 2.5/97.5 CI, fraction of resamples with ΔS > 0.
     C35 passes if ΔS > 0 and CI lower bound > 0.
   - Plot: equity curves of timed vs passive on the same axes saved to
-    `sprints/v5.7/plots/vs_passive.png`.
+    `sprints/v6.6/plots/vs_passive.png`.
   - Acceptance: ΔS and CI printed, C35 verdict stated. Plot saved.
-  - Files: `sprints/v5.7/plots/vs_passive.png`, `sprints/v5.7/notes.md`
+  - Files: `sprints/v6.6/plots/vs_passive.png`, `sprints/v6.6/notes.md`
   - Validation: fails if the passive benchmark uses any timing signal; fails if
     bootstrap is not seeded; fails if C35 verdict is absent from output.
 
 - [ ] **Task T7: Notebook + sprint close**
-  - Write `scripts/build_notebook_v5_7.py` and produce
-    `notebooks/05_7_hyig_validation.ipynb`. Four sections:
+  - Write `scripts/build_notebook_v6_6.py` and produce
+    `notebooks/06_6_hyig_validation.ipynb`. Four sections:
     (1) Signal characterisation vs RV1_A (T1 — overlap, correlation, scatter)
     (2) Stationarity and rate exposure (T2/T3 — ADF table, OU half-life, DV01 audit)
     (3) Backtest results (T4/T5 — M1ʹ–M6ʹ scorecard, equity curve, param grid)
     (4) Bootstrap vs passive (T6 — C35 verdict, equity overlay)
     Execute via `jupyter nbconvert --execute --inplace`. Zero cell errors.
     Last cell prints `[notebook clean]`.
-  - If all hard gates passed: write `sprints/v5.7/signal_selection.md` mirroring
+  - If all hard gates passed: write `sprints/v6.6/signal_selection.md` mirroring
     v5.6 format — M1ʹ–M6ʹ scorecard, sizing path, DV01 note, Bonferroni note
     (fourth signal tested), statement that Tier 2 sequence v6–v10 is now retargeted
     on hy_ig.
@@ -145,8 +145,8 @@ T5 (subperiod + grid) → T6 (bootstrap vs passive) → T7 (notebook + close).
     honest state of the research program is.
   - Acceptance: notebook executes clean. All hard-gate verdicts (C32, C33, M1ʹ,
     C35) visible in output. `signal_selection.md` or failure note written.
-  - Files: `notebooks/05_7_hyig_validation.ipynb`,
-    `scripts/build_notebook_v5_7.py`,
-    `sprints/v5.7/signal_selection.md` (if passes) or note in `notes.md`
+  - Files: `notebooks/06_6_hyig_validation.ipynb`,
+    `scripts/build_notebook_v6_6.py`,
+    `sprints/v6.6/signal_selection.md` (if passes) or note in `notes.md`
   - Validation: fails if any cell errors; fails if C32/C33/M1ʹ/C35 verdicts
     are absent from output; fails if the sizing path from T3 is not stated.

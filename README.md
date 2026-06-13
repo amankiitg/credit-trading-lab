@@ -2,11 +2,34 @@
 
 Research platform for credit relative-value trading strategies. Combines a Python data pipeline with a C++17 pricing engine to build duration-hedged RV signals for HY/IG credit spreads. The central thesis: equity markets incorporate risk faster than credit, creating predictable lag-driven dislocations.
 
-## Tier 1 — complete (5 sprints, tagged `sprint-v1` … `sprint-v5`)
+## Research Conclusion (sprints v1–v6.6)
+
+**No deployable mean-reversion signal was found in the current HY/IG ETF spread framework.**
+
+The research programme ran through seven sprints of Tier 1 and three accounting-audit sprints. The honest summary:
+
+| sprint | finding |
+|--------|---------|
+| v1–v4 | Data pipeline, C++ pricer, RV signals, visualizer — all valid infrastructure |
+| v5 | Strategy A (RV1_A OLS): registered net Sharpe 0.591, 81% hit rate — **subsequently invalidated** |
+| v5.5 | Foundation repair: three residuals conflated; OLS selected as canonical — valid |
+| v5.6 | Three signals admitted to Tier 2 (RV1_A 0.591, RV2_A 0.693, RV3_A 0.856) — **withdrawn** |
+| v6 | Factor attribution: 57% of RV1_A gross P&L was OLS intercept re-centring, not market moves |
+| v6.5 | Fixed-entry accounting: RV1_A corrected Sharpe **0.202** (R1 FAIL); RV2_A **−0.108**, RV3_A **−0.187** (both catastrophically negative due to rate cycle absorption). All Tier 1 admissions withdrawn. |
+| v6.6 | Option B (raw hy_ig z-score, no OLS): C36 IC test — hit rate **49.6/50.7/49.9%** at 5/10/20d. Entry signal is a coin flip. |
+
+### Retained findings (valid, carry forward to any future programme)
+
+1. **Fixed-entry P&L accounting is mandatory.** Rolling residuals cannot be marked to market unless model parameters (α, β) are fixed at entry. OLS re-centring during the hold is not tradeable P&L.
+2. **Rolling OLS residuals embed a drift artifact.** The intercept `α[t] = mean_y[t] − β[t]·mean_x[t]` re-centres daily. For rate-spread pairs (HY vs 10y, HY/IG vs slope) this absorbed the full 2007–2026 rate cycle — up to $13M per signal in phantom P&L.
+3. **Rolling z-scores on I(1) price levels need IC tests, not just stationarity diagnostics.** A z-score can be stationary (rolling demeaning makes it so by construction) while having zero directional predictive content. The IC test (does the entry signal predict the direction of the next price move?) is the correct gate.
+4. **hy_ig level does not predict forward spread direction at 5/10/20d.** The 252-day rolling mean catches up to an I(1) level; this drives z-score reversion, not actual price mean-reversion.
+
+## Tier 1 — infrastructure complete (sprints v1–v5.5)
 
 Tier 1 built the full research stack — data pipeline, C++ pricer, RV signals, regime analytics, a visualizer, and a costed backtest — and put the central thesis on trial under pre-registered falsification criteria.
 
-**Bottom line.** The equity-credit lag is a genuine *statistical* effect (Sprint 3, restated in Sprint 5.5: mean-reversion is ~67% faster on `equity_first` regime days on the tradeable OLS residual) but **not a tradeable regime filter** (Sprint 5: gating trades on it gives a negative incremental Sharpe, ΔS = −0.41 with a bootstrap CI entirely below zero, and the rejection holds out-of-sample and across every robustness cut). The genuine deliverable is the **unfiltered RV1 signal** — Strategy A, net Sharpe 0.59, 81% hit rate after costs. The honest negative on the regime overlay is itself a Tier-1 result: a pre-registered hypothesis, falsified cleanly and documented. Tier 2 would test the lag as a position-*sizing* input rather than an entry *gate*, and harden Strategy A toward paper trading.
+**Bottom line.** The equity-credit lag is a genuine *statistical* effect (Sprint 3, restated in Sprint 5.5: mean-reversion is ~67% faster on `equity_first` regime days on the tradeable OLS residual) but **not a tradeable regime filter** (Sprint 5: gating trades on it gives a negative incremental Sharpe, ΔS = −0.41 with a bootstrap CI entirely below zero, and the rejection holds out-of-sample and across every robustness cut). The unfiltered RV1 signal showed Sharpe 0.591 in backtest, but subsequent accounting audit (v6.5) reduced the corrected figure to 0.202 — insufficient for paper trading. See Research Conclusion above.
 
 ## Architecture
 
@@ -118,6 +141,19 @@ A **corrective** sprint, not new research. Auditing the signal-generation layer 
 | E6 — Strategy A re-validated through the unchanged v5 engine | ✓ PASS (Sharpe 0.591, Δ +0.001) |
 
 **Corrections to the Sprint 3 record:** (1) the "best method = Kalman" claim was an artifact of the ADF selector — the tradeability selector (stationary **and** half-life ∈ [5, 63] days) picks **OLS** for all three pairs; (2) the C22 "43–67% shorter *across methods*" framing is retired — the 43% end was the whitened Kalman residual (0.85d vs 1.46d = noise vs noise) and the DV01 leg is non-stationary; the honest number is **67% shorter on OLS only**, and C22 still passes. The `regime_signal_quality.parquet` schema is 56 rows (was 63; the 7 `rv_xterm/dv01` rows removed).
+
+### Sprint 5.6 — Multi-Signal Validation (complete, withdrawn)
+Three signals (RV1_A, RV2_A, RV3_A) admitted to Tier 2 via M1–M8 scorecard. All admissions subsequently withdrawn by v6.5 accounting audit. Notebook: `notebooks/56_multisignal_validation.ipynb`. Binding document: `sprints/v5.6/signal_selection.md` (superseded).
+
+### Sprints v6–v6.6 — Accounting Audit (closed)
+
+| sprint | scope | outcome |
+|--------|-------|---------|
+| v6 | Factor attribution (RV1_A) | Model drift = 57% of gross P&L. FA1/FA2 fail. |
+| v6.5 | Fixed-entry rescue test — all 3 signals | R1 FAIL all three. RV2/RV3 corrected P&L −$13M/−$11M. All admissions withdrawn. |
+| v6.6 | Option B: hy_ig z-score (no OLS) | C36 IC FAIL — 49–51% hit rate at 5/10/20d. Signal uninformative. Programme closed. |
+
+Notebooks: `notebooks/06_factor_attribution.ipynb`, `notebooks/06_5_engine_correction.ipynb`, `notebooks/06_6_hyig_validation.ipynb`.
 
 ## Building
 

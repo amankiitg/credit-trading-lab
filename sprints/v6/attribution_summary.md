@@ -102,11 +102,13 @@ No directional credit beta. Confirmed: the strategy is not running a net credit 
 
 ---
 
-## Extension Note — RV2_A and RV3_A (sprint v6.5)
+## Extension Note — RV2_A and RV3_A (after v8)
 
 RV2_A (rv_credit_rates) and RV3_A (rv_xterm) are admitted to Tier 2 per
-`sprints/v5.6/signal_selection.md`. The same T1–T7 attribution framework will be
-applied in sprint v6.5 with the following signal-specific considerations:
+`sprints/v5.6/signal_selection.md`. They will not be touched until all three
+RV1_A Tier 2 sprints (v6, v7, v8) are complete. After v8 ships, the same T1–T7
+attribution framework will be extended to these signals with the following
+signal-specific considerations:
 
 **RV2_A (rv_credit_rates)**: The x-leg is `dgs10` (10-year Treasury yield in decimal),
 not a spread. `delta_ig` in T2 becomes `delta_rates = dgs10[exit] − dgs10[entry]`.

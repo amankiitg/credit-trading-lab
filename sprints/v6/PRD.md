@@ -4,11 +4,10 @@
 
 This sprint builds and validates the factor attribution framework on **Strategy A
 (RV1_A / rv_hy_ig / OLS / no gate)** only. RV2_A (rv_credit_rates) and RV3_A
-(rv_xterm) are admitted to Tier 2 per `sprints/v5.6/signal_selection.md` and will
-have attribution run against the same framework in **sprint v6.5** once we have
-confirmed the decomposition is correct and the tooling is stable on the signal we
-understand best. v6.5 is a thin extension sprint — most of its work is running
-T1–T7 below with pair=rv_credit_rates and pair=rv_xterm.
+(rv_xterm) are admitted to Tier 2 per `sprints/v5.6/signal_selection.md` but will
+not be touched until **all three RV1_A Tier 2 sprints are complete**: v6 (factor
+attribution), v7 (scenario risk), v8 (paper trading). Only after v8 ships will
+the same framework be extended to RV2_A and RV3_A in a dedicated sprint.
 
 ---
 

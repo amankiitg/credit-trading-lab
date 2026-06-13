@@ -1,16 +1,17 @@
 # Sprint v6.5 — Tasks
 
-Seven tasks (T1–T7). Hard gate: **T1 must pass R1 and R2 before any other task runs.**
-If T1 fails, stop and reassess Tier 1. Do not proceed to T2–T7.
+**Gate outcome: T1 FAILED (corrected Sharpe 0.202 < 0.40). Original T2–T7 (engine fix
+path) are superseded. Sprint pivots to: Option C analysis, failure notebook, and
+architecture recommendation for Option B.**
 
 Status starts `[ ]`; flip to `[x]` as each task lands.
 
-**Dependency order:** T1 (rescue test, gate) → T2 (engine fix) → T3 (verify fix) →
-T4 (re-run all signals) → T5 (compare before/after) → T6 (notebook) → T7 (register).
+**Revised dependency order:** T1 (rescue test, gate) → T2 (Option C: all signals) →
+T3 (failure notebook) → T4 (architecture close).
 
 ---
 
-- [ ] **Task T1: Rescue test — fixed-entry P&L for RV1_A (hard gate)**
+- [x] **Task T1: Rescue test — fixed-entry P&L for RV1_A (hard gate)**
   - Load `sprints/v6/attribution_table.csv` (94 trades, already has `delta_hy`,
     `delta_ig`, `hedge_ratio_entry`, `cost`). Compute:
     ```python
@@ -31,90 +32,61 @@ T4 (re-run all signals) → T5 (compare before/after) → T6 (notebook) → T7 (
     hedge_ratio_entry; fails if R1/R2 verdict is not explicitly printed; fails if
     the daily P&L series assigns P&L to entry date instead of exit date.
 
-- [ ] **Task T2: Engine fix — add fixed-entry gross computation**
-  - Modify `backtest/engine.py`. Add optional parameters `y_series: pd.Series | None`
-    and `x_series: pd.Series | None` to the `run()` function. When both are provided,
-    compute exit residual using **entry-date** hedge ratio:
-    ```python
-    # inside trade loop, at exit:
-    if y is not None and x is not None:
-        gross = sign * ((y[exit_fill] - y[entry_fill])
-                        - hr[entry_fill] * (x[exit_fill] - x[entry_fill])) * notional
-    else:
-        gross = sign * (rv_exit - rv_entry) * notional  # unchanged fallback
-    ```
-    No other changes. Existing tests must still pass.
-  - Acceptance: engine.py modified. The old call signature (no y/x args) produces
-    identical results to pre-fix. Print diff of changed lines only.
-  - Files: `backtest/engine.py`
-  - Validation: fails if the fallback path changes; fails if `hr[entry_fill]` is not
-    used (must be entry hedge ratio, not exit); fails if existing engine behaviour
-    changes for callers that don't pass y/x.
+- [x] **Task T2: Option C — fixed-entry rescue for RV2_A and RV3_A**
+  - Apply the same daily MTM reconstruction from T1 to RV2_A and RV3_A.
+    - RV2_A: y = hy_spread, x = dgs10 (from `data/raw/credit_market_data.parquet`, ffill)
+    - RV3_A: y = hy_ig (= hy_spread − ig_spread), x = slope (= dgs10 − dgs2)
+    Both reconciliations exact ($0 diff).
+  - Results (computed 2026-06-13, see notes.md):
+    - RV2_A: registered 0.693 → corrected **−0.108** (net P&L $995k → −$13.1M)
+    - RV3_A: registered 0.856 → corrected **−0.187** (net P&L $990k → −$10.8M)
+  - Plots: `sprints/v6.5/plots/option_c_all_signals.png`,
+    `sprints/v6.5/plots/option_c_sharpe_comparison.png`
+  - Verdict: all three signals fail R1. RV2/RV3 invert catastrophically due to
+    rolling OLS absorbing secular rate trends. Architecture is invalid.
 
-- [ ] **Task T3: Verify engine fix matches rescue test**
-  - Run the fixed engine for RV1_A by passing `hy_spread` and `ig_spread` series.
-    Compare per-trade `gross_pnl` from the fixed engine vs `gross_fixed` from T1.
-    Maximum per-trade absolute difference must be < $1 (floating-point only).
-    Print the max difference and assert < $1.
-  - Acceptance: assertion passes. Print "engine fix verified: max diff $X" where X < 1.
-  - Files: `sprints/v6.5/notes.md`
-  - Validation: fails if any trade-level difference exceeds $1.
-
-- [ ] **Task T4: Re-run all three signals with fixed engine**
-  - Run `build_strategy(features, residuals, StrategySpec(pair,'ols',gated=False))`
-    with the fixed engine for RV1_A, RV2_A, RV3_A. Pass the correct y/x series for
-    each pair:
-    - RV1_A: y=hy_spread, x=ig_spread
-    - RV2_A: y=hy_spread, x=dgs10 (from credit_market_data.parquet, reindexed)
-    - RV3_A: y=hy_ig (= hy_spread − ig_spread), x=slope (= dgs10 − dgs2)
-    For each signal record: Sharpe, hit rate, n_trades, total net P&L, max drawdown.
-    Evaluate R3 (RV2_A and RV3_A Sharpe ≥ 0.40) and R4 (ranking preserved).
-  - Acceptance: table of all three signals printed with corrected numbers. R3 and R4
-    verdicts stated.
-  - Files: `sprints/v6.5/notes.md`
-  - Validation: fails if y/x series are not correctly matched to each pair; fails if
-    the old (unfixed) engine is used for any signal.
-
-- [ ] **Task T5: Before/after comparison — all three signals**
-  - Build a side-by-side table: for each signal, v5/v5.6 registered number vs corrected
-    number for Sharpe, hit rate, total net P&L, max drawdown. Compute the delta for each.
-    Flag any signal whose corrected Sharpe drops below 0.40 (R3 fail).
-    Save equity curve comparison plots to `sprints/v6.5/plots/`:
-    - `equity_rv1_before_after.png` — old vs corrected cumulative P&L for RV1_A
-    - `equity_all_corrected.png` — all three corrected equity curves on one axes
-  - Acceptance: comparison table printed. Both plots saved. Deltas reported.
-  - Files: `sprints/v6.5/plots/equity_rv1_before_after.png`,
-    `sprints/v6.5/plots/equity_all_corrected.png`, `sprints/v6.5/notes.md`
-  - Validation: fails if the "old" numbers don't match v5/v5.6 registered values;
-    fails if any signal is missing from the comparison.
-
-- [ ] **Task T6: Notebook `06_5_engine_correction.ipynb`**
+- [x] **Task T3: Failure notebook `notebooks/06_5_engine_correction.ipynb`**
   - Write `scripts/build_notebook_v6_5.py` and produce
-    `notebooks/06_5_engine_correction.ipynb`. Four sections:
-    (1) Rescue test: fixed-entry P&L for RV1_A — old vs corrected, R1/R2 verdict
-    (2) Engine fix verification: per-trade diff between T1 formula and fixed engine
-    (3) All three signals corrected — side-by-side table and equity curves
-    (4) Summary scorecard: old M1 (Sharpe >0.40) vs corrected M1, pass/fail for each
+    `notebooks/06_5_engine_correction.ipynb`. Three sections:
+    (1) **RV1_A rescue test**: registered vs fixed-entry daily MTM. Side-by-side
+        table, equity curve overlay, R1/R2 verdict. Plot inline.
+    (2) **All-signals rescue (Option C)**: RV2_A and RV3_A fixed-entry results.
+        Complete 3-signal scorecard table. Equity curves for all three signals
+        (3-panel, registered vs corrected). Sharpe bar chart vs R1 threshold.
+        R1 FAIL verdict for all three.
+    (3) **Architecture conclusion + Option B roadmap**: explain why rolling OLS
+        intercept creates model drift (1 paragraph). Introduce Option B:
+        `hy_ig = hy_spread − ig_spread` z-scored, no β, no α. Show that
+        `hy_ig_z252` already exists in features.parquet. Print a preview of
+        the new signal's z-score distribution (histogram) and time-series plot.
+        State: "All prior Tier 1 admission decisions are withdrawn. A new Tier 1
+        sprint (v7) will validate Option B under honest accounting."
     Execute via `jupyter nbconvert --execute --inplace`. Zero cell errors.
     Last cell prints `[notebook clean]`.
-  - Acceptance: notebook executes clean. R1/R2/R3/R4 verdicts visible in output.
-    Before/after comparison table visible. All plots rendered inline.
-  - Files: `notebooks/06_5_engine_correction.ipynb`,
-    `scripts/build_notebook_v6_5.py`
-  - Validation: fails if any cell errors; fails if any R verdict is absent from output.
+  - Acceptance: notebook executes clean. All three R1 FAIL verdicts visible.
+    All plots rendered inline. Option B signal preview present.
+  - Files: `notebooks/06_5_engine_correction.ipynb`, `scripts/build_notebook_v6_5.py`
+  - Validation: fails if any cell has an error; fails if any signal is missing
+    from the scorecard; fails if Option B section is absent.
 
-- [ ] **Task T7: Register corrected numbers + sprint close**
+- [x] **Task T4: Architecture close — `sprints/v6.5/correction_summary.md`**
   - Write `sprints/v6.5/correction_summary.md` with:
-    (a) Root cause explanation: why model drift is not real P&L
-    (b) Corrected M1–M8 scorecard for all three signals under fixed-entry accounting
-    (c) Explicit statement: "These numbers supersede all prior v5/v5.6 registered
-        numbers from this date forward. v7 and v8 will use the corrected engine."
-    (d) If R4 holds (rankings preserved): confirm admission decisions from
-        `sprints/v5.6/signal_selection.md` remain valid under corrected accounting.
-    (e) If R4 fails: state which admission decisions need revision.
-    Finalise `sprints/v6.5/notes.md`. Mark all tasks [x].
-  - Acceptance: correction_summary.md exists with all five sections. Every number
-    has a source (either "computed in T1" or "computed in T4"). notes.md complete.
+    (a) Root cause: rolling OLS intercept α = mean_y − β×mean_x continuously
+        re-centres the residual, booking "reversion" that is really model drift.
+        Worst for rate-spread pairs (RV2, RV3) where secular trends are large.
+    (b) Disqualification table: all three signals, registered vs corrected Sharpe,
+        R1 verdict.
+    (c) Explicit statement: "All v5/v5.6 admission decisions are withdrawn as of
+        2026-06-13. No Tier 2 work (v6–v8) will proceed under OLS residual signals."
+    (d) Option B specification: new signal = `hy_ig` z-scored over trailing 252 days,
+        no OLS, no hedge ratio, entry |z|>2, exit |z|<0.5. Column `hy_ig_z252`
+        already in features.parquet. The engine gross formula becomes
+        `side × Δhy_ig × notional` — no model drift possible.
+    (e) Next sprint: v7 is a new Tier 1 sprint for the hy_ig signal under corrected
+        accounting. Same M1–M8 gates as v5.
+    Finalise `sprints/v6.5/notes.md`. Mark T3 and T4 [x].
+  - Acceptance: correction_summary.md has all five sections. Option B signal
+    spec is precise (column name, window, threshold). Withdrawal statement present.
   - Files: `sprints/v6.5/correction_summary.md`, `sprints/v6.5/notes.md`
-  - Validation: fails if corrected numbers are not stated explicitly; fails if the
-    "supersedes" statement is absent.
+  - Validation: fails if the withdrawal statement is absent; fails if Option B
+    spec doesn't name the column and parameters.

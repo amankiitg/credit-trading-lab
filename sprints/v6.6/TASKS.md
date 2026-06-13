@@ -11,7 +11,7 @@ T5 (subperiod + grid) → T6 (bootstrap vs passive) → T7 (notebook + close).
 
 ---
 
-- [ ] **Task T1: Signal characterisation — hy_ig vs RV1_A**
+- [x] **Task T1: Signal characterisation — hy_ig vs RV1_A**
   - Load `hy_ig_z252` and `z_rv_hy_ig` from `features.parquet`.
     Compute:
     (a) Pearson correlation `corr(z_rv_hy_ig, hy_ig_z252)` over the overlapping
@@ -31,7 +31,7 @@ T5 (subperiod + grid) → T6 (bootstrap vs passive) → T7 (notebook + close).
   - Validation: fails if correlation is not computed; fails if overlap fraction
     uses a different window than ±2 days.
 
-- [ ] **Task T2: Stationarity and OU half-life — hard gate (C32, C33)**
+- [x] **Task T2: Stationarity and OU half-life — hard gate (C32, C33)**
   - Run three ADF tests on `hy_ig` levels (not z-score): full sample, 2007–2016,
     2017–2026. Use `statsmodels.tsa.stattools.adfuller` with `autolag='AIC'`.
     Report test statistic, p-value, and critical values (1%, 5%, 10%) for each.

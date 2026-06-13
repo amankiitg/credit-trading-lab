@@ -64,10 +64,10 @@ narrative and allow v6.5 / v7 to proceed.
 
 | ID | Criterion | Pass threshold | What failure means |
 |----|-----------|---------------|-------------------|
-| FA1 | HY leg component share of gross P&L, mean across trades | ≥ 50% | Strategy is running IG hedge beta, not HY mean reversion |
+| FA1 | HY leg component share of gross P&L — both mean(hy_leg_pnl/gross_pnl) across trades AND sum(hy_leg_pnl)/sum(gross_pnl) in aggregate | ≥ 50% for both | Strategy is running IG hedge beta, not HY mean reversion |
 | FA2 | IG hedge contribution: mean across all trades | Not significantly different from 0 (|mean| < 20% of mean gross_pnl per trade) | IG leg is a systematic alpha source, not a hedge — changes the story |
 | FA3 | vol_regime=low AND vol_regime=high both have mean net_pnl > 0 per trade | both positive | Edge confined to stress episodes only |
-| FA4 | holding_days < 10 AND holding_days > 20 groups both have mean net_pnl > 0 | both positive | P&L structure inconsistent with OU half-life story |
+| FA4 | holding_days ≤ 10 AND holding_days > 20 groups both have mean net_pnl > 0 | both positive | P&L structure inconsistent with OU half-life story |
 
 FA1 and FA2 are complements: FA1 checks the HY leg drives the result; FA2 checks the
 IG hedge is not a hidden source of profit. A strategy can pass FA1 and fail FA2 (if
@@ -87,20 +87,31 @@ trade ledger, merged with features.parquet for hy_spread and ig_spread):
 Δhy = hy_spread[exit_fill_date] − hy_spread[entry_fill_date]
 Δig = ig_spread[exit_fill_date] − ig_spread[entry_fill_date]
 
-hy_leg_pnl   = side × (−Δhy) × notional        # hy spread tightens → hy_leg_pnl > 0 for long
-ig_hedge_pnl = side × hedge_ratio_entry × Δig × notional  # ig widens → short-ig hedge earns
+hy_leg_pnl   = side × Δhy × notional
+ig_hedge_pnl = side × (−hedge_ratio_entry × Δig) × notional
 
-gross_check = hy_leg_pnl + ig_hedge_pnl  # should match engine gross_pnl within $1 (rounding)
+gross_check = hy_leg_pnl + ig_hedge_pnl  # must match engine gross_pnl within $100
 ```
 
-**Note on sign convention:** rv_hy_ig = hy_spread − β × ig_spread. Strategy goes
-LONG (side=+1) when rv < −2σ (HY cheap). Profit requires rv to increase: either
-hy_spread falls (tightens) OR ig_spread rises (widens). In spread convention:
-spread falling = bond price rising = positive P&L for a long credit position.
+**Note on sign convention:** `hy_spread = ln(HYG/IEF)` and `ig_spread = ln(LQD/IEF)` —
+these are log price ratios, not OAS-style spreads. The engine computes:
 
-- `hy_leg_pnl = side × (−Δhy) × notional` : spread tightens (Δhy<0) → hy_leg_pnl>0
-- `ig_hedge_pnl = side × hedge_ratio_entry × Δig × notional` : we are SHORT β×IG.
-  If IG widens (Δig>0), the short earns money → positive.
+```
+gross = side × (rv_exit − rv_entry) × notional
+      = side × (Δhy − β × Δig) × notional
+```
+
+So the attribution splits directly as `hy_leg = side × Δhy` and
+`ig_hedge = side × (−β × Δig)`.
+
+For a LONG trade (side=+1) entered when rv is very negative (HY cheap):
+- Profit comes from rv increasing: Δhy > 0 (HYG outperforms IEF) → hy_leg_pnl > 0
+- The short-IG hedge earns when Δig < 0 (LQD underperforms IEF):
+  ig_hedge_pnl = −β × Δig > 0 when Δig < 0
+
+**Important:** do not use OAS/spread-tightening language here. The features use
+log price ratios, so a rising `hy_spread` value means HYG is outperforming IEF
+(a credit rally), which is the direction we want in a long trade.
 
 **Regime enrichment** (join on entry_fill_date):
 - `vol_regime` : "high" / "low" (from features.parquet, 21-day realized vol of HYG)
@@ -110,9 +121,11 @@ spread falling = bond price rising = positive P&L for a long credit position.
 
 **Holding-period buckets:**
 - very_short : holding_days < 5
-- short : 5 ≤ holding_days < 15
-- medium : 15 ≤ holding_days ≤ 30
-- long : holding_days > 30
+- short : 5 ≤ holding_days ≤ 10
+- medium : 11 ≤ holding_days ≤ 20
+- long : holding_days > 20
+
+FA4 tests `≤10` (= very_short + short) and `>20` (= long).
 
 ---
 

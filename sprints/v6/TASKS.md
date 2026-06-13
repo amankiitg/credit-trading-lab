@@ -26,25 +26,27 @@ T5 (beta audit) → T6 (plots) → T7 (notebook) → T8 (summary + close).
     decomposition); fails if row count ≠ 94.
 
 - [ ] **Task T2: Per-trade P&L decomposition — FA1, FA2**
-  - Compute per-trade:
+  - Compute per-trade (sign convention: hy_spread = ln(HYG/IEF), log price ratio,
+    not OAS — rising value = credit rally):
     ```
-    hy_leg_pnl   = side × (−delta_hy) × 1_000_000
-    ig_hedge_pnl = side × hedge_ratio_entry × delta_ig × 1_000_000
+    hy_leg_pnl   = side × delta_hy × 1_000_000
+    ig_hedge_pnl = side × (−hedge_ratio_entry × delta_ig) × 1_000_000
     gross_check  = hy_leg_pnl + ig_hedge_pnl
     ```
     Verify: `max(|gross_check − gross_pnl|) < $100` (rounding tolerance).
+    If gross_check > $100 on any trade, stop — there is a sign error in the formula.
     Compute `hy_share = hy_leg_pnl / gross_pnl` per trade (exclude trades where
-    `|gross_pnl| < $500` from share computation to avoid division noise).
-    Report: mean hy_share, mean ig_hedge_pnl, mean gross_pnl.
-    Evaluate FA1 (mean hy_share ≥ 50%) and FA2 (|mean ig_hedge_pnl| < 20% of
-    mean gross_pnl).
-  - Acceptance: gross_check residual printed and ≤ $100. FA1 and FA2 verdict
-    explicitly printed. Scatter plot of hy_leg_pnl vs ig_hedge_pnl (one dot per
-    trade, coloured by side) saved to `sprints/v6/plots/decomp_scatter.png`.
+    `|gross_pnl| < $500` to avoid division noise).
+    Report for FA1: (a) mean(hy_share) across qualifying trades; (b) aggregate
+    sum(hy_leg_pnl) / sum(gross_pnl). Both must be ≥ 50%.
+    Report for FA2: mean(ig_hedge_pnl) — must be |mean| < 20% of mean(gross_pnl).
+  - Acceptance: gross_check residual printed and ≤ $100. Both FA1 metrics and FA2
+    verdict explicitly printed. Scatter plot of hy_leg_pnl vs ig_hedge_pnl (one dot
+    per trade, coloured by side) saved to `sprints/v6/plots/decomp_scatter.png`.
   - Files: `sprints/v6/plots/decomp_scatter.png`, notebook
-  - Validation: fails if gross_check > $100 (sign error in formula); fails if
-    FA1/FA2 verdicts are not stated; fails if hedge_ratio_exit is used instead
-    of hedge_ratio_entry.
+  - Validation: fails if gross_check > $100 (sign error); fails if FA1 reports only
+    the mean ratio without the aggregate sum ratio; fails if hedge_ratio_exit is used
+    instead of hedge_ratio_entry.
 
 - [ ] **Task T3: Regime breakdown — FA3**
   - Slice trades by `vol_regime` (high/low), `equity_regime` (bull/bear), and
@@ -66,12 +68,13 @@ T5 (beta audit) → T6 (plots) → T7 (notebook) → T8 (summary + close).
 - [ ] **Task T4: Holding-period concentration — FA4**
   - Bucket trades by holding_days:
     - very_short: < 5d
-    - short: 5–14d
-    - medium: 15–30d
-    - long: > 30d
+    - short: 5–10d
+    - medium: 11–20d
+    - long: > 20d
     For each bucket: n_trades, mean net_pnl, hit rate, cumulative net_pnl.
-    Evaluate FA4: short (<15d) and long (>20d) groups both must have
-    mean net_pnl > 0. (If very_short has < 5 trades: "too few to conclude".)
+    Evaluate FA4: (≤10d group = very_short + short combined) AND (>20d = long)
+    must both have mean net_pnl > 0. (If very_short has < 5 trades: "too few to
+    conclude" for that bucket alone; fold into the ≤10 group for FA4 verdict.)
     Scatter plot: holding_days vs net_pnl (one dot per trade, with horizontal
     zero line and vertical lines at the bucket boundaries) saved to
     `sprints/v6/plots/hold_vs_pnl.png`.
@@ -98,9 +101,8 @@ T5 (beta audit) → T6 (plots) → T7 (notebook) → T8 (summary + close).
     |mean| > 0.3 (more than 30% net long/short on average). Log result in
     `sprints/v6/notes.md`.
   - Files: `sprints/v6/plots/net_beta_over_time.png`, `sprints/v6/notes.md`
-  - Validation: fails if the daily net exposure is computed from the trade ledger
-    rather than reconstructed from daily position states; fails if only entry
-    dates are used (must be all active holding days).
+  - Validation: fails if only entry dates are used — exposure must span all
+    active holding days, not just the day a trade opens.
 
 - [ ] **Task T6: Cumulative attribution curves**
   - Build the time-series view of attribution:
@@ -108,7 +110,9 @@ T5 (beta audit) → T6 (plots) → T7 (notebook) → T8 (summary + close).
         cost, net_pnl) to a single date (exit_fill_date — when the P&L is realised).
     (b) Compute cumulative sums of each component over time.
     (c) Plot four cumulative lines on the same axes: hy_leg cumulative,
-        ig_hedge cumulative, cost cumulative, net_pnl cumulative.
+        ig_hedge cumulative, (−cost) cumulative (so all four components
+        sum to net_pnl: hy_leg + ig_hedge − cost = gross − cost = net),
+        net_pnl cumulative.
         Save to `sprints/v6/plots/cumulative_attribution.png`.
   - Acceptance: four-line plot saved with labelled axes and title including date
     range and n_trades. The net_pnl curve should match the strategy equity curve

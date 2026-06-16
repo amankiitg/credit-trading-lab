@@ -155,14 +155,15 @@ Three signals (RV1_A, RV2_A, RV3_A) admitted to Tier 2 via M1–M8 scorecard. Al
 
 Notebooks: `notebooks/06_factor_attribution.ipynb`, `notebooks/06_5_engine_correction.ipynb`, `notebooks/06_6_hyig_validation.ipynb`.
 
-### Sprints v7.1 – v8.1 — New Programmes (post v6.6 closure)
+### Sprints v7.1 – v8.2 — New Programmes (post v6.6 closure)
 
 | sprint | scope | outcome |
 |--------|-------|---------|
 | v7.1 | NAV wedge (HYG/LQD premium/discount) — data-availability probe | **G0a FAIL**: daily NAV not retrievable via a free, scriptable endpoint (the legacy iShares CSV export is retired). Programme stopped at the data gate; no proxy substituted. |
 | v8.1 | Universe and trend signal — operational instrument, not a research hypothesis | Mechanical 120d trend signal, vol-targeted across 8 liquid ETFs (SPY, EFA, EEM, TLT, IEF, HYG, LQD, GLD). No IC test, no Sharpe claim by design. All 5 engineering gates (E1–E5) pass; daily target-position vector built and persisted. |
+| v8.2 | Add shorts, set parameters — still an operational instrument, not a prediction | Signal made symmetric (long/short, `E1–E7`/`B1–B2` all pass). A magnitude no-trade band (T2, `band_pct=0.20`) **missed its own turnover target** (cut only 3.3%) — diagnosed: 96% of turnover is sign-flip-driven, which a magnitude band can't touch. **T2b** (signal-level hysteresis, a dead zone on the sign decision, `k=0.5`) was added to fix that directly and **did** hit the target (32.32x → 5.48x, an 83% cut), at an honestly-reported net-return cost (7.79% → 4.24%) and a ~9-trading-day responsiveness lag on genuine reversals. Long-only beats long/short here (single-rate-supercycle bias, not a forward-looking signal); buy-and-hold (1/8) now beats the T2+T2b book on return, at much lower vol. |
 
-Docs: `sprints/v7.1/{PRD,TASKS,notes}.md`, `sprints/v8.1/{PRD,TASKS,notes,WALKTHROUGH}.md`.
+Docs: `sprints/v7.1/{PRD,TASKS,notes}.md`, `sprints/v8.1/{PRD,TASKS,notes,WALKTHROUGH}.md`, `sprints/v8.2/{PRD,TASKS,notes,WALKTHROUGH}.md`.
 
 ## Building
 

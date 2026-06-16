@@ -5,6 +5,7 @@ data/*.csv
 # credentials -- never commit
 .env
 .env.*
+.streamlit/secrets.toml
 
 # C++ build artifacts (sprint v2)
 build/

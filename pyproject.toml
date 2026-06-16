@@ -9,6 +9,7 @@ description = "Research lab for systematic credit trading strategies."
 requires-python = ">=3.9"
 dependencies = [
     "alpaca-py>=0.8",
+    "supabase>=2.0",
 ]
 
 [tool.setuptools]

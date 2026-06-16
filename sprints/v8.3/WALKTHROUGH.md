@@ -355,8 +355,8 @@ tables in Signal Behavior above contain all the pre-registered outputs.
   range 2007-04-11 to 2026-06-15.
 - **Commit:** this sprint's code (`risk/attribution.py`,
   `signals/dividends.py`, `signals/etf_universe.py`, `tests/test_attribution.py`,
-  `notebooks/08_3_attribution.ipynb`) is being committed alongside this
-  walkthrough.
+  `notebooks/08_3_attribution.ipynb`) was committed as `ff2ab76`
+  immediately prior to this walkthrough.
 - **Exact commands to regenerate every output:**
 
 ```bash

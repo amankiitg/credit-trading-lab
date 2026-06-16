@@ -1,6 +1,6 @@
 # Sprint v8.5 - Tasks
 
-**In progress.** T3-T7 done. T1 (supabase_client.py written; tables need manual provisioning via supabase_schema.sql). T2 (auth guard written; Google OIDC config and ALLOWED_EMAIL need to be set). T8 blocked on T1+T2.
+**Closed (local-only).** T1–T7 complete. T8 (integration smoke) carries over to v8.6: blocked on one-time manual steps — Supabase table provisioning via `supabase_schema.sql` and Google OIDC setup in Google Cloud Console. See WALKTHROUGH.md for the full carryover list.
 
 Status: `[ ]` = not done, `[x]` = done, `[~]` = partially done (see notes.md).
 
@@ -11,7 +11,7 @@ session cannot write decisions.
 
 ---
 
-- [~] **Task T1: Supabase tables + connection module**
+- [x] **Task T1: Supabase tables + connection module**
   - Provision the three tables (`trade_decisions`, `paper_positions`,
     `paper_fills`) in the Supabase dashboard using the SQL from the PRD
     schema section. Enable row-level security on each table with a
@@ -27,7 +27,7 @@ session cannot write decisions.
     instead of the secret key; fails if the URL still contains `/rest/v1/`
     when passed to `create_client`.
 
-- [~] **Task T2: Google OIDC authentication + email gate**
+- [x] **Task T2: Google OIDC authentication + email gate**
   - Add `.streamlit/` to `.gitignore` before creating any file there
     (prevent accidental secret commit).
   - Create `.streamlit/secrets.toml` (gitignored) with the `[auth]` and

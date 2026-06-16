@@ -21,6 +21,8 @@ from dashboard.supabase_client import (
     fetch_decision_for_date,
     fetch_pnl_log,
     fetch_positions,
+    get_auto_approve,
+    set_auto_approve,
     write_decision,
 )
 
@@ -94,18 +96,34 @@ def render(user_email: str) -> None:
     existing = fetch_decision_for_date(as_of_date)
     supabase_ok = bool(os.environ.get("SUPABASE_SECRET_KEY"))
 
-    st.markdown("**Approve or reject ALL trades for today:**")
-    st.caption(
-        "One decision covers the entire book. "
-        "The v8.6 cron reads this each morning before executing."
+    # ---- standing auto-approve toggle ----
+    auto_approve = get_auto_approve()
+    new_val = st.toggle(
+        "Auto-approve: execute every day unless I explicitly reject",
+        value=auto_approve,
+        disabled=not supabase_ok,
+        help="When ON, the v8.6 cron runs each morning without needing a daily approval. "
+             "Turn OFF to require an explicit approve each day.",
     )
-
-    if existing:
-        if existing == "approve":
-            st.success(f"Decision: APPROVE (recorded for {as_of_date})")
+    if new_val != auto_approve:
+        set_auto_approve(new_val)
+        if new_val:
+            st.success("Auto-approve ON -- trades will execute daily unless you reject.")
         else:
-            st.error(f"Decision: REJECT (recorded for {as_of_date})")
-        st.caption("To change the decision, click the opposite button below.")
+            st.info("Auto-approve OFF -- you must approve each morning to trade.")
+
+    if auto_approve:
+        st.caption(
+            "Cron logic: execute unless `decision = reject` for today. "
+            "No row or `decision = approve` both trigger execution."
+        )
+    else:
+        st.caption(
+            "Cron logic: execute only if `decision = approve` for today. "
+            "No row or `decision = reject` both skip execution."
+        )
+
+    st.markdown("**Today's decision:**")
 
     if not supabase_ok:
         st.warning(
@@ -113,34 +131,27 @@ def render(user_email: str) -> None:
             "Set SUPABASE_URL and SUPABASE_SECRET_KEY in .env and restart."
         )
 
-    col_approve, col_reject = st.columns(2)
+    if existing == "approve":
+        st.success(f"Approved for {as_of_date} -- trades will execute at next cron run.")
+        if st.button("Change to: Reject / skip today", disabled=not supabase_ok, key=f"reject_{as_of_date}"):
+            if write_decision(as_of_date, "reject"):
+                st.rerun()
 
-    if col_approve.button(
-        "Approve all trades",
-        type="primary",
-        disabled=not supabase_ok,
-        key=f"approve_{as_of_date}",
-    ):
-        ok = write_decision(as_of_date, "approve")
-        if ok:
-            st.success("Decision saved: APPROVE")
-            st.cache_data.clear()
-            st.rerun()
-        else:
-            st.error("Failed to write to Supabase. Check credentials and table schema.")
+    elif existing == "reject":
+        st.error(f"Rejected for {as_of_date} -- no trades will execute.")
+        if st.button("Change to: Approve all trades", type="primary", disabled=not supabase_ok, key=f"approve_{as_of_date}"):
+            if write_decision(as_of_date, "approve"):
+                st.rerun()
 
-    if col_reject.button(
-        "Reject / skip today",
-        disabled=not supabase_ok,
-        key=f"reject_{as_of_date}",
-    ):
-        ok = write_decision(as_of_date, "reject")
-        if ok:
-            st.info("Decision saved: REJECT")
-            st.cache_data.clear()
-            st.rerun()
-        else:
-            st.error("Failed to write to Supabase. Check credentials and table schema.")
+    else:
+        # No decision yet -- show both options
+        col_approve, col_reject = st.columns(2)
+        if col_approve.button("Approve all trades", type="primary", disabled=not supabase_ok, key=f"approve_{as_of_date}"):
+            if write_decision(as_of_date, "approve"):
+                st.rerun()
+        if col_reject.button("Reject / skip today", disabled=not supabase_ok, key=f"reject_{as_of_date}"):
+            if write_decision(as_of_date, "reject"):
+                st.rerun()
 
     st.markdown("---")
 

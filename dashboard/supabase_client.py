@@ -134,6 +134,44 @@ def fetch_positions(latest_only: bool = True) -> list[dict]:
         return []
 
 
+# ---------------------------------------------------------------- settings
+
+def get_auto_approve() -> bool:
+    """Return the current auto-approve standing setting (default False)."""
+    client = get_supabase_client()
+    if client is None:
+        return False
+    try:
+        resp = (
+            client.table("settings")
+            .select("value")
+            .eq("key", "auto_approve")
+            .limit(1)
+            .execute()
+        )
+        if resp.data:
+            return resp.data[0]["value"].lower() == "true"
+        return False
+    except Exception:
+        return False
+
+
+def set_auto_approve(enabled: bool) -> bool:
+    """Upsert the auto-approve standing setting."""
+    client = get_supabase_client()
+    if client is None:
+        return False
+    try:
+        client.table("settings").upsert({
+            "key": "auto_approve",
+            "value": "true" if enabled else "false",
+        }).execute()
+        return True
+    except Exception as exc:
+        _log.error("set_auto_approve failed: %s", exc)
+        return False
+
+
 # ---------------------------------------------------------------- pnl_log
 
 def fetch_pnl_log(limit: int = 60) -> list[dict]:

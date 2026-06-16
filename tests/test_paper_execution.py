@@ -23,6 +23,7 @@ from execution.alpaca_paper import (
     CAP_PER_POSITION_NOTIONAL,
     DELTA_MIN_NOTIONAL,
     MAX_ORDERS_PER_RUN,
+    MAX_TRADED_NOTIONAL_PER_RUN,
     PAPER_NAV_DEFAULT,
     FillRecord,
     OrderSpec,
@@ -385,3 +386,149 @@ def test_full_dry_run_pipeline_no_alpaca_calls() -> None:
 
     dry_run_orders = [o for o in guarded if o.guard_status == "DRY_RUN"]
     assert len(dry_run_orders) > 0
+
+
+# ================================================================
+# Traded-notional brake tests (second fail-safe guard)
+# ================================================================
+
+# ---------------------------------------------------------------- core new guard: crossing under cap, over brake
+
+def test_traded_notional_brake_catches_crossing_that_cap_misses() -> None:
+    """This is the case the position-size cap alone would miss.
+
+    The target (-$6,000) is within the $8,000 cap, so CAP passes.
+    But the crossing trades abs(close $7,000) + abs(open $6,000) = $13,000,
+    which exceeds the _max_traded=$12,000 brake. Both legs must be rejected
+    with REJECTED_TRADED_NOTIONAL, not REJECTED_CAP.
+    """
+    current_notionals = {"SPY": 7_000.0}
+    target_weights = {"SPY": -0.06}  # -$6,000 at $100K NAV
+
+    orders = compute_delta_orders(target_weights, current_notionals, paper_nav=100_000.0)
+    spy_orders = [o for o in orders if o.ticker == "SPY"]
+    assert len(spy_orders) == 2, "expected two-leg crossing"
+
+    guarded = apply_guards(spy_orders, dry_run=False, _max_traded=12_000.0)
+
+    spy_guarded = [o for o in guarded if o.ticker == "SPY"]
+    statuses = [o.guard_status for o in spy_guarded]
+
+    assert all(s == "REJECTED_TRADED_NOTIONAL" for s in statuses), (
+        f"expected both legs REJECTED_TRADED_NOTIONAL, got {statuses}"
+    )
+    # Confirm cap did NOT trigger (target $6,000 < cap $8,000)
+    assert not any(s == "REJECTED_CAP" for s in statuses)
+
+
+def test_traded_notional_brake_crossing_all_or_nothing() -> None:
+    """Neither leg of a crossing fires when the brake triggers.
+
+    This verifies all-or-nothing behavior: leg 1 (close) alone would be
+    within the brake, but leg 1 + leg 2 together exceed it. The brake
+    must block both, not just leg 2.
+    """
+    # close leg: $7,000; open leg: $6,000; total: $13,000 > $12,000 brake
+    current_notionals = {"SPY": 7_000.0}
+    target_weights = {"SPY": -0.06}
+
+    orders = compute_delta_orders(target_weights, current_notionals, paper_nav=100_000.0)
+    guarded = apply_guards(orders, dry_run=False, _max_traded=12_000.0)
+
+    leg1 = next(o for o in guarded if o.ticker == "SPY" and o.leg == 1)
+    leg2 = next(o for o in guarded if o.ticker == "SPY" and o.leg == 2)
+
+    # Leg 1 (close $7,000) alone would be within $12,000 brake, but must
+    # still be blocked because the crossing is evaluated as a unit.
+    assert leg1.guard_status == "REJECTED_TRADED_NOTIONAL"
+    assert leg2.guard_status == "REJECTED_TRADED_NOTIONAL"
+
+
+def test_normal_open_unaffected_by_traded_notional_brake() -> None:
+    """A plain open with notional below the brake passes through unchanged."""
+    orders = compute_delta_orders({"GLD": 0.03}, {}, paper_nav=100_000.0)
+    guarded = apply_guards(orders, dry_run=False, _max_traded=12_000.0)
+
+    gld = [o for o in guarded if o.ticker == "GLD"]
+    assert len(gld) == 1
+    assert gld[0].guard_status == "PENDING"
+
+
+def test_crossing_within_brake_passes() -> None:
+    """A crossing whose total traded notional is within the brake passes."""
+    # close $3,000 + open $2,000 = $5,000 < $12,000 brake
+    current_notionals = {"IEF": 3_000.0}
+    target_weights = {"IEF": -0.02}  # -$2,000 at $100K NAV
+
+    orders = compute_delta_orders(target_weights, current_notionals, paper_nav=100_000.0)
+    guarded = apply_guards(orders, dry_run=False, _max_traded=12_000.0)
+
+    ief = [o for o in guarded if o.ticker == "IEF"]
+    assert len(ief) == 2
+    assert all(o.guard_status == "PENDING" for o in ief)
+
+
+# ---------------------------------------------------------------- dry-run auditability of both rejection reasons
+
+def test_both_rejection_reasons_visible_in_dry_run() -> None:
+    """DRY_RUN applied last: REJECTED_CAP and REJECTED_TRADED_NOTIONAL must
+    surface in dry-run so guards stay auditable without a live run.
+    """
+    # Oversized target -> REJECTED_CAP
+    oversized = [_pending_spec("TLT", "buy", 9_000.0, "buy_to_open", 9_000.0)]
+    # Normal open that passes cap but is within brake
+    normal = [_pending_spec("IEF", "buy", 3_000.0, "buy_to_open", 3_000.0)]
+
+    # Build a crossing that is within cap but over the brake
+    # close $7,000 + open $6,000 = $13,000 > $12,000 brake
+    current_notionals = {"SPY": 7_000.0}
+    crossing_orders = compute_delta_orders(
+        {"SPY": -0.06}, current_notionals, paper_nav=100_000.0
+    )
+
+    all_orders = oversized + crossing_orders + normal
+    guarded = apply_guards(all_orders, dry_run=True, _max_traded=12_000.0)
+
+    statuses = {o.ticker: o.guard_status for o in guarded}
+
+    # Oversized target: must still be REJECTED_CAP, not DRY_RUN
+    assert statuses["TLT"] == "REJECTED_CAP", (
+        f"oversized target must show REJECTED_CAP in dry-run, got {statuses['TLT']}"
+    )
+
+    # Crossing over brake: must still be REJECTED_TRADED_NOTIONAL, not DRY_RUN
+    spy_statuses = [o.guard_status for o in guarded if o.ticker == "SPY"]
+    assert all(s == "REJECTED_TRADED_NOTIONAL" for s in spy_statuses), (
+        f"brake-rejected crossing must show REJECTED_TRADED_NOTIONAL in dry-run, got {spy_statuses}"
+    )
+
+    # Normal open: passes both guards, becomes DRY_RUN
+    assert statuses["IEF"] == "DRY_RUN", (
+        f"normal open must be DRY_RUN after passing all content guards, got {statuses['IEF']}"
+    )
+
+
+# ---------------------------------------------------------------- cumulative brake across multiple orders
+
+def test_traded_notional_accumulates_across_tickers() -> None:
+    """The brake is a per-run total, not per-order.
+
+    Two normal opens of $7,000 each = $14,000 total. First passes ($7,000 <
+    $12,000); second is blocked because $7,000 + $7,000 = $14,000 > $12,000.
+    """
+    orders = [
+        _pending_spec("SPY", "buy", 7_000.0, "buy_to_open", 7_000.0),
+        _pending_spec("IEF", "buy", 7_000.0, "buy_to_open", 7_000.0),
+    ]
+    guarded = apply_guards(orders, dry_run=False, _max_traded=12_000.0)
+
+    spy = next(o for o in guarded if o.ticker == "SPY")
+    ief = next(o for o in guarded if o.ticker == "IEF")
+
+    assert spy.guard_status == "PENDING"  # $7,000 <= $12,000 OK
+    assert ief.guard_status == "REJECTED_TRADED_NOTIONAL"  # $7,000+$7,000 > $12,000
+
+
+def test_traded_notional_brake_uses_default_constant() -> None:
+    """Without an override, MAX_TRADED_NOTIONAL_PER_RUN is 2x the cap."""
+    assert MAX_TRADED_NOTIONAL_PER_RUN == 2 * CAP_PER_POSITION_NOTIONAL

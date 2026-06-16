@@ -133,6 +133,123 @@ Alpaca calls. Adversarial scenarios covered:
 | P7 | PASS | zero credential patterns in module source |
 | P8 | PASS | zero Alpaca API calls in dry-run mode |
 
-Sprint v8.4 status: **implementation done (T1-T4 core + test suite);
-T5-T8 partially (fill/reconciliation/cost implemented and tested with
-mocked data; live feed deferred to first paper session); T9 passes dry-run.**
+---
+
+## Second fail-safe guard: traded-notional brake (MAX_TRADED_NOTIONAL_PER_RUN)
+
+### Why the position-size cap alone is insufficient
+
+The position-size cap (`CAP_PER_POSITION_NOTIONAL = $8,000`) checks
+`abs(target_notional)`: the size of the position you are trying to reach.
+For a zero-crossing this is the size of the *destination* position only.
+
+But a zero-crossing *transacts* more than the destination: to go from long
+$7,000 to short $6,000, the run trades $7,000 (close leg) + $6,000 (open
+leg) = $13,000, even though the destination position ($6,000) is under
+the $8,000 cap. The cap passes; the transaction volume is $13,000. The cap
+is measuring the right thing for position-sizing purposes and the wrong
+thing for transaction-volume purposes. These are two distinct properties
+that need two distinct guards.
+
+### The new guard: MAX_TRADED_NOTIONAL_PER_RUN
+
+**Value:** `MAX_TRADED_NOTIONAL_PER_RUN = 16_000.0` (2 x `CAP_PER_POSITION_NOTIONAL`).
+
+**Rationale:** the largest single crossing that would pass the position-size
+cap is one where the destination is just under $8,000 and the existing
+position is also around $8,000, totaling roughly $16,000 traded. Setting
+the brake at exactly $16,000 means that crossing just passes; any larger
+combination is blocked. This is a round number chosen before any live run,
+consistent with House Rule 3 (not tuned for performance).
+
+**Guard logic:** the brake checks the *summed* notional of all legs in a
+ticker group for the run. For a crossing: `abs(close_leg) + abs(open_leg)`.
+For a single-leg order: `abs(leg.notional)`. If adding the group's total
+to the run's accumulated total would exceed `MAX_TRADED_NOTIONAL_PER_RUN`,
+the guard fires. The crossing is still evaluated as a unit (all-or-nothing):
+neither leg fires on breach, so you cannot end up half-crossed under the
+brake any more than under the cap.
+
+**Distinct reason code:** `REJECTED_TRADED_NOTIONAL` -- separate from
+`REJECTED_CAP` so the two guards are distinguishable in the reconciliation
+log. A `REJECTED_CAP` entry means the destination position was too large.
+A `REJECTED_TRADED_NOTIONAL` entry means the transaction volume in a single
+run was too large. These are different operational problems with different
+remedies.
+
+### Plain-English distinction (for notes inheritance and live-session review)
+
+- **Position-size cap** (`CAP_PER_POSITION_NOTIONAL`): limits how large a
+  position you are allowed to *hold*. Checked against `abs(target_notional)`.
+  This is a position-sizing limit.
+
+- **Traded-notional brake** (`MAX_TRADED_NOTIONAL_PER_RUN`): limits how much
+  you are allowed to *transact* in a single run. Checked against the summed
+  notional of all legs submitted. This is a transaction-throughput limit.
+
+- **They diverge only in crossings.** A plain open or reduce has
+  `|traded| == |delta|` which is at most `|target|`, so if the destination
+  passes the cap the traded amount is at most the cap value and the brake is
+  not the binding constraint. A crossing has `|traded| = |close| + |open|`,
+  which can be roughly 2x the destination, and the brake catches this extra
+  volume that the cap ignores.
+
+### Guard ordering update
+
+Guards now run in this priority order (DRY_RUN last, so all content
+rejection reasons stay auditable in dry-run):
+
+1. `REJECTED_CAP`: destination position too large
+2. `REJECTED_TRADED_NOTIONAL`: run's transaction volume would be too large
+3. `REJECTED_MAX_ORDERS`: run's order count would be too large
+4. `DRY_RUN`: order would otherwise be submitted (all content guards passed)
+
+The refactored `apply_guards` processes legs in ticker groups rather than
+individually. This fixed a pre-existing secondary bug: the original per-leg
+MAX_ORDERS check could allow leg 1 of a crossing when `submitted_count`
+was at the limit and block only leg 2, leaving the book half-crossed. The
+group-based implementation blocks all legs of a crossing atomically under
+all three content guards.
+
+### Tests added (27 total, up from 20)
+
+- `test_traded_notional_brake_catches_crossing_that_cap_misses`: the core
+  case. Target $6,000 (under $8,000 cap), current $7,000 long, total traded
+  $13,000 (over $12,000 custom brake) -> both legs REJECTED_TRADED_NOTIONAL,
+  not REJECTED_CAP.
+- `test_traded_notional_brake_crossing_all_or_nothing`: confirms that leg 1
+  (close) is also blocked, not just leg 2 (open), when the group total
+  breaches the brake.
+- `test_normal_open_unaffected_by_traded_notional_brake`: a plain open
+  within the brake passes through unchanged.
+- `test_crossing_within_brake_passes`: a crossing whose total traded notional
+  is within the brake passes both guards.
+- `test_both_rejection_reasons_visible_in_dry_run`: REJECTED_CAP and
+  REJECTED_TRADED_NOTIONAL both appear in dry-run output; a normal order
+  that passes both becomes DRY_RUN. Guards stay auditable.
+- `test_traded_notional_accumulates_across_tickers`: the brake is a
+  per-run total; a second order that would push the total over the limit
+  is blocked even if it would pass individually.
+- `test_traded_notional_brake_uses_default_constant`: asserts
+  `MAX_TRADED_NOTIONAL_PER_RUN == 2 * CAP_PER_POSITION_NOTIONAL`.
+
+### Live-session smoke test plan (pending, do not run now)
+
+When the zero-crossing is exercised in the first supervised live paper
+session, include one crossing constructed near the traded-notional brake
+boundary:
+
+- Set current_notionals to a position that, combined with a target just
+  under the cap, produces a group_traded total above $16,000.
+  Example: current SPY +$9,000, target SPY -$7,500. Close leg: $9,000,
+  open leg: $7,500, total: $16,500 > $16,000 brake. Target $7,500 < $8,000
+  cap. This is the case the position-size cap alone would miss.
+- Confirm the guard blocks BOTH legs against real Alpaca API responses
+  (not just in the dry-run test). The dry-run test proves the guard fires
+  in code; the live session proves it fires in the path that actually
+  reaches the order router, where the partial-success risk lives.
+- Log the order_id (or absence thereof) in the reconciliation JSON and
+  verify both legs show REJECTED_TRADED_NOTIONAL, not REJECTED_ALPACA.
+
+Sprint v8.4 status: **second fail-safe guard implemented and tested (27
+tests pass); live session still pending for T5/T8.**

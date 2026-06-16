@@ -50,6 +50,7 @@ LOG_DIR = Path("execution/logs")
 PAPER_ENDPOINT = "https://paper-api.alpaca.markets"
 
 CAP_PER_POSITION_NOTIONAL: float = 8_000.0
+MAX_TRADED_NOTIONAL_PER_RUN: float = 16_000.0  # 2x the position cap
 MAX_ORDERS_PER_RUN: int = 20
 DELTA_MIN_NOTIONAL: float = 10.0
 DRY_RUN_DEFAULT: bool = True
@@ -73,7 +74,7 @@ class OrderSpec:
     notional: float        # unsigned magnitude in USD
     position_intent: str   # "buy_to_open", "buy_to_close", "sell_to_open", "sell_to_close"
     target_notional: float # signed final target for this ticker (used for the cap guard)
-    guard_status: str      # "PENDING" | "REJECTED_CAP" | "REJECTED_MAX_ORDERS" | "DRY_RUN"
+    guard_status: str      # "PENDING" | "REJECTED_CAP" | "REJECTED_TRADED_NOTIONAL" | "REJECTED_MAX_ORDERS" | "DRY_RUN"
     leg: int               # 1 for single-order or close-leg; 2 for open-leg of a crossing
 
 
@@ -89,7 +90,7 @@ class FillRecord:
     filled_notional: float
     fill_price: float
     simulated_cost: float
-    status: str            # "FILLED" | "TIMEOUT" | "REJECTED_ALPACA" | "DRY_RUN" | "REJECTED_CAP" | "REJECTED_MAX_ORDERS"
+    status: str            # "FILLED" | "TIMEOUT" | "REJECTED_ALPACA" | "DRY_RUN" | "REJECTED_CAP" | "REJECTED_TRADED_NOTIONAL" | "REJECTED_MAX_ORDERS"
     guard_status: str
 
 
@@ -286,50 +287,118 @@ def compute_delta_orders(
 
 # ---------------------------------------------------------------- guard layer
 
-def apply_guards(orders: list[OrderSpec], dry_run: bool = DRY_RUN_DEFAULT) -> list[OrderSpec]:
+def apply_guards(
+    orders: list[OrderSpec],
+    dry_run: bool = DRY_RUN_DEFAULT,
+    _cap: float = CAP_PER_POSITION_NOTIONAL,
+    _max_traded: float = MAX_TRADED_NOTIONAL_PER_RUN,
+    _max_orders: int = MAX_ORDERS_PER_RUN,
+) -> list[OrderSpec]:
     """Apply fail-safe guards to a pending order list, in order.
 
-    Rules applied in priority order:
-    1. CAP: |target_notional| > CAP_PER_POSITION_NOTIONAL -> REJECTED_CAP.
-       Applied to EVERY leg for that ticker (both legs of a crossing share
-       the same target_notional).
-    2. MAX_ORDERS: total legs reaching submission would exceed MAX_ORDERS_PER_RUN.
-       When the count would be exceeded, all remaining PENDING orders become
-       REJECTED_MAX_ORDERS.
-    3. DRY_RUN: any PENDING order becomes DRY_RUN (no Alpaca call).
+    Crossings (leg=1 close + leg=2 open for the same ticker) are evaluated
+    as a unit so that a guard rejection is always all-or-nothing: you cannot
+    end up half-crossed (one leg fired, the other blocked) under any guard.
 
-    Returns a new list with updated guard_status fields.
+    Guards applied in priority order:
+
+    1. POSITION-SIZE CAP (CAP_PER_POSITION_NOTIONAL): checks abs(target_notional).
+       This limits the size of the destination position. Both legs of a
+       crossing share the same target_notional, so one check covers both.
+
+    2. TRADED-NOTIONAL BRAKE (MAX_TRADED_NOTIONAL_PER_RUN): checks whether
+       adding this group's summed leg notionals to the run's accumulated
+       total would exceed the limit. For a crossing the group total is
+       abs(close_leg) + abs(open_leg), which is larger than the target alone.
+       This is the guard the position-size cap alone would miss.
+
+    3. MAX-ORDERS: checks whether adding this group's leg count to the run's
+       submitted count would exceed MAX_ORDERS_PER_RUN.
+
+    4. DRY_RUN: any group that passed all content guards becomes DRY_RUN.
+       Applied last so guards 1-3 are still visible and auditable in dry-run
+       (a rejected group shows its real rejection reason, not DRY_RUN).
+
+    The limit arguments (_cap, _max_traded, _max_orders) default to the
+    module-level constants and can be overridden in tests without patching
+    globals.
     """
-    result: list[OrderSpec] = []
-    submitted_count = 0
-
+    # Group consecutive PENDING specs for the same ticker. Crossings produce
+    # leg=1 then leg=2 consecutively for the same ticker; non-crossings
+    # produce a single leg=1. Pre-rejected specs are always singleton groups.
+    groups: list[list[OrderSpec]] = []
     for spec in orders:
-        if spec.guard_status != "PENDING":
-            result.append(spec)
+        if (
+            groups
+            and groups[-1][0].guard_status == "PENDING"
+            and spec.guard_status == "PENDING"
+            and groups[-1][0].ticker == spec.ticker
+        ):
+            groups[-1].append(spec)
+        else:
+            groups.append([spec])
+
+    result: list[OrderSpec] = []
+    submitted_count: int = 0
+    traded_notional_total: float = 0.0
+
+    for group in groups:
+        # Pass through specs that were already rejected upstream.
+        if group[0].guard_status != "PENDING":
+            result.extend(group)
             continue
 
-        if abs(spec.target_notional) > CAP_PER_POSITION_NOTIONAL:
-            logger.warning(
-                "REJECTED_CAP: %s target_notional=%.2f exceeds cap=%.2f",
-                spec.ticker, spec.target_notional, CAP_PER_POSITION_NOTIONAL,
-            )
-            result.append(_replace_status(spec, "REJECTED_CAP"))
+        target_notional = group[0].target_notional  # same for all legs in group
+        group_traded = sum(spec.notional for spec in group)
+        group_size = len(group)
+
+        # Guard 1: position-size cap (destination position limit)
+        if abs(target_notional) > _cap:
+            for spec in group:
+                logger.warning(
+                    "REJECTED_CAP: %s target_notional=%.2f exceeds cap=%.2f",
+                    spec.ticker, target_notional, _cap,
+                )
+                result.append(_replace_status(spec, "REJECTED_CAP"))
             continue
 
-        if submitted_count >= MAX_ORDERS_PER_RUN:
-            logger.warning(
-                "REJECTED_MAX_ORDERS: max %d orders per run reached, blocking %s",
-                MAX_ORDERS_PER_RUN, spec.ticker,
-            )
-            result.append(_replace_status(spec, "REJECTED_MAX_ORDERS"))
+        # Guard 2: traded-notional brake (transaction throughput limit)
+        # Crossing evaluated as a unit: if either leg would push the run
+        # total over the limit, neither fires.
+        if traded_notional_total + group_traded > _max_traded:
+            for spec in group:
+                logger.warning(
+                    "REJECTED_TRADED_NOTIONAL: %s group_traded=%.2f would push "
+                    "run_total=%.2f over brake=%.2f",
+                    spec.ticker, group_traded, traded_notional_total, _max_traded,
+                )
+                result.append(_replace_status(spec, "REJECTED_TRADED_NOTIONAL"))
             continue
 
+        # Guard 3: max orders per run (also all-or-nothing for crossings)
+        if submitted_count + group_size > _max_orders:
+            for spec in group:
+                logger.warning(
+                    "REJECTED_MAX_ORDERS: max %d orders per run reached, blocking %s",
+                    _max_orders, spec.ticker,
+                )
+                result.append(_replace_status(spec, "REJECTED_MAX_ORDERS"))
+            continue
+
+        # Guard 4: dry-run -- applied last so guards 1-3 remain auditable.
+        # Accumulate counts even in dry-run so subsequent groups see the
+        # correct running totals (dry-run simulates live ordering faithfully).
         if dry_run:
-            result.append(_replace_status(spec, "DRY_RUN"))
+            for spec in group:
+                result.append(_replace_status(spec, "DRY_RUN"))
+            submitted_count += group_size
+            traded_notional_total += group_traded
             continue
 
-        result.append(spec)
-        submitted_count += 1
+        for spec in group:
+            result.append(spec)
+        submitted_count += group_size
+        traded_notional_total += group_traded
 
     return result
 

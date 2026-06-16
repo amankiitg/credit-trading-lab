@@ -7,6 +7,9 @@ name = "credit-trading-lab"
 version = "0.0.1"
 description = "Research lab for systematic credit trading strategies."
 requires-python = ">=3.9"
+dependencies = [
+    "alpaca-py>=0.8",
+]
 
 [tool.setuptools]
 packages = ["signals", "backtest", "execution", "risk", "models", "dashboard"]

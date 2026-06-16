@@ -19,6 +19,17 @@ RAW_DIR: Path = Path("data/raw")
 
 UNIVERSE: list[str] = ["SPY", "EFA", "EEM", "TLT", "IEF", "HYG", "LQD", "GLD"]
 
+ASSET_CLASS: dict[str, str] = {
+    "SPY": "equity",
+    "EFA": "equity",
+    "EEM": "equity",
+    "TLT": "rates",
+    "IEF": "rates",
+    "HYG": "credit",
+    "LQD": "credit",
+    "GLD": "commodity",
+}
+
 
 def ingest(
     tickers: list[str],

@@ -155,6 +155,15 @@ Three signals (RV1_A, RV2_A, RV3_A) admitted to Tier 2 via M1–M8 scorecard. Al
 
 Notebooks: `notebooks/06_factor_attribution.ipynb`, `notebooks/06_5_engine_correction.ipynb`, `notebooks/06_6_hyig_validation.ipynb`.
 
+### Sprints v7.1 – v8.1 — New Programmes (post v6.6 closure)
+
+| sprint | scope | outcome |
+|--------|-------|---------|
+| v7.1 | NAV wedge (HYG/LQD premium/discount) — data-availability probe | **G0a FAIL**: daily NAV not retrievable via a free, scriptable endpoint (the legacy iShares CSV export is retired). Programme stopped at the data gate; no proxy substituted. |
+| v8.1 | Universe and trend signal — operational instrument, not a research hypothesis | Mechanical 120d trend signal, vol-targeted across 8 liquid ETFs (SPY, EFA, EEM, TLT, IEF, HYG, LQD, GLD). No IC test, no Sharpe claim by design. All 5 engineering gates (E1–E5) pass; daily target-position vector built and persisted. |
+
+Docs: `sprints/v7.1/{PRD,TASKS,notes}.md`, `sprints/v8.1/{PRD,TASKS,notes,WALKTHROUGH}.md`.
+
 ## Building
 
 ### Prerequisites

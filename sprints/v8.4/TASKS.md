@@ -75,7 +75,7 @@ before continuing.
   - Validation: fails if any REJECTED_CAP order could reach the Alpaca
     submission call (the cap guard must run BEFORE submission, not after).
 
-- [~] **Task T5: order submission and fill reader (P8)**
+- [x] **Task T5: order submission and fill reader (P8)**
   - `execution/paper.py::submit_orders(client, orders, dry_run)` iterates
     only orders with `guard_status == 'PENDING'` and submits each as a
     `MarketOrderRequest` with `notional` quantity, `time_in_force=DAY`.

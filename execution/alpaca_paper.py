@@ -501,8 +501,8 @@ def build_fill_records(
                 fill_price = 0.0
             elif hasattr(order, "status") and order.status == OrderStatus.FILLED:
                 status = "FILLED"
-                filled_n = float(order.filled_notional or 0)
                 fill_price = float(order.filled_avg_price or 0)
+                filled_n = float(order.filled_qty or 0) * fill_price
             else:
                 status = "REJECTED_ALPACA"
                 filled_n = 0.0

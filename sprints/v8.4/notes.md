@@ -253,3 +253,41 @@ boundary:
 
 Sprint v8.4 status: **second fail-safe guard implemented and tested (27
 tests pass); live session still pending for T5/T8.**
+
+---
+
+## T5 live paper session (2026-06-17 — market hours)
+
+**Result: PASS.** Connection and fill round-trip confirmed.
+
+### Orders submitted
+
+| order_id | ticker | side | notional | fill_price | filled_qty | filled_$ | status |
+|----------|--------|------|----------|------------|------------|----------|--------|
+| 70a77327 | SPY | buy_to_open | $100.00 | $750.784 | 0.133181 | $100.00 | FILLED |
+| 2d649792 | SPY | sell_to_close | $99.98 | $750.734 | 0.133176 | $99.98 | FILLED |
+
+Both fills within the 30s timeout. Reconciliation: 0 flagged discrepancies.
+Simulated cost on close leg: $0.020 (2bp half-spread + slippage on $100).
+Residual after close: $0.003 (fractional share rounding — expected).
+Log: `execution/logs/reconciliation_2026-06-17.json`.
+
+Bug found and fixed: `build_fill_records` used `order.filled_notional` which
+doesn't exist in alpaca-py. Fixed to `filled_qty * filled_avg_price`.
+
+### Cap calibration issue (carry to v8.6)
+
+The full-book pipeline run (all 8 tickers, $100k NAV) rejected all orders
+at REJECTED_CAP. Root cause: `CAP_PER_POSITION_NOTIONAL = $8,000` but at
+$100k NAV even the smallest target weight (IEF 18%) = $18,123.
+
+For ALL positions to pass the cap at current weights:
+  NAV < CAP / max_weight = 8000 / 0.36 ≈ $22,000
+
+**v8.6 decision needed:** either lower PAPER_NAV_DEFAULT to ~$20k (all
+weights pass cap), or raise the cap proportionally, or make the cap a
+fraction of NAV rather than a fixed dollar amount. Document the choice in
+v8.6 PRD before the first real book execution.
+
+Sprint v8.4 status: **T5 live session DONE (2026-06-17). T8 (attribution
+feed append) deferred to v8.6.**

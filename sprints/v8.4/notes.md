@@ -291,3 +291,53 @@ v8.6 PRD before the first real book execution.
 
 Sprint v8.4 status: **T5 live session DONE (2026-06-17). T8 (attribution
 feed append) deferred to v8.6.**
+
+---
+
+## Supervised smoke gate — items 2-4 (2026-06-17 market hours)
+
+### Item 2: Short locate — PASS (with critical finding)
+
+1-share SPY `sell_to_open` filled (order addb8e0a, 1 share @ $751.51).
+Negative position confirmed via `get_current_positions`: SPY = -$751.56.
+
+**Critical finding: notional shorts are blocked by Alpaca paper.**
+`"fractional orders cannot be sold short"` — Alpaca rejects any notional
+sell_to_open with a 422 error. Shorts MUST be submitted as `qty` (whole
+shares), not `notional`.
+
+Design fix required in v8.6: `submit_orders` needs a short path that
+converts `notional → floor(notional / last_price)` shares and submits
+with `qty` instead of `notional`. Long orders (buy_to_open, buy_to_close)
+can remain notional. Longs-reducing-short (buy_to_close on a fractional
+short) should also use `qty` from the position record, not notional.
+
+### Item 3: Zero-crossing — PASS
+
+Long open: 1 share SPY @ $751.49 (order 4b5e9a7f).
+Leg 1 sell_to_close: 1 share @ $751.41 (order 94c50a50) — filled.
+Leg 2 sell_to_open:  1 share @ $751.38 (order 55a05158) — filled.
+Final position: SPY = -$751.40 (short). Closed via close_position.
+
+Both legs filled in sequence (close confirmed before open submitted).
+All-or-nothing structure held: no partial crossing observed.
+
+### Item 4: Guard boundary — PASS
+
+Scenario: EEM $7,000 open (group_traded $7k, passes cap + brake);
+SPY crossing close $7,900 + open $7,000 = group_traded $14,900;
+accumulated total $21,900 > $16,000 brake; SPY target -$7,000 < cap.
+
+apply_guards(dry_run=False) fired REJECTED_TRADED_NOTIONAL on BOTH SPY
+legs. EEM reached submit_orders (order d89789f0, filled $6,999.99).
+SPY never reached the Alpaca API. Guard fired in the live code path, not
+just in dry-run mode.
+
+### Smoke gate verdict: items 1-4 PASS; item 5 (T8 attribution feed) deferred to v8.6
+
+Outstanding v8.6 design changes surfaced by this gate:
+1. `submit_orders` needs a short path using `qty` (not `notional`)
+2. `PAPER_NAV_DEFAULT` or `CAP_PER_POSITION_NOTIONAL` must be recalibrated
+   before full-book execution (cap rejects all positions at $100k NAV)
+3. `close_position` API should be preferred over notional close orders for
+   dust/fractional residuals

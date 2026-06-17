@@ -135,21 +135,22 @@ session cannot write decisions.
   - Validation: fails if any P&L panel lacks the caption; fails if the
     S4 text in notes.md differs from the PRD verbatim.
 
-- [ ] **Task T8: Integration smoke test (U1-U7 sweep)**
+- [~] **Task T8: Integration smoke test (U1-U7 sweep)** -- manual checks done 2026-06-17; Google OAuth deferred
   - Run `streamlit run dashboard/app.py` locally. Manually walk through
     every panel in the checklist below. Document the result in notes.md.
   - Checklist:
     - [ ] Login redirects to Google; authorized email enters dashboard; other
           email sees "Access denied" page and cannot proceed.
-    - [ ] Attribution tab loads all 7 panels without error; sleeve P&L
+          **DEFERRED** -- Google OAuth config pending; local dev mode used instead.
+    - [x] Attribution tab loads all 7 panels without error; sleeve P&L
           totals match notes.md figures within 1%.
-    - [ ] Panel E Finding-3 caveat text is present verbatim (U2).
-    - [ ] Panel H shows yesterday's as-of date; Approve writes a row to
+    - [x] Panel E Finding-3 caveat text is present verbatim (U2).
+    - [x] Panel H shows yesterday's as-of date; Approve writes a row to
           Supabase; Reject writes a row; both rows visible in Supabase
           dashboard (U3, U4).
-    - [ ] Panels I-L show "TODO v8.6" stub warnings, no Alpaca calls (U6).
-    - [ ] Every P&L panel shows the rate-cycle framing caption (U7).
-    - [ ] `grep -r "TradingClient" dashboard/` returns zero hits (U6).
+    - [x] Panels I-L show "TODO v8.6" stub warnings, no Alpaca calls (U6).
+    - [x] Every P&L panel shows the rate-cycle framing caption (U7).
+    - [x] `grep -r "TradingClient" dashboard/` returns zero hits (U6).
   - Acceptance: all checklist items pass.
   - Files: `sprints/v8.5/notes.md`
   - Validation: fails if any gate (U1-U7, S4) is not confirmed passing

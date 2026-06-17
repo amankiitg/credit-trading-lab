@@ -204,3 +204,22 @@ it per House Rule 8, recording the omission in the relevant sprint's notes.
 
 Sprint v8.5 status: implementation complete; pending Supabase table
 provisioning and Google OIDC configuration for full integration test.
+
+---
+
+## T8 manual smoke -- 2026-06-17
+
+Ran `streamlit run dashboard/app.py` locally with `.env` sourced.
+
+| Gate | Result | Notes |
+|------|--------|-------|
+| U1 -- Attribution panels load | PASS | All 7 panels render, row counts shown |
+| U2 -- Finding-3 caveat present | PASS | st.info box visible in Panel E, verbatim text confirmed |
+| U3 -- As-of date shown (no look-ahead) | PASS | Panel H shows yesterday's close date |
+| U4 -- Approve/Reject writes to Supabase | PASS | Row visible in Supabase dashboard within 2s |
+| U5 -- Google OIDC email gate | DEFERRED | Google OAuth config pending; dashboard runs in local dev mode (ALLOWED_EMAIL passthrough). Will be verified in v8.6 before Render deployment. |
+| U6 -- Alpaca stubs labelled TODO v8.6 | PASS | Panels I-L show warnings; grep TradingClient dashboard/ = zero hits |
+| U7 -- Rate-cycle framing caption on all P&L panels | PASS | Caption present on every panel that shows P&L |
+| S4 -- Guardrail text in notes.md | PASS | Present verbatim at top of this file |
+
+T8 status: 6/7 gates pass manually. U5 (Google OAuth) deferred to v8.6.

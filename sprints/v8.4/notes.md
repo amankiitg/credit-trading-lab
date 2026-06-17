@@ -341,3 +341,63 @@ Outstanding v8.6 design changes surfaced by this gate:
    before full-book execution (cap rejects all positions at $100k NAV)
 3. `close_position` API should be preferred over notional close orders for
    dust/fractional residuals
+
+---
+
+## NAV-relative position-size cap refactor (2026-06-17)
+
+### Context
+
+The live T5 session (today) rejected all 8 book tickers at REJECTED_CAP.
+Root cause: the old absolute guard was CAP_PER_POSITION_NOTIONAL = $8,000.
+At PAPER_NAV_DEFAULT = $100,000, even the smallest target weight (IEF 18.12%)
+produces a notional of $18,120, which exceeds the $8,000 cap by 2.3x.
+A position-size limit that cannot hold any position in the intended book is
+not a guard; it is a hard block. The cap must scale with the book.
+
+### Decision: MAX_POSITION_PCT_OF_NAV = 0.40
+
+The cap is now abs(target_notional) > MAX_POSITION_PCT_OF_NAV * nav.
+
+Rationale for 0.40 (not the suggested 0.25):
+- 0.25 would reject TLT (-36.25%), EFA (34.96%), and EEM (26.14%) from the
+  live-run weights -- 3 of 8 names still blocked.
+- 0.25 would have been an improvement over $8k but not a solution.
+- 0.40 (40% of NAV) admits the observed maximum weight (TLT 36.25%) with
+  ~10% headroom. At $100k NAV the cap is $40,000; the largest position is
+  TLT at $36,250.
+- A per-name cap of 40% is conservative for a diversified 8-name vol-targeted
+  book. The gross long+short exposure is typically 1.5x to 2x NAV spread
+  across all 8 names; 40% per name constrains any single name to no more than
+  roughly 40/(150 to 200) = 20-27% of gross exposure.
+
+MAX_TRADED_NOTIONAL_PER_RUN remains $16,000 (absolute). It is deliberately
+NOT scaled with NAV; it is a fat-finger throughput limit on a single
+execution run, not a portfolio constraint.
+
+### What changed
+
+execution/alpaca_paper.py:
+- CAP_PER_POSITION_NOTIONAL removed; replaced by MAX_POSITION_PCT_OF_NAV = 0.40
+- apply_guards signature: _cap: float -> _cap_pct: float, _nav: float
+  (both default to module constants; production callers should pass live
+  account equity as _nav)
+- Cap check: abs(target_notional) > _cap becomes > _cap_pct * _nav
+- Added deliberate-split comment at the constants block and in the docstring
+- No change to MAX_TRADED_NOTIONAL_PER_RUN or the brake logic
+
+tests/test_paper_execution.py:
+- Removed import of CAP_PER_POSITION_NOTIONAL
+- Three basic cap tests migrated to use explicit _cap_pct=0.10, _nav=100k
+  overrides (deterministic, independent of module defaults)
+- test_both_rejection_reasons_visible_in_dry_run: oversized target changed
+  from $9k to $45k and explicit _cap_pct=0.40, _nav=100k added
+- test_traded_notional_brake_uses_default_constant renamed and rewritten as
+  test_traded_notional_brake_is_absolute (asserts $16k, no cap reference)
+- Four new tests added:
+    test_full_book_at_100k_nav_passes_cap (regression gate for T5 finding)
+    test_cap_rejects_position_exceeding_pct_of_nav
+    test_cap_scales_with_nav ($15k passes at $100k NAV, fails at $30k NAV)
+    test_brake_fires_independently_of_nav (same brake fires at any NAV)
+
+Test result: 31/31 pass. No live Alpaca calls.

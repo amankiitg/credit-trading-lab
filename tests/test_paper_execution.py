@@ -20,9 +20,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from execution.alpaca_paper import (
-    CAP_PER_POSITION_NOTIONAL,
     DELTA_MIN_NOTIONAL,
     MAX_ORDERS_PER_RUN,
+    MAX_POSITION_PCT_OF_NAV,
     MAX_TRADED_NOTIONAL_PER_RUN,
     PAPER_NAV_DEFAULT,
     FillRecord,
@@ -51,40 +51,44 @@ def _pending_spec(ticker, side, notional, position_intent, target_notional, leg=
 # ---------------------------------------------------------------- P2: guard rejects oversized target
 
 def test_guard_rejects_order_exceeding_cap() -> None:
-    """P2: a target notional above CAP_PER_POSITION_NOTIONAL must never be
-    submitted to Alpaca -- the guard must set guard_status='REJECTED_CAP'.
+    """P2: a target notional above _cap_pct * _nav must be REJECTED_CAP.
+
+    Override cap_pct=0.10 and nav=$100k (cap=$10k) to make the test
+    independent of the module default MAX_POSITION_PCT_OF_NAV.
     """
-    oversized_target = CAP_PER_POSITION_NOTIONAL + 500.0  # deliberately above cap
+    cap_pct, nav = 0.10, 100_000.0          # explicit cap = $10,000
+    oversized_target = cap_pct * nav + 500.0  # $10,500 -- deliberately above cap
     orders = [
         _pending_spec("SPY", "buy", oversized_target, "buy_to_open", oversized_target)
     ]
-    guarded = apply_guards(orders, dry_run=False)
+    guarded = apply_guards(orders, dry_run=False, _cap_pct=cap_pct, _nav=nav)
 
     assert guarded[0].guard_status == "REJECTED_CAP"
-    # confirm no PENDING orders remain that could slip through to submission
     pending = [o for o in guarded if o.guard_status == "PENDING"]
     assert len(pending) == 0
 
 
 def test_guard_accepts_order_at_cap_boundary() -> None:
-    """P2 boundary: exactly at the cap should be accepted (strict less-than)."""
-    at_cap = CAP_PER_POSITION_NOTIONAL
+    """P2 boundary: exactly at cap_pct * nav is accepted (strict greater-than check)."""
+    cap_pct, nav = 0.10, 100_000.0
+    at_cap = cap_pct * nav   # exactly $10,000
     orders = [
         _pending_spec("IEF", "buy", at_cap, "buy_to_open", at_cap)
     ]
-    guarded = apply_guards(orders, dry_run=False)
+    guarded = apply_guards(orders, dry_run=False, _cap_pct=cap_pct, _nav=nav)
     assert guarded[0].guard_status == "PENDING"
 
 
 def test_guard_rejects_oversized_short_using_abs() -> None:
-    """P2: the cap guard uses the absolute value of target_notional so shorts
-    are bounded the same way as longs.
+    """P2: the cap guard uses abs(target_notional) so shorts are bounded
+    the same way as longs.
     """
-    oversized_short = -(CAP_PER_POSITION_NOTIONAL + 100.0)
+    cap_pct, nav = 0.10, 100_000.0
+    oversized_short = -(cap_pct * nav + 100.0)   # -$10,100
     orders = [
         _pending_spec("HYG", "sell", abs(oversized_short), "sell_to_open", oversized_short)
     ]
-    guarded = apply_guards(orders, dry_run=False)
+    guarded = apply_guards(orders, dry_run=False, _cap_pct=cap_pct, _nav=nav)
     assert guarded[0].guard_status == "REJECTED_CAP"
 
 
@@ -473,13 +477,16 @@ def test_crossing_within_brake_passes() -> None:
 def test_both_rejection_reasons_visible_in_dry_run() -> None:
     """DRY_RUN applied last: REJECTED_CAP and REJECTED_TRADED_NOTIONAL must
     surface in dry-run so guards stay auditable without a live run.
+
+    Uses explicit _cap_pct=0.40, _nav=100k (cap=$40k) so the oversized
+    target of $45k is clearly above cap regardless of module defaults.
     """
-    # Oversized target -> REJECTED_CAP
-    oversized = [_pending_spec("TLT", "buy", 9_000.0, "buy_to_open", 9_000.0)]
-    # Normal open that passes cap but is within brake
+    # Oversized target ($45k > 40% of $100k = $40k cap) -> REJECTED_CAP
+    oversized = [_pending_spec("TLT", "buy", 45_000.0, "buy_to_open", 45_000.0)]
+    # Normal open that passes cap and is within brake
     normal = [_pending_spec("IEF", "buy", 3_000.0, "buy_to_open", 3_000.0)]
 
-    # Build a crossing that is within cap but over the brake
+    # Crossing within cap ($6k < $40k) but over the explicit brake ($13k > $12k)
     # close $7,000 + open $6,000 = $13,000 > $12,000 brake
     current_notionals = {"SPY": 7_000.0}
     crossing_orders = compute_delta_orders(
@@ -487,22 +494,23 @@ def test_both_rejection_reasons_visible_in_dry_run() -> None:
     )
 
     all_orders = oversized + crossing_orders + normal
-    guarded = apply_guards(all_orders, dry_run=True, _max_traded=12_000.0)
+    guarded = apply_guards(
+        all_orders, dry_run=True,
+        _cap_pct=0.40, _nav=100_000.0, _max_traded=12_000.0,
+    )
 
     statuses = {o.ticker: o.guard_status for o in guarded}
 
-    # Oversized target: must still be REJECTED_CAP, not DRY_RUN
     assert statuses["TLT"] == "REJECTED_CAP", (
         f"oversized target must show REJECTED_CAP in dry-run, got {statuses['TLT']}"
     )
 
-    # Crossing over brake: must still be REJECTED_TRADED_NOTIONAL, not DRY_RUN
     spy_statuses = [o.guard_status for o in guarded if o.ticker == "SPY"]
     assert all(s == "REJECTED_TRADED_NOTIONAL" for s in spy_statuses), (
-        f"brake-rejected crossing must show REJECTED_TRADED_NOTIONAL in dry-run, got {spy_statuses}"
+        f"brake-rejected crossing must show REJECTED_TRADED_NOTIONAL in dry-run, "
+        f"got {spy_statuses}"
     )
 
-    # Normal open: passes both guards, becomes DRY_RUN
     assert statuses["IEF"] == "DRY_RUN", (
         f"normal open must be DRY_RUN after passing all content guards, got {statuses['IEF']}"
     )
@@ -529,6 +537,92 @@ def test_traded_notional_accumulates_across_tickers() -> None:
     assert ief.guard_status == "REJECTED_TRADED_NOTIONAL"  # $7,000+$7,000 > $12,000
 
 
-def test_traded_notional_brake_uses_default_constant() -> None:
-    """Without an override, MAX_TRADED_NOTIONAL_PER_RUN is 2x the cap."""
-    assert MAX_TRADED_NOTIONAL_PER_RUN == 2 * CAP_PER_POSITION_NOTIONAL
+def test_traded_notional_brake_is_absolute() -> None:
+    """MAX_TRADED_NOTIONAL_PER_RUN is an absolute dollar limit independent of NAV."""
+    assert MAX_TRADED_NOTIONAL_PER_RUN == 16_000.0
+    assert isinstance(MAX_TRADED_NOTIONAL_PER_RUN, float)
+
+
+# ================================================================
+# NAV-relative cap: new tests surfaced by the live T5 session
+# ================================================================
+
+def test_full_book_at_100k_nav_passes_cap() -> None:
+    """All 8 live-session weights must pass the cap at $100k NAV.
+
+    The live T5 run rejected all 8 tickers at REJECTED_CAP because the old
+    absolute $8k cap was smaller than even the smallest weight (IEF ~18% =
+    $18k).  This test is the regression gate: with MAX_POSITION_PCT_OF_NAV
+    and the default PAPER_NAV_DEFAULT, no name should be rejected.
+    """
+    live_weights = {
+        "SPY": -0.1993, "EFA":  0.3496, "EEM": 0.2614, "TLT": -0.3625,
+        "IEF":  0.1812, "HYG":  0.2075, "LQD": 0.2065, "GLD":  0.2320,
+    }
+    orders = compute_delta_orders(live_weights, {}, paper_nav=PAPER_NAV_DEFAULT)
+    guarded = apply_guards(orders, dry_run=False)
+
+    rejected_cap = [o for o in guarded if o.guard_status == "REJECTED_CAP"]
+    assert len(rejected_cap) == 0, (
+        f"0 REJECTED_CAP expected at {PAPER_NAV_DEFAULT:.0f} NAV; "
+        f"got {[(o.ticker, o.target_notional) for o in rejected_cap]}"
+    )
+
+
+def test_cap_rejects_position_exceeding_pct_of_nav() -> None:
+    """A target notional above MAX_POSITION_PCT_OF_NAV * NAV is REJECTED_CAP.
+
+    Uses the default MAX_POSITION_PCT_OF_NAV and an explicit NAV so the
+    threshold is computed the same way the guard does it.
+    """
+    nav = 80_000.0
+    oversized = MAX_POSITION_PCT_OF_NAV * nav + 1_000.0
+    orders = [_pending_spec("GLD", "buy", oversized, "buy_to_open", oversized)]
+    guarded = apply_guards(orders, dry_run=False, _nav=nav)
+    assert guarded[0].guard_status == "REJECTED_CAP"
+
+
+def test_cap_scales_with_nav() -> None:
+    """The same absolute notional passes the cap at high NAV and fails at low NAV.
+
+    This verifies the guard is truly NAV-relative rather than a fixed dollar
+    limit: halving the book size halves the cap, so a mid-range notional that
+    was safe at full size becomes oversized at half size.
+    """
+    cap_pct = MAX_POSITION_PCT_OF_NAV
+    notional = 15_000.0
+
+    # At $100k NAV: cap = 0.40 * 100k = $40k; $15k is within cap.
+    guarded_high = apply_guards(
+        [_pending_spec("EFA", "buy", notional, "buy_to_open", notional)],
+        dry_run=False, _cap_pct=cap_pct, _nav=100_000.0,
+    )
+    assert guarded_high[0].guard_status == "PENDING"
+
+    # At $30k NAV: cap = 0.40 * 30k = $12k; $15k exceeds cap.
+    guarded_low = apply_guards(
+        [_pending_spec("EFA", "buy", notional, "buy_to_open", notional)],
+        dry_run=False, _cap_pct=cap_pct, _nav=30_000.0,
+    )
+    assert guarded_low[0].guard_status == "REJECTED_CAP"
+
+
+def test_brake_fires_independently_of_nav() -> None:
+    """The traded-notional brake is absolute: raising NAV does not relax it.
+
+    Two $7k orders total $14k traded, which exceeds the $12k override brake
+    regardless of whether NAV is $100k or $1M.  The cap (NAV-relative) would
+    pass both at those NAV levels, so any rejection here must be the brake.
+    """
+    orders = [
+        _pending_spec("SPY", "buy", 7_000.0, "buy_to_open", 7_000.0),
+        _pending_spec("IEF", "buy", 7_000.0, "buy_to_open", 7_000.0),
+    ]
+    for nav in (100_000.0, 1_000_000.0):
+        guarded = apply_guards(orders, dry_run=False, _nav=nav, _max_traded=12_000.0)
+        spy = next(o for o in guarded if o.ticker == "SPY")
+        ief = next(o for o in guarded if o.ticker == "IEF")
+        assert spy.guard_status == "PENDING", f"SPY should pass cap at NAV={nav}"
+        assert ief.guard_status == "REJECTED_TRADED_NOTIONAL", (
+            f"IEF should hit brake at NAV={nav}"
+        )

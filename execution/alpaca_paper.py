@@ -49,8 +49,23 @@ from signals.etf_universe import UNIVERSE
 LOG_DIR = Path("execution/logs")
 PAPER_ENDPOINT = "https://paper-api.alpaca.markets"
 
-CAP_PER_POSITION_NOTIONAL: float = 8_000.0
-MAX_TRADED_NOTIONAL_PER_RUN: float = 16_000.0  # 2x the position cap
+# Guard 1 (position-size cap) is NAV-relative: it limits how large a single
+# position can be as a fraction of the book.  With vol-targeted weights across
+# 8 liquid ETFs, the largest observed single-name weight is ~36% (TLT); 0.40
+# (40% of NAV) admits that weight with modest headroom.  The cap is evaluated
+# against the TARGET notional, not the delta, and covers longs and shorts
+# symmetrically via abs().
+#
+# Guard 2 (traded-notional brake) is ABSOLUTE: it is a fat-finger throughput
+# limit on the total dollar volume a single execution run can transact,
+# independent of book size.  $16,000 caps a run at 2x the largest expected
+# single-name notional at $100k NAV with a 40% cap.
+#
+# An order must pass BOTH guards.  The two guards intentionally use different
+# units: the cap scales with the book, the brake does not.
+
+MAX_POSITION_PCT_OF_NAV: float = 0.40
+MAX_TRADED_NOTIONAL_PER_RUN: float = 16_000.0
 MAX_ORDERS_PER_RUN: int = 20
 DELTA_MIN_NOTIONAL: float = 10.0
 DRY_RUN_DEFAULT: bool = True
@@ -290,7 +305,8 @@ def compute_delta_orders(
 def apply_guards(
     orders: list[OrderSpec],
     dry_run: bool = DRY_RUN_DEFAULT,
-    _cap: float = CAP_PER_POSITION_NOTIONAL,
+    _cap_pct: float = MAX_POSITION_PCT_OF_NAV,
+    _nav: float = PAPER_NAV_DEFAULT,
     _max_traded: float = MAX_TRADED_NOTIONAL_PER_RUN,
     _max_orders: int = MAX_ORDERS_PER_RUN,
 ) -> list[OrderSpec]:
@@ -300,28 +316,40 @@ def apply_guards(
     as a unit so that a guard rejection is always all-or-nothing: you cannot
     end up half-crossed (one leg fired, the other blocked) under any guard.
 
+    Guard 1 (position-size cap) and Guard 2 (traded-notional brake) use
+    deliberately different units:
+      - The cap (_cap_pct * _nav) is NAV-relative: it limits how large a
+        single position can be as a fraction of the book.  Pass the current
+        account equity or configured paper NAV as _nav so the cap scales
+        with actual book size.
+      - The brake (_max_traded) is absolute: it is a fat-finger throughput
+        limit on the total dollar volume a single run can transact, regardless
+        of book size.
+
     Guards applied in priority order:
 
-    1. POSITION-SIZE CAP (CAP_PER_POSITION_NOTIONAL): checks abs(target_notional).
-       This limits the size of the destination position. Both legs of a
-       crossing share the same target_notional, so one check covers both.
+    1. POSITION-SIZE CAP (_cap_pct * _nav): checks abs(target_notional).
+       Both legs of a crossing share the same target_notional, so one check
+       covers both.  Rejection reason: REJECTED_CAP.
 
-    2. TRADED-NOTIONAL BRAKE (MAX_TRADED_NOTIONAL_PER_RUN): checks whether
-       adding this group's summed leg notionals to the run's accumulated
-       total would exceed the limit. For a crossing the group total is
-       abs(close_leg) + abs(open_leg), which is larger than the target alone.
-       This is the guard the position-size cap alone would miss.
+    2. TRADED-NOTIONAL BRAKE (_max_traded): checks whether adding this
+       group's summed leg notionals to the run's accumulated total would
+       exceed the limit.  For a crossing the group total is abs(close_leg) +
+       abs(open_leg), which is larger than the target alone.  This is the
+       guard the position-size cap alone would miss.  Rejection reason:
+       REJECTED_TRADED_NOTIONAL.
 
     3. MAX-ORDERS: checks whether adding this group's leg count to the run's
-       submitted count would exceed MAX_ORDERS_PER_RUN.
+       submitted count would exceed MAX_ORDERS_PER_RUN.  Rejection reason:
+       REJECTED_MAX_ORDERS.
 
     4. DRY_RUN: any group that passed all content guards becomes DRY_RUN.
        Applied last so guards 1-3 are still visible and auditable in dry-run
        (a rejected group shows its real rejection reason, not DRY_RUN).
 
-    The limit arguments (_cap, _max_traded, _max_orders) default to the
-    module-level constants and can be overridden in tests without patching
-    globals.
+    Override arguments (_cap_pct, _nav, _max_traded, _max_orders) default to
+    module-level constants and can be set in tests without patching globals.
+    In production, pass the live account equity as _nav.
     """
     # Group consecutive PENDING specs for the same ticker. Crossings produce
     # leg=1 then leg=2 consecutively for the same ticker; non-crossings
@@ -351,13 +379,16 @@ def apply_guards(
         target_notional = group[0].target_notional  # same for all legs in group
         group_traded = sum(spec.notional for spec in group)
         group_size = len(group)
+        cap_notional = _cap_pct * _nav
 
-        # Guard 1: position-size cap (destination position limit)
-        if abs(target_notional) > _cap:
+        # Guard 1: position-size cap (NAV-relative destination position limit)
+        if abs(target_notional) > cap_notional:
             for spec in group:
                 logger.warning(
-                    "REJECTED_CAP: %s target_notional=%.2f exceeds cap=%.2f",
-                    spec.ticker, target_notional, _cap,
+                    "REJECTED_CAP: %s target_notional=%.2f exceeds cap=%.2f"
+                    " (%.0f%% of NAV=%.0f)",
+                    spec.ticker, target_notional, cap_notional,
+                    _cap_pct * 100, _nav,
                 )
                 result.append(_replace_status(spec, "REJECTED_CAP"))
             continue

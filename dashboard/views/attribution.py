@@ -293,9 +293,8 @@ def render() -> None:
     st.markdown("### G - Marginal Risk Contribution by Sleeve")
     sleeve_cols = ["mctr_equity", "mctr_rates", "mctr_credit", "mctr_commodity"]
     mctr_latest = (
-        mctr.groupby("mode")
-        .apply(lambda g: g.nlargest(1, "date"))
-        .reset_index(drop=True)
+        mctr.sort_values("date", ascending=False)
+        .drop_duplicates(subset="mode")
         .set_index("mode")
     )
 

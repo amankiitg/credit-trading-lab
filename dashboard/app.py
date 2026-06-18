@@ -30,6 +30,13 @@ if _ROOT not in sys.path:
 # accessed for the first time (Streamlit lazy-loads on first access).
 # This runs on every worker startup so it survives container restarts.
 _google_client_id = os.environ.get("GOOGLE_CLIENT_ID", "")
+_oidc_env_vars = {
+    k: bool(os.environ.get(k))
+    for k in ("GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET",
+              "STREAMLIT_COOKIE_SECRET", "STREAMLIT_AUTH_REDIRECT_URI")
+}
+print(f"[app] OIDC env vars present: {_oidc_env_vars}", flush=True)
+
 if _google_client_id:
     _secrets_toml = Path(_ROOT) / ".streamlit" / "secrets.toml"
     if not _secrets_toml.exists():
@@ -44,6 +51,11 @@ if _google_client_id:
             f'client_secret       = "{os.environ.get("GOOGLE_CLIENT_SECRET", "")}"\n'
             'server_metadata_url = "https://accounts.google.com/.well-known/openid-configuration"\n'
         )
+        print(f"[app] wrote secrets.toml to {_secrets_toml}", flush=True)
+    else:
+        print(f"[app] secrets.toml already exists at {_secrets_toml}", flush=True)
+else:
+    print("[app] GOOGLE_CLIENT_ID not set -- OIDC disabled", flush=True)
 
 import streamlit as st  # noqa: E402
 

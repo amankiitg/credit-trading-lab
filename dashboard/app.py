@@ -34,11 +34,14 @@ st.set_page_config(
 
 # ----------------------------------------------------------------- auth gate
 _ALLOWED_EMAIL = os.environ.get("ALLOWED_EMAIL", "")
-_secrets_configured = (
-    hasattr(st, "secrets")
-    and "auth" in st.secrets
-    and "google" in st.secrets.get("auth", {})
-)
+try:
+    _secrets_configured = (
+        "auth" in st.secrets
+        and "google" in st.secrets.get("auth", {})
+    )
+except Exception:
+    # No secrets.toml present (e.g. fresh Render deploy before write_render_secrets runs)
+    _secrets_configured = False
 
 if _secrets_configured:
     if not st.user.is_logged_in:

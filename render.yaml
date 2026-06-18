@@ -21,7 +21,7 @@ services:
   - type: web
     name: credit-lab-dashboard
     runtime: python
-    buildCommand: pip install -e .
+    buildCommand: pip install -e . && python scripts/write_render_secrets.py
     startCommand: streamlit run dashboard/app.py --server.port $PORT --server.address 0.0.0.0
     envVars:
       - key: SUPABASE_URL
@@ -31,6 +31,12 @@ services:
       - key: ALLOWED_EMAIL
         sync: false
       - key: STREAMLIT_AUTH_REDIRECT_URI
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: STREAMLIT_COOKIE_SECRET
         sync: false
       # ALPACA_PAPER_API_KEY and ALPACA_PAPER_SECRET_KEY are intentionally
       # absent from this service. The dashboard never calls Alpaca directly.

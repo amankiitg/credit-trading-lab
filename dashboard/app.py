@@ -1,10 +1,15 @@
-"""Sprint v8.5 Attribution Lab -- Streamlit entrypoint.
+"""Sprint v8.6 Attribution Lab -- Streamlit entrypoint.
 
 Run from project root:
     streamlit run dashboard/app.py
 
 Two tabs: Attribution Lab (v8.3 forensic panels) and Trades & Positions
-(proposed trade + Approve/Reject + Supabase). No auth in v8.5 local build.
+(proposed trade + Approve/Reject + Supabase).
+
+Auth: Google OIDC restricted to ALLOWED_EMAIL (exact case-sensitive match).
+Requires .streamlit/secrets.toml with [auth] and [auth.google] sections.
+Degrades gracefully when secrets.toml is absent: shows a warning and uses
+ALLOWED_EMAIL as a local dev passthrough (no OIDC redirect).
 """
 
 from __future__ import annotations
@@ -22,13 +27,41 @@ if _ROOT not in sys.path:
 import streamlit as st  # noqa: E402
 
 st.set_page_config(
-    page_title="Attribution Lab -- v8.5",
+    page_title="Attribution Lab -- v8.6",
     page_icon=":test_tube:",
     layout="wide",
 )
 
-# Auth disabled for local dev -- TODO v8.6: restore before deploying
-_user_email = os.environ.get("ALLOWED_EMAIL", "local")
+# ----------------------------------------------------------------- auth gate
+_ALLOWED_EMAIL = os.environ.get("ALLOWED_EMAIL", "")
+_secrets_configured = (
+    hasattr(st, "secrets")
+    and "auth" in st.secrets
+    and "google" in st.secrets.get("auth", {})
+)
+
+if _secrets_configured:
+    if not st.user.is_logged_in:
+        st.login("google")
+        st.stop()
+
+    _user_email: str = st.user.email or ""
+    if _user_email != _ALLOWED_EMAIL:
+        st.error(
+            f"Access denied. This dashboard is restricted to one authorized account. "
+            f"You are signed in as **{_user_email}**. "
+            f"Please sign out and use the authorized account."
+        )
+        st.stop()
+else:
+    # Local dev fallback: no OIDC redirect, use ALLOWED_EMAIL as passthrough.
+    # Do NOT deploy in this mode.
+    st.warning(
+        "Google OIDC not configured. Running in local dev mode -- "
+        "create .streamlit/secrets.toml to enable auth.",
+        icon="⚠",
+    )
+    _user_email = _ALLOWED_EMAIL or "local"
 
 # ----------------------------------------------------------------- tabs
 

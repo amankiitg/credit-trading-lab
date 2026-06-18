@@ -190,3 +190,116 @@ def fetch_pnl_log(limit: int = 60) -> list[dict]:
         return resp.data or []
     except Exception:
         return []
+
+
+def write_pnl_log(row: dict) -> bool:
+    """Upsert a daily P&L row (trade_date is the PK)."""
+    client = get_supabase_client()
+    if client is None:
+        return False
+    try:
+        client.table("pnl_log").upsert(row).execute()
+        return True
+    except Exception as exc:
+        _log.error("write_pnl_log failed: %s", exc)
+        return False
+
+
+def write_positions(rows: list[dict]) -> bool:
+    """Upsert position snapshot rows (PK: trade_date + ticker)."""
+    client = get_supabase_client()
+    if client is None or not rows:
+        return False
+    try:
+        client.table("positions").upsert(rows).execute()
+        return True
+    except Exception as exc:
+        _log.error("write_positions failed: %s", exc)
+        return False
+
+
+# ---------------------------------------------------------------- generic settings
+
+def get_setting(key: str) -> str | None:
+    """Read a key-value setting from the settings table. Returns None if absent."""
+    client = get_supabase_client()
+    if client is None:
+        return None
+    try:
+        resp = (
+            client.table("settings")
+            .select("value")
+            .eq("key", key)
+            .limit(1)
+            .execute()
+        )
+        if resp.data:
+            return resp.data[0]["value"]
+        return None
+    except Exception:
+        return None
+
+
+def set_setting(key: str, value: str) -> bool:
+    """Upsert a key-value setting in the settings table."""
+    client = get_supabase_client()
+    if client is None:
+        return False
+    try:
+        client.table("settings").upsert({"key": key, "value": value}).execute()
+        return True
+    except Exception as exc:
+        _log.error("set_setting(%s) failed: %s", key, exc)
+        return False
+
+
+# ---------------------------------------------------------------- live attribution
+
+def write_live_attribution(rows: list[dict]) -> bool:
+    """Upsert live attribution rows (PK: run_date + ticker)."""
+    client = get_supabase_client()
+    if client is None or not rows:
+        return False
+    try:
+        client.table("live_attribution").upsert(rows).execute()
+        return True
+    except Exception as exc:
+        _log.error("write_live_attribution failed: %s", exc)
+        return False
+
+
+# ---------------------------------------------------------------- cron run log (idempotency)
+
+def check_cron_run(job_name: str, run_date: str) -> bool:
+    """Return True if this job already completed for run_date."""
+    client = get_supabase_client()
+    if client is None:
+        return False
+    try:
+        resp = (
+            client.table("cron_runs")
+            .select("run_date")
+            .eq("run_date", run_date)
+            .eq("job_name", job_name)
+            .limit(1)
+            .execute()
+        )
+        return bool(resp.data)
+    except Exception:
+        return False
+
+
+def write_cron_run(job_name: str, run_date: str) -> bool:
+    """Record a completed cron run. Called at end of successful run only."""
+    client = get_supabase_client()
+    if client is None:
+        return False
+    try:
+        client.table("cron_runs").upsert({
+            "run_date": run_date,
+            "job_name": job_name,
+        }).execute()
+        return True
+    except Exception as exc:
+        _log.error("write_cron_run failed: %s", exc)
+        return False

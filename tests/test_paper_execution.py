@@ -21,6 +21,7 @@ import pytest
 
 from execution.alpaca_paper import (
     DELTA_MIN_NOTIONAL,
+    DUST_THRESHOLD_USD,
     MAX_ORDERS_PER_RUN,
     MAX_POSITION_PCT_OF_NAV,
     MAX_TRADED_NOTIONAL_PER_RUN,
@@ -29,9 +30,13 @@ from execution.alpaca_paper import (
     OrderSpec,
     apply_guards,
     build_fill_records,
+    close_dust_positions,
     compute_delta_orders,
+    feed_attribution,
+    get_live_nav,
     mark_costs,
     reconcile,
+    submit_orders,
 )
 from execution.costs import CostParams
 
@@ -626,3 +631,363 @@ def test_brake_fires_independently_of_nav() -> None:
         assert ief.guard_status == "REJECTED_TRADED_NOTIONAL", (
             f"IEF should hit brake at NAV={nav}"
         )
+
+
+# ================================================================
+# v8.6 tests: shorts via qty, dust close, live NAV, feed_attribution
+# ================================================================
+
+# ---------------------------------------------------------------- T1a: short orders use whole-share qty
+
+def test_short_submit_uses_qty() -> None:
+    """sell_to_open must use integer qty, not notional (E1).
+
+    Alpaca paper rejects fractional sell_to_open. This test verifies that
+    submit_orders builds a MarketOrderRequest with qty= (not notional=) when
+    the position_intent is sell_to_open and close_prices is provided.
+    """
+    from unittest.mock import call, patch, MagicMock
+    from alpaca.trading.requests import MarketOrderRequest
+    import execution.alpaca_paper as ap_mod
+
+    spec = _pending_spec("GLD", "sell", 3_000.0, "sell_to_open", -3_000.0)
+    close_prices = {"GLD": 200.0}  # qty = floor(3000/200) = 15
+
+    mock_client = MagicMock()
+    mock_order = MagicMock()
+    mock_order.id = "test-order-id"
+    mock_client.submit_order.return_value = mock_order
+
+    with patch.object(ap_mod, "PositionIntent", side_effect=lambda x: x), \
+         patch.object(ap_mod, "OrderSide") as mock_side, \
+         patch.object(ap_mod, "TimeInForce") as mock_tif, \
+         patch.object(ap_mod, "MarketOrderRequest") as mock_req_cls:
+        mock_side.BUY = "buy"
+        mock_side.SELL = "sell"
+        mock_tif.DAY = "day"
+        mock_req_cls.return_value = MagicMock()
+        mock_client.submit_order.return_value = mock_order
+
+        result = submit_orders(mock_client, [spec], close_prices=close_prices)
+
+    # Verify MarketOrderRequest was called with qty=15, not notional
+    mock_req_cls.assert_called_once()
+    call_kwargs = mock_req_cls.call_args[1]
+    assert "qty" in call_kwargs, f"Expected qty in call kwargs, got: {call_kwargs}"
+    assert call_kwargs["qty"] == 15, f"Expected qty=15, got {call_kwargs['qty']}"
+    assert "notional" not in call_kwargs, "notional must not appear for short orders"
+    assert result == ["test-order-id"]
+
+
+def test_long_submit_uses_notional() -> None:
+    """buy_to_open must still use notional (not qty). Asymmetry is intentional."""
+    from unittest.mock import patch, MagicMock
+    import execution.alpaca_paper as ap_mod
+
+    spec = _pending_spec("SPY", "buy", 5_000.0, "buy_to_open", 5_000.0)
+    close_prices = {"SPY": 500.0}
+
+    mock_client = MagicMock()
+    mock_order = MagicMock()
+    mock_order.id = "long-order"
+    mock_client.submit_order.return_value = mock_order
+
+    with patch.object(ap_mod, "PositionIntent", side_effect=lambda x: x), \
+         patch.object(ap_mod, "OrderSide") as mock_side, \
+         patch.object(ap_mod, "TimeInForce") as mock_tif, \
+         patch.object(ap_mod, "MarketOrderRequest") as mock_req_cls:
+        mock_side.BUY = "buy"
+        mock_side.SELL = "sell"
+        mock_tif.DAY = "day"
+        mock_req_cls.return_value = MagicMock()
+
+        result = submit_orders(mock_client, [spec], close_prices=close_prices)
+
+    call_kwargs = mock_req_cls.call_args[1]
+    assert "notional" in call_kwargs, f"Expected notional in kwargs, got: {call_kwargs}"
+    assert "qty" not in call_kwargs, "qty must not appear for long orders"
+    assert result == ["long-order"]
+
+
+def test_qty_zero_skipped() -> None:
+    """When floor(notional/price)=0, the order is skipped with SKIPPED_QTY_ZERO sentinel."""
+    from unittest.mock import patch, MagicMock
+    import execution.alpaca_paper as ap_mod
+
+    # $5 notional at $200 price -> floor(5/200) = 0 shares
+    spec = _pending_spec("GLD", "sell", 5.0, "sell_to_open", -5.0)
+    close_prices = {"GLD": 200.0}
+
+    mock_client = MagicMock()
+
+    with patch.object(ap_mod, "PositionIntent", side_effect=lambda x: x), \
+         patch.object(ap_mod, "OrderSide") as mock_side, \
+         patch.object(ap_mod, "TimeInForce") as mock_tif, \
+         patch.object(ap_mod, "MarketOrderRequest") as mock_req_cls:
+        mock_side.SELL = "sell"
+        mock_tif.DAY = "day"
+
+        result = submit_orders(mock_client, [spec], close_prices=close_prices)
+
+    assert result == ["SKIPPED_QTY_ZERO"]
+    mock_client.submit_order.assert_not_called()
+
+
+def test_buy_to_close_uses_qty() -> None:
+    """buy_to_close (closing a short) also uses qty to match the shorted share count."""
+    from unittest.mock import patch, MagicMock
+    import execution.alpaca_paper as ap_mod
+
+    spec = _pending_spec("HYG", "buy", 2_000.0, "buy_to_close", 0.0)
+    close_prices = {"HYG": 80.0}  # qty = floor(2000/80) = 25
+
+    mock_client = MagicMock()
+    mock_order = MagicMock()
+    mock_order.id = "btc-order"
+    mock_client.submit_order.return_value = mock_order
+
+    with patch.object(ap_mod, "PositionIntent", side_effect=lambda x: x), \
+         patch.object(ap_mod, "OrderSide") as mock_side, \
+         patch.object(ap_mod, "TimeInForce") as mock_tif, \
+         patch.object(ap_mod, "MarketOrderRequest") as mock_req_cls:
+        mock_side.BUY = "buy"
+        mock_tif.DAY = "day"
+        mock_req_cls.return_value = MagicMock()
+
+        result = submit_orders(mock_client, [spec], close_prices=close_prices)
+
+    call_kwargs = mock_req_cls.call_args[1]
+    assert "qty" in call_kwargs
+    assert call_kwargs["qty"] == 25
+    assert "notional" not in call_kwargs
+
+
+# ---------------------------------------------------------------- T1b: dust position cleanup
+
+def test_dust_close_called_in_live_mode() -> None:
+    """close_position is called for any UNIVERSE position below DUST_THRESHOLD_USD (E2)."""
+    mock_client = MagicMock()
+    dust_pos = MagicMock()
+    dust_pos.symbol = "SPY"
+    dust_pos.market_value = "0.003"
+
+    big_pos = MagicMock()
+    big_pos.symbol = "GLD"
+    big_pos.market_value = "5000.00"
+
+    mock_client.get_all_positions.return_value = [dust_pos, big_pos]
+
+    closed = close_dust_positions(mock_client, dry_run=False)
+
+    assert closed == ["SPY"]
+    mock_client.close_position.assert_called_once_with("SPY")
+
+
+def test_dust_not_closed_in_dry_run() -> None:
+    """close_position must NOT be called in dry_run=True (P8 gate extension)."""
+    mock_client = MagicMock()
+    closed = close_dust_positions(mock_client, dry_run=True)
+
+    assert closed == []
+    mock_client.get_all_positions.assert_not_called()
+    mock_client.close_position.assert_not_called()
+
+
+def test_non_universe_dust_ignored() -> None:
+    """Dust cleanup only touches tickers in UNIVERSE, not unrecognised symbols."""
+    mock_client = MagicMock()
+    external_dust = MagicMock()
+    external_dust.symbol = "AAPL"
+    external_dust.market_value = "0.01"
+
+    mock_client.get_all_positions.return_value = [external_dust]
+
+    closed = close_dust_positions(mock_client, dry_run=False)
+
+    assert closed == []
+    mock_client.close_position.assert_not_called()
+
+
+# ---------------------------------------------------------------- T2: live NAV
+
+def test_get_live_nav_returns_equity() -> None:
+    """get_live_nav returns account.equity as float (E3)."""
+    mock_client = MagicMock()
+    mock_account = MagicMock()
+    mock_account.equity = "120000.50"
+    mock_client.get_account.return_value = mock_account
+
+    nav = get_live_nav(mock_client)
+    assert abs(nav - 120_000.50) < 0.01
+
+
+def test_get_live_nav_fallback_on_error() -> None:
+    """get_live_nav falls back to PAPER_NAV_DEFAULT if Alpaca call fails."""
+    mock_client = MagicMock()
+    mock_client.get_account.side_effect = RuntimeError("network error")
+
+    nav = get_live_nav(mock_client)
+    assert nav == PAPER_NAV_DEFAULT
+
+
+# ---------------------------------------------------------------- T3: feed_attribution
+
+def test_feed_attribution_appends_one_row(tmp_path: Path) -> None:
+    """A single FILLED FillRecord appends exactly one row to attribution.parquet (E4)."""
+    import pandas as pd
+
+    fill = FillRecord(
+        ticker="GLD",
+        order_id="ord-abc",
+        side="buy",
+        position_intent="buy_to_open",
+        intended_notional=5_000.0,
+        filled_notional=5_000.0,
+        fill_price=190.0,
+        simulated_cost=1.0,
+        status="FILLED",
+        guard_status="PENDING",
+    )
+    close_prices = {"GLD": 192.0}
+    parquet_path = str(tmp_path / "attribution.parquet")
+
+    n = feed_attribution(
+        [fill],
+        close_prices=close_prices,
+        run_date=date(2026, 6, 17),
+        nav=100_000.0,
+        parquet_path=parquet_path,
+    )
+
+    assert n == 1
+    df = pd.read_parquet(parquet_path)
+    assert len(df) == 1
+    row = df.iloc[0]
+    assert row["ticker"] == "GLD"
+    assert row["asset_class"] == "commodity"
+    # pnl = (192-190)/190 * 5000 = 2/190 * 5000 ≈ 52.63
+    expected_pnl = (192.0 - 190.0) / 190.0 * 5_000.0
+    assert abs(row["pnl"] - expected_pnl) < 0.01
+    assert row["net_pnl"] == row["gross_pnl"] - row["turnover_cost"]
+
+
+def test_feed_attribution_dry_run_noop(tmp_path: Path) -> None:
+    """Empty fills list leaves the parquet file untouched (E4 dry-run gate)."""
+    parquet_path = str(tmp_path / "attribution.parquet")
+
+    n = feed_attribution(
+        [],
+        close_prices={},
+        run_date=date(2026, 6, 17),
+        nav=100_000.0,
+        parquet_path=parquet_path,
+    )
+
+    assert n == 0
+    assert not (tmp_path / "attribution.parquet").exists()
+
+
+def test_feed_attribution_schema_match(tmp_path: Path) -> None:
+    """Appended rows have exactly the v8.3 tidy-frame column set (E4 schema gate)."""
+    import pandas as pd
+
+    _EXPECTED_COLUMNS = [
+        "date", "ticker", "asset_class", "weight", "pnl", "carry", "price_change",
+        "gross_pnl", "net_pnl", "turnover_cost", "borrow_cost",
+        "directional", "selection", "net_exposure", "beta_explained", "residual", "r_squared",
+    ]
+
+    fill = FillRecord(
+        ticker="SPY",
+        order_id="ord-xyz",
+        side="sell",
+        position_intent="sell_to_open",
+        intended_notional=3_000.0,
+        filled_notional=3_000.0,
+        fill_price=520.0,
+        simulated_cost=0.60,
+        status="FILLED",
+        guard_status="PENDING",
+    )
+    parquet_path = str(tmp_path / "attribution.parquet")
+
+    feed_attribution(
+        [fill],
+        close_prices={"SPY": 518.0},
+        run_date=date(2026, 6, 17),
+        nav=100_000.0,
+        parquet_path=parquet_path,
+    )
+
+    df = pd.read_parquet(parquet_path)
+    assert list(df.columns) == _EXPECTED_COLUMNS, (
+        f"Column mismatch.\nExpected: {_EXPECTED_COLUMNS}\nGot:      {list(df.columns)}"
+    )
+
+
+def test_feed_attribution_short_sign(tmp_path: Path) -> None:
+    """A short fill (sell) has negative weight and profits when price falls (E4)."""
+    import pandas as pd
+
+    fill = FillRecord(
+        ticker="SPY",
+        order_id="s1",
+        side="sell",
+        position_intent="sell_to_open",
+        intended_notional=4_000.0,
+        filled_notional=4_000.0,
+        fill_price=520.0,
+        simulated_cost=0.80,
+        status="FILLED",
+        guard_status="PENDING",
+    )
+    parquet_path = str(tmp_path / "attribution.parquet")
+
+    feed_attribution(
+        [fill],
+        close_prices={"SPY": 515.0},  # price fell -> short profits
+        run_date=date(2026, 6, 17),
+        nav=100_000.0,
+        parquet_path=parquet_path,
+    )
+
+    df = pd.read_parquet(parquet_path)
+    row = df.iloc[0]
+    assert row["weight"] < 0, "short position must have negative weight"
+    assert row["pnl"] > 0, "short position profits when price falls"
+
+
+def test_feed_attribution_appends_to_existing(tmp_path: Path) -> None:
+    """feed_attribution appends to an existing parquet without overwriting it."""
+    import pandas as pd
+
+    parquet_path = str(tmp_path / "attribution.parquet")
+
+    # Pre-populate with one row
+    existing = pd.DataFrame([{
+        "date": pd.Timestamp("2026-01-01"),
+        "ticker": "IEF", "asset_class": "rates",
+        "weight": 0.1, "pnl": 100.0, "carry": 50.0, "price_change": 50.0,
+        "gross_pnl": 100.0, "net_pnl": 99.0, "turnover_cost": 1.0, "borrow_cost": 0.0,
+        "directional": float("nan"), "selection": float("nan"), "net_exposure": 0.1,
+        "beta_explained": float("nan"), "residual": float("nan"), "r_squared": float("nan"),
+    }])
+    existing.to_parquet(parquet_path, index=False)
+
+    fill = FillRecord(
+        ticker="GLD", order_id="g1", side="buy", position_intent="buy_to_open",
+        intended_notional=2_000.0, filled_notional=2_000.0, fill_price=200.0,
+        simulated_cost=0.4, status="FILLED", guard_status="PENDING",
+    )
+    n = feed_attribution(
+        [fill],
+        close_prices={"GLD": 202.0},
+        run_date=date(2026, 6, 17),
+        nav=100_000.0,
+        parquet_path=parquet_path,
+    )
+
+    assert n == 1
+    df = pd.read_parquet(parquet_path)
+    assert len(df) == 2  # original + new
+    assert set(df["ticker"]) == {"IEF", "GLD"}

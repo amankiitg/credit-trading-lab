@@ -1,0 +1,70 @@
+# Render deployment blueprint -- sprint v8.6
+#
+# Three services in one project:
+#   1. credit-lab-dashboard: always-on Streamlit web service (NO Alpaca keys)
+#   2. credit-lab-signal:    evening cron, fires after US close
+#   3. credit-lab-execution: morning cron, fires after approval window
+#
+# UTC cron schedules and DST:
+#   Signal cron  "30 21 * * 1-5" = 17:30 EDT / 16:30 EST (both after 16:00 ET close)
+#   Exec cron    "30 14 * * 1-5" = 10:30 EDT / 09:30 EST (both in clean execution window)
+#   Render cron is UTC; the UTC schedule is DST-correct without runtime logic.
+#
+# Secret isolation:
+#   Dashboard gets Supabase + Google OIDC secrets only. NO Alpaca keys.
+#   Cron jobs get Supabase + Alpaca keys. NO Google OIDC secrets.
+#
+# All env var VALUES are set manually in the Render dashboard (sync: false).
+# This file commits the KEY names only -- no credentials appear here.
+
+services:
+  - type: web
+    name: credit-lab-dashboard
+    runtime: python
+    buildCommand: pip install -e .
+    startCommand: streamlit run dashboard/app.py --server.port $PORT --server.address 0.0.0.0
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SECRET_KEY
+        sync: false
+      - key: ALLOWED_EMAIL
+        sync: false
+      - key: STREAMLIT_AUTH_REDIRECT_URI
+        sync: false
+      # ALPACA_PAPER_API_KEY and ALPACA_PAPER_SECRET_KEY are intentionally
+      # absent from this service. The dashboard never calls Alpaca directly.
+
+  - type: cron
+    name: credit-lab-signal
+    runtime: python
+    buildCommand: pip install -e .
+    schedule: "30 21 * * 1-5"
+    startCommand: python scripts/run_signal.py
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SECRET_KEY
+        sync: false
+      - key: ALPACA_PAPER_API_KEY
+        sync: false
+      - key: ALPACA_PAPER_SECRET_KEY
+        sync: false
+      # No Google OIDC secrets here.
+
+  - type: cron
+    name: credit-lab-execution
+    runtime: python
+    buildCommand: pip install -e .
+    schedule: "30 14 * * 1-5"
+    startCommand: python scripts/run_execution.py
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SECRET_KEY
+        sync: false
+      - key: ALPACA_PAPER_API_KEY
+        sync: false
+      - key: ALPACA_PAPER_SECRET_KEY
+        sync: false
+      # No Google OIDC secrets here.

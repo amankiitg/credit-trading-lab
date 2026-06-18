@@ -68,12 +68,20 @@ MAX_POSITION_PCT_OF_NAV: float = 0.40
 MAX_TRADED_NOTIONAL_PER_RUN: float = 16_000.0
 MAX_ORDERS_PER_RUN: int = 20
 DELTA_MIN_NOTIONAL: float = 10.0
+DUST_THRESHOLD_USD: float = 1.0  # positions below this are closed via close_position
 DRY_RUN_DEFAULT: bool = True
 PAPER_NAV_DEFAULT: float = 100_000.0
 FILL_POLL_TIMEOUT_SECS: int = 30
 FILL_POLL_INTERVAL_SECS: float = 1.0
 RECONCILE_ABS_TOL: float = 10.0
 RECONCILE_REL_TOL: float = 0.005
+
+# Short-side position intents: Alpaca paper rejects fractional notional sell_to_open
+# ("fractional orders cannot be sold short"). These intents MUST use integer qty.
+# Long-side intents (buy_to_open, sell_to_close closing a long) continue to use
+# notional. The resulting asymmetry is expected and intentional: longs are
+# notional-precise, shorts are quantized to whole shares.
+_SHORT_QTY_INTENTS: frozenset[str] = frozenset({"sell_to_open", "buy_to_close"})
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +150,29 @@ def connect(dry_run: bool = DRY_RUN_DEFAULT) -> Optional[object]:
         paper=True,
         url_override=PAPER_ENDPOINT,
     )
+
+
+# ---------------------------------------------------------------- live NAV
+
+def get_live_nav(client) -> float:
+    """Read the live account equity from Alpaca and return it as a float.
+
+    Used to anchor the NAV-relative position-size cap to the actual book size.
+    Falls back to PAPER_NAV_DEFAULT on any error so the guard still runs.
+    """
+    try:
+        account = client.get_account()
+        equity = float(account.equity)
+        if equity <= 0:
+            raise ValueError(f"non-positive equity: {equity}")
+        logger.info("live NAV from Alpaca: %.2f", equity)
+        return equity
+    except Exception as exc:
+        logger.warning(
+            "get_live_nav failed, falling back to PAPER_NAV_DEFAULT=%.0f: %s",
+            PAPER_NAV_DEFAULT, exc,
+        )
+        return PAPER_NAV_DEFAULT
 
 
 # ---------------------------------------------------------------- positions
@@ -441,12 +472,26 @@ def _replace_status(spec: OrderSpec, status: str) -> OrderSpec:
 
 # ---------------------------------------------------------------- submission
 
-def submit_orders(client, orders: list[OrderSpec]) -> list[str]:
+def submit_orders(
+    client,
+    orders: list[OrderSpec],
+    close_prices: dict[str, float] | None = None,
+) -> list[str]:
     """Submit PENDING orders to Alpaca paper and return a list of order IDs.
 
     Only orders with guard_status='PENDING' are submitted. All others are
     skipped. Returns [] in dry-run (no PENDING orders should exist if
     apply_guards was called with dry_run=True).
+
+    Short-side intents (sell_to_open, buy_to_close) are submitted as integer
+    qty (whole shares) because Alpaca paper rejects fractional sell_to_open.
+    Long-side intents continue to use notional. close_prices is required for
+    the qty conversion; if absent, short orders are submitted as notional
+    (which may fail on paper -- pass close_prices in production).
+
+    Returns one entry per PENDING spec: either the Alpaca order ID for
+    successfully submitted orders, or the sentinel 'SKIPPED_QTY_ZERO' for
+    short-side orders where floor(notional/price) rounds to zero.
     """
     order_ids: list[str] = []
     for spec in orders:
@@ -455,18 +500,49 @@ def submit_orders(client, orders: list[OrderSpec]) -> list[str]:
 
         pi = PositionIntent(spec.position_intent)
         side = OrderSide.BUY if spec.side == "buy" else OrderSide.SELL
+        use_qty = spec.position_intent in _SHORT_QTY_INTENTS
 
-        req = MarketOrderRequest(
-            symbol=spec.ticker,
-            notional=round(spec.notional, 2),
-            side=side,
-            time_in_force=TimeInForce.DAY,
-            position_intent=pi,
-        )
+        if use_qty and close_prices is not None:
+            price = close_prices.get(spec.ticker, 0.0)
+            if price > 0:
+                qty = int(spec.notional / price)  # floor to whole shares
+            else:
+                qty = 0
+            if qty == 0:
+                logger.warning(
+                    "SKIPPED_QTY_ZERO: %s %s notional=%.2f price=%.2f -> qty=0",
+                    spec.position_intent, spec.ticker, spec.notional, price,
+                )
+                order_ids.append("SKIPPED_QTY_ZERO")
+                continue
+            req = MarketOrderRequest(
+                symbol=spec.ticker,
+                qty=qty,
+                side=side,
+                time_in_force=TimeInForce.DAY,
+                position_intent=pi,
+            )
+            logger.info(
+                "submitted (qty) %s %s qty=%d (~$%.0f), order_id pending",
+                spec.side, spec.ticker, qty, spec.notional,
+            )
+        else:
+            req = MarketOrderRequest(
+                symbol=spec.ticker,
+                notional=round(spec.notional, 2),
+                side=side,
+                time_in_force=TimeInForce.DAY,
+                position_intent=pi,
+            )
+            logger.info(
+                "submitted (notional) %s %s %.2f notional",
+                spec.side, spec.ticker, spec.notional,
+            )
+
         order = client.submit_order(order_data=req)
         logger.info(
-            "submitted %s %s %.2f notional, order_id=%s",
-            spec.side, spec.ticker, spec.notional, order.id,
+            "order accepted: %s %s order_id=%s",
+            spec.side, spec.ticker, order.id,
         )
         order_ids.append(str(order.id))
 
@@ -526,7 +602,11 @@ def build_fill_records(
             oid = next(id_iter, "UNKNOWN")
             order = fill_data.get(oid)
 
-            if order is None:
+            if oid == "SKIPPED_QTY_ZERO":
+                status = "SKIPPED_QTY_ZERO"
+                filled_n = 0.0
+                fill_price = 0.0
+            elif order is None:
                 status = "TIMEOUT"
                 filled_n = 0.0
                 fill_price = 0.0
@@ -595,6 +675,155 @@ def mark_costs(
         fill.simulated_cost = trading_cost + borrow
 
     return fills
+
+
+# ---------------------------------------------------------------- dust cleanup
+
+def close_dust_positions(
+    client,
+    dry_run: bool = DRY_RUN_DEFAULT,
+) -> list[str]:
+    """Close any UNIVERSE position whose market value is below DUST_THRESHOLD_USD.
+
+    Dust accumulates from whole-share rounding on short orders: floor(notional/price)
+    leaves a fractional-dollar residual that cannot be submitted as a notional order
+    (Alpaca rejects notional < $1). close_position() handles any remaining quantity
+    regardless of size.
+
+    Returns a list of tickers for which close_position was called.
+    """
+    if dry_run:
+        return []
+
+    try:
+        all_positions = client.get_all_positions()
+    except Exception as exc:
+        logger.warning("close_dust_positions: get_all_positions failed: %s", exc)
+        return []
+
+    closed: list[str] = []
+    for pos in all_positions:
+        sym = pos.symbol
+        if sym not in UNIVERSE:
+            continue
+        mv = abs(float(pos.market_value))
+        if mv < DUST_THRESHOLD_USD:
+            try:
+                client.close_position(sym)
+                logger.info(
+                    "closed dust position: %s market_value=%.4f (below threshold %.2f)",
+                    sym, mv, DUST_THRESHOLD_USD,
+                )
+                closed.append(sym)
+            except Exception as exc:
+                logger.warning("close_dust_positions: close_position(%s) failed: %s", sym, exc)
+
+    return closed
+
+
+# ---------------------------------------------------------------- attribution feed
+
+def feed_attribution(
+    fills: list[FillRecord],
+    close_prices: dict[str, float],
+    run_date: "date | None" = None,
+    nav: float = PAPER_NAV_DEFAULT,
+    parquet_path: str = "data/processed/attribution.parquet",
+) -> int:
+    """Translate paper fill records into v8.3-compatible rows and append to attribution.parquet.
+
+    For each FILLED order, computes the day-of fill P&L components (price_change,
+    carry=0 approximation, gross/net P&L, costs) and appends a row matching the v8.3
+    tidy schema exactly. Factor-regression columns (directional, selection, beta_explained,
+    residual, r_squared) are left as NaN -- they require rolling OLS history unavailable
+    at single-day resolution.
+
+    In dry-run (empty fills list or all non-FILLED), returns 0 without touching the file.
+    Returns the number of rows appended.
+    """
+    import math
+    import pandas as pd
+    from pathlib import Path as _Path
+    from signals.etf_universe import ASSET_CLASS
+
+    run_date = run_date or date.today()
+    run_date_str = str(run_date)
+
+    _ATTRIBUTION_COLUMNS = [
+        "date", "ticker", "asset_class", "weight", "pnl", "carry", "price_change",
+        "gross_pnl", "net_pnl", "turnover_cost", "borrow_cost",
+        "directional", "selection", "net_exposure", "beta_explained", "residual", "r_squared",
+    ]
+
+    rows = []
+    for fill in fills:
+        if fill.status != "FILLED":
+            continue
+        ticker = fill.ticker
+        price = close_prices.get(ticker, 0.0)
+        if fill.fill_price <= 0 or price <= 0:
+            logger.warning(
+                "feed_attribution: skipping %s -- fill_price=%.4f close=%.4f",
+                ticker, fill.fill_price, price,
+            )
+            continue
+
+        # Signed notional: positive for long (buy), negative for short (sell)
+        signed_notional = fill.filled_notional if fill.side == "buy" else -fill.filled_notional
+        weight = signed_notional / nav if nav > 0 else 0.0
+
+        # Day's price return (intraday: fill_price to close)
+        day_ret = (price - fill.fill_price) / fill.fill_price
+        price_change = signed_notional * day_ret
+
+        # Carry: dividend-based accrual is not tracked at fill granularity.
+        # Using 0.0 here; the daily carry accrual is dominated by HYG/LQD coupons
+        # that accrue in the historical frame but are not captured in single fills.
+        carry = 0.0
+        pnl = price_change + carry
+        gross_pnl = pnl
+        net_pnl = gross_pnl - fill.simulated_cost
+        net_exposure = weight
+
+        rows.append({
+            "date": pd.Timestamp(run_date_str),
+            "ticker": ticker,
+            "asset_class": ASSET_CLASS.get(ticker, "unknown"),
+            "weight": weight,
+            "pnl": pnl,
+            "carry": carry,
+            "price_change": price_change,
+            "gross_pnl": gross_pnl,
+            "net_pnl": net_pnl,
+            "turnover_cost": fill.simulated_cost,
+            "borrow_cost": 0.0,  # borrow accrual is in mark_costs; not re-split here
+            "directional": math.nan,
+            "selection": math.nan,
+            "net_exposure": net_exposure,
+            "beta_explained": math.nan,
+            "residual": math.nan,
+            "r_squared": math.nan,
+        })
+
+    if not rows:
+        logger.info("feed_attribution: no filled orders to append for %s", run_date_str)
+        return 0
+
+    new_df = pd.DataFrame(rows, columns=_ATTRIBUTION_COLUMNS)
+
+    p = _Path(parquet_path)
+    if p.exists():
+        existing = pd.read_parquet(p)
+        combined = pd.concat([existing, new_df], ignore_index=True)
+    else:
+        combined = new_df
+
+    combined.to_parquet(p, index=False)
+    logger.info(
+        "feed_attribution: appended %d rows for %s -> %s",
+        len(rows), run_date_str, p,
+    )
+    return len(rows)
 
 
 # ---------------------------------------------------------------- reconciliation

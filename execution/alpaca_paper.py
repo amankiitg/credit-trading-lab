@@ -74,7 +74,7 @@ MAX_TRADED_NOTIONAL_PER_RUN: float = float(
 MAX_ORDERS_PER_RUN: int = 20
 DELTA_MIN_NOTIONAL: float = 10.0
 DUST_THRESHOLD_USD: float = 1.0  # positions below this are closed via close_position
-DRY_RUN_DEFAULT: bool = True
+DRY_RUN_DEFAULT: bool = os.environ.get("DRY_RUN_DEFAULT", "true").lower() != "false"
 PAPER_NAV_DEFAULT: float = 100_000.0
 FILL_POLL_TIMEOUT_SECS: int = 30
 FILL_POLL_INTERVAL_SECS: float = 1.0

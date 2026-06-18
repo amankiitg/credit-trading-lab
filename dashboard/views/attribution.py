@@ -102,7 +102,7 @@ def render() -> None:
     ax.set_title("Cumulative gross P&L by asset-class sleeve")
     ax.legend(fontsize=9); ax.grid(alpha=0.25)
     fig.tight_layout()
-    st.pyplot(fig, use_container_width=True)
+    st.pyplot(fig, width="stretch")
     plt.close(fig)
 
     totals = sleeve_cum.iloc[-1].sort_values(ascending=False)
@@ -129,7 +129,7 @@ def render() -> None:
     ax.set_title("Cumulative carry vs price change -- carry is ~70% of gross P&L")
     ax.legend(fontsize=9); ax.grid(alpha=0.25)
     fig.tight_layout()
-    st.pyplot(fig, use_container_width=True)
+    st.pyplot(fig, width="stretch")
     plt.close(fig)
 
     total_carry = carry_price_cum["carry"].iloc[-1]
@@ -165,7 +165,7 @@ def render() -> None:
     ax.set_title("Cumulative long vs short gross P&L")
     ax.legend(fontsize=9); ax.grid(alpha=0.25)
     fig.tight_layout()
-    st.pyplot(fig, use_container_width=True)
+    st.pyplot(fig, width="stretch")
     plt.close(fig)
 
     st.caption(
@@ -186,7 +186,7 @@ def render() -> None:
     ax.set_title("Cumulative directional vs selection P&L")
     ax.legend(fontsize=9); ax.grid(alpha=0.25)
     fig.tight_layout()
-    st.pyplot(fig, use_container_width=True)
+    st.pyplot(fig, width="stretch")
     plt.close(fig)
 
     st.caption(
@@ -241,7 +241,7 @@ def render() -> None:
         ax2.set_title("Cumulative beta-explained P&L vs residual")
         ax2.legend(fontsize=8); ax2.grid(alpha=0.25)
         fig.tight_layout()
-        st.pyplot(fig, use_container_width=True)
+        st.pyplot(fig, width="stretch")
         plt.close(fig)
 
         r2_mean = fr.r_squared.dropna().mean()
@@ -274,7 +274,7 @@ def render() -> None:
     ax.set_title("Gross vs net P&L -- cost drag shaded")
     ax.legend(fontsize=9); ax.grid(alpha=0.25)
     fig.tight_layout()
-    st.pyplot(fig, use_container_width=True)
+    st.pyplot(fig, width="stretch")
     plt.close(fig)
 
     total_tc = daily["turnover_cost"].sum()
@@ -314,7 +314,7 @@ def render() -> None:
         ax.set_title("Marginal contribution to portfolio vol by sleeve (most recent date)")
         ax.legend(fontsize=9); ax.grid(alpha=0.25, axis="y")
         fig.tight_layout()
-        st.pyplot(fig, use_container_width=True)
+        st.pyplot(fig, width="stretch")
         plt.close(fig)
 
         st.caption("MCTR reconciles to portfolio sigma (Euler identity), not to P&L.")

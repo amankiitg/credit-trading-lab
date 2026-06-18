@@ -204,7 +204,7 @@ def render(
         legend=dict(orientation="h", yanchor="bottom", y=1.03, xanchor="left", x=0),
     )
 
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     # Static stats strip
     st.caption("Residual diagnostics · computed on selected date range · threshold-independent")

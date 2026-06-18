@@ -90,7 +90,7 @@ def render(user_email: str) -> None:
     )
 
     df_trade = pd.DataFrame(proposed_rows)
-    st.dataframe(df_trade, use_container_width=True, hide_index=True)
+    st.dataframe(df_trade, width="stretch", hide_index=True)
 
     # Check existing decision for today
     existing = fetch_decision_for_date(as_of_date)
@@ -171,7 +171,7 @@ def render(user_email: str) -> None:
         ax.set_ylabel("Cumulative net P&L ($)")
         ax.grid(alpha=0.25)
         fig.tight_layout()
-        st.pyplot(fig, use_container_width=True)
+        st.pyplot(fig, width="stretch")
         plt.close(fig)
         st.caption(FRAMING_CAPTION)
     else:
@@ -187,7 +187,7 @@ def render(user_email: str) -> None:
     positions = fetch_positions()
     if positions:
         df_pos = pd.DataFrame(positions)
-        st.dataframe(df_pos, use_container_width=True, hide_index=True)
+        st.dataframe(df_pos, width="stretch", hide_index=True)
     else:
         st.warning(
             "**TODO v8.6**: Open positions will be populated from Alpaca "
@@ -202,7 +202,7 @@ def render(user_email: str) -> None:
         df_log = pd.DataFrame(pnl_rows)
         st.dataframe(
             df_log[["trade_date", "gross_pnl", "net_pnl", "turnover_cost", "borrow_cost"]],
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
         st.caption(

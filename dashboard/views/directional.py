@@ -90,4 +90,4 @@ def render(
         fig.update_yaxes(title_text="spread", row=r, col=1, secondary_y=False)
         fig.update_yaxes(title_text="z", row=r, col=1, secondary_y=True, showgrid=False)
 
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")

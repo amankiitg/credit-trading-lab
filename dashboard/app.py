@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
@@ -23,6 +24,26 @@ if os.getcwd() != _ROOT:
     os.chdir(_ROOT)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
+
+# -------------------------------------------------------------- secrets bootstrap
+# On Render, write .streamlit/secrets.toml from env vars before st.secrets is
+# accessed for the first time (Streamlit lazy-loads on first access).
+# This runs on every worker startup so it survives container restarts.
+_google_client_id = os.environ.get("GOOGLE_CLIENT_ID", "")
+if _google_client_id:
+    _secrets_toml = Path(_ROOT) / ".streamlit" / "secrets.toml"
+    if not _secrets_toml.exists():
+        _secrets_toml.parent.mkdir(exist_ok=True)
+        _secrets_toml.write_text(
+            "[auth]\n"
+            f'redirect_uri  = "{os.environ.get("STREAMLIT_AUTH_REDIRECT_URI", "")}"\n'
+            f'cookie_secret = "{os.environ.get("STREAMLIT_COOKIE_SECRET", "")}"\n'
+            "\n"
+            "[auth.google]\n"
+            f'client_id           = "{_google_client_id}"\n'
+            f'client_secret       = "{os.environ.get("GOOGLE_CLIENT_SECRET", "")}"\n'
+            'server_metadata_url = "https://accounts.google.com/.well-known/openid-configuration"\n'
+        )
 
 import streamlit as st  # noqa: E402
 
@@ -40,7 +61,6 @@ try:
         and "google" in st.secrets.get("auth", {})
     )
 except Exception:
-    # No secrets.toml present (e.g. fresh Render deploy before write_render_secrets runs)
     _secrets_configured = False
 
 if _secrets_configured:

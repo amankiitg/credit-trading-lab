@@ -29,6 +29,10 @@ if _ROOT not in sys.path:
 # On Render, write .streamlit/secrets.toml from env vars before st.secrets is
 # accessed for the first time (Streamlit lazy-loads on first access).
 # This runs on every worker startup so it survives container restarts.
+def _toml_val(v: str) -> str:
+    """Escape a string value for a TOML basic string (double-quoted)."""
+    return v.strip("\"'").replace("\\", "\\\\").replace('"', '\\"')
+
 _google_client_id = os.environ.get("GOOGLE_CLIENT_ID", "")
 _oidc_env_vars = {
     k: bool(os.environ.get(k))
@@ -39,21 +43,18 @@ print(f"[app] OIDC env vars present: {_oidc_env_vars}", flush=True)
 
 if _google_client_id:
     _secrets_toml = Path(_ROOT) / ".streamlit" / "secrets.toml"
-    if not _secrets_toml.exists():
-        _secrets_toml.parent.mkdir(exist_ok=True)
-        _secrets_toml.write_text(
-            "[auth]\n"
-            f'redirect_uri  = "{os.environ.get("STREAMLIT_AUTH_REDIRECT_URI", "")}"\n'
-            f'cookie_secret = "{os.environ.get("STREAMLIT_COOKIE_SECRET", "")}"\n'
-            "\n"
-            "[auth.google]\n"
-            f'client_id           = "{_google_client_id}"\n'
-            f'client_secret       = "{os.environ.get("GOOGLE_CLIENT_SECRET", "")}"\n'
-            'server_metadata_url = "https://accounts.google.com/.well-known/openid-configuration"\n'
-        )
-        print(f"[app] wrote secrets.toml to {_secrets_toml}", flush=True)
-    else:
-        print(f"[app] secrets.toml already exists at {_secrets_toml}", flush=True)
+    _secrets_toml.parent.mkdir(exist_ok=True)
+    _secrets_toml.write_text(
+        "[auth]\n"
+        f'redirect_uri  = "{_toml_val(os.environ.get("STREAMLIT_AUTH_REDIRECT_URI", ""))}"\n'
+        f'cookie_secret = "{_toml_val(os.environ.get("STREAMLIT_COOKIE_SECRET", ""))}"\n'
+        "\n"
+        "[auth.google]\n"
+        f'client_id           = "{_toml_val(_google_client_id)}"\n'
+        f'client_secret       = "{_toml_val(os.environ.get("GOOGLE_CLIENT_SECRET", ""))}"\n'
+        'server_metadata_url = "https://accounts.google.com/.well-known/openid-configuration"\n'
+    )
+    print(f"[app] wrote secrets.toml to {_secrets_toml}", flush=True)
 else:
     print("[app] GOOGLE_CLIENT_ID not set -- OIDC disabled", flush=True)
 

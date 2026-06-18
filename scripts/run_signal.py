@@ -48,8 +48,9 @@ def main() -> int:
         logger.info("already ran for %s -- exit 0 (idempotent)", today)
         return 0
 
-    # -- 3. Load universe closes
-    from signals.etf_universe import UNIVERSE, load_universe_close
+    # -- 3. Refresh closes from yfinance then load
+    from signals.etf_universe import UNIVERSE, ingest, load_universe_close
+    ingest(UNIVERSE)
     close = load_universe_close()
     as_of_date = str(close.index[-1].date())
     logger.info("as_of_date: %s (latest close available)", as_of_date)

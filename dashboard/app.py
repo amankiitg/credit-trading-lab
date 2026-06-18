@@ -70,9 +70,10 @@ _ALLOWED_EMAIL = os.environ.get("ALLOWED_EMAIL", "")
 try:
     _secrets_configured = (
         "auth" in st.secrets
-        and "google" in st.secrets.get("auth", {})
+        and "google" in st.secrets["auth"]
     )
-except Exception:
+except Exception as _e:
+    print(f"[app] st.secrets check failed: {type(_e).__name__}: {_e}", flush=True)
     _secrets_configured = False
 
 if _secrets_configured:

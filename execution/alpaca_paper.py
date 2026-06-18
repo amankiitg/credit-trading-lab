@@ -65,7 +65,12 @@ PAPER_ENDPOINT = "https://paper-api.alpaca.markets"
 # units: the cap scales with the book, the brake does not.
 
 MAX_POSITION_PCT_OF_NAV: float = 0.40
-MAX_TRADED_NOTIONAL_PER_RUN: float = 16_000.0
+# Override via env var MAX_TRADED_NOTIONAL_PER_RUN for the initial portfolio build
+# (all positions from zero requires ~200k gross notional on a 100k book).
+# Default 16_000 is right for incremental rebalancing; raise to 250_000 once.
+MAX_TRADED_NOTIONAL_PER_RUN: float = float(
+    os.environ.get("MAX_TRADED_NOTIONAL_PER_RUN", "16000")
+)
 MAX_ORDERS_PER_RUN: int = 20
 DELTA_MIN_NOTIONAL: float = 10.0
 DUST_THRESHOLD_USD: float = 1.0  # positions below this are closed via close_position

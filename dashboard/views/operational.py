@@ -40,15 +40,15 @@ def _get_proposed_trade() -> tuple[list[dict], str]:
     No look-ahead: close.index[-1] is yesterday's closing date.
     Returns (rows, as_of_date) where rows is a list of per-ticker dicts.
     """
-    from signals.etf_universe import UNIVERSE
+    from signals.etf_universe import UNIVERSE, ingest, load_universe_close
     from signals.trend_signal import (
         apply_rebalance_control,
         compute_trend,
         shift_to_next_day,
         to_position_matrix,
     )
-    from signals.etf_universe import load_universe_close
 
+    ingest(UNIVERSE)
     close = load_universe_close()
     as_of_date = str(close.index[-1].date())
 

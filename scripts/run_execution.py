@@ -218,9 +218,12 @@ def main() -> int:
             ]
             write_live_attribution(live_rows)
 
-    # Write positions snapshot to Supabase
+    # Write positions snapshot to Supabase -- fetch AFTER fills so the first
+    # run (flat account before trades) still records real post-fill positions.
+    post_notionals = get_current_positions(client, dry_run=dry_run)
+    logger.info("post-trade positions: %s", post_notionals)
     position_rows = []
-    for ticker, signed_n in current_notionals.items():
+    for ticker, signed_n in post_notionals.items():
         position_rows.append({
             "trade_date": today,
             "ticker": ticker,

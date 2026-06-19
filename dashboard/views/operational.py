@@ -22,6 +22,7 @@ from dashboard.supabase_client import (
     fetch_pnl_log,
     fetch_positions,
     get_auto_approve,
+    get_setting,
     set_auto_approve,
     write_decision,
 )
@@ -34,11 +35,12 @@ FRAMING_CAPTION = (
 
 
 @st.cache_data(ttl=300)
-def _get_proposed_trade() -> tuple[list[dict], str]:
-    """Compute today's proposed target weights using yesterday's close.
+def _get_proposed_trade() -> tuple[list[dict], str, float]:
+    """Compute delta orders for tomorrow using yesterday's close.
 
     No look-ahead: close.index[-1] is yesterday's closing date.
-    Returns (rows, as_of_date) where rows is a list of per-ticker dicts.
+    Returns (rows, as_of_date, nav) where rows show the actual incremental
+    orders the cron will submit (target - current position), not target sizes.
     """
     from signals.etf_universe import UNIVERSE, ingest, load_universe_close
     from signals.trend_signal import (
@@ -57,22 +59,45 @@ def _get_proposed_trade() -> tuple[list[dict], str]:
     )
     held = apply_rebalance_control(desired, rebal_freq=1, band_pct=0.20)
     target = shift_to_next_day(held)
-    weights = target.iloc[-1]  # proposed weights for the next trading day
+    weights = target.iloc[-1]
+
+    # NAV: use live value written by execution cron; fall back to $100k
+    nav_str = get_setting("live_nav")
+    nav = float(nav_str) if nav_str else 100_000.0
+
+    # Current positions from Supabase (latest snapshot after last execution)
+    pos_rows = fetch_positions(latest_only=True)
+    current_notionals: dict[str, float] = {
+        r["ticker"]: float(r["signed_notional"]) for r in pos_rows
+    }
 
     rows = []
     for ticker in UNIVERSE:
         w = float(weights.get(ticker) or 0.0)
         if w != w:
             w = 0.0
-        notional = w * 100_000.0
-        side = "long" if w > 0 else ("short" if w < 0 else "flat")
+        target_notional = w * nav
+        current_notional = current_notionals.get(ticker, 0.0)
+        delta = target_notional - current_notional
+        current_w = current_notional / nav if nav > 0 else 0.0
+
+        # Mirror the cron's minimum-order guard ($250 threshold)
+        if abs(delta) < 250:
+            action = "skip — within band"
+        elif delta > 0:
+            action = "buy"
+        else:
+            action = "sell / short"
+
         rows.append({
             "ticker": ticker,
-            "weight": round(w, 4),
-            "notional ($)": round(notional, 0),
-            "side": side,
+            "current ($)": round(current_notional, 0),
+            "current wt": round(current_w, 4),
+            "target wt": round(w, 4),
+            "delta ($)": round(delta, 0),
+            "action": action,
         })
-    return rows, as_of_date
+    return rows, as_of_date, nav
 
 
 def render(user_email: str) -> None:
@@ -82,15 +107,25 @@ def render(user_email: str) -> None:
     st.markdown("### H - Proposed Next Trade")
 
     with st.spinner("Computing today's signal..."):
-        proposed_rows, as_of_date = _get_proposed_trade()
+        proposed_rows, as_of_date, nav = _get_proposed_trade()
 
     st.caption(
-        f"As-of date (yesterday's close): **{as_of_date}** -- "
-        "No look-ahead: positions for tomorrow computed from data through this date only."
+        f"As-of date (yesterday's close): **{as_of_date}** · "
+        f"NAV: **${nav:,.0f}** · "
+        "No look-ahead: positions for tomorrow computed from data through this date only. "
+        "Delta = target − current; tickers within the 20% rebalance band show 'skip'."
     )
 
     df_trade = pd.DataFrame(proposed_rows)
-    st.dataframe(df_trade, width="stretch", hide_index=True)
+    st.dataframe(
+        df_trade.style.map(
+            lambda v: "color: green" if v == "buy"
+            else ("color: red" if "sell" in str(v) else "color: grey"),
+            subset=["action"],
+        ),
+        width="stretch",
+        hide_index=True,
+    )
 
     # Check existing decision for today
     existing = fetch_decision_for_date(as_of_date)

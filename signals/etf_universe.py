@@ -43,7 +43,9 @@ def ingest(
     rate-limited or unavailable, so the cron doesn't crash on a transient
     Yahoo Finance error.
     """
-    end = end or date.today().isoformat()
+    from datetime import timedelta
+    # yfinance end is exclusive, so pass today+1 to include today's close
+    end = end or (date.today() + timedelta(days=1)).isoformat()
     data = fetch(tickers, start, end)
     for t, df in data.items():
         print(f"{t}: {len(df)} rows, {df.index.min().date()} -> {df.index.max().date()}")

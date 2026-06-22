@@ -54,19 +54,34 @@ def main() -> int:
         logger.info("already ran for %s -- exit 0 (idempotent)", today)
         return 0
 
-    # -- 3. Refresh closes from yfinance then load
-    from signals.etf_universe import UNIVERSE, ingest, load_universe_close
-    ingest(UNIVERSE)
-    close = load_universe_close()
-    as_of_date = str(close.index[-1].date())
-    logger.info("as_of_date: %s", as_of_date)
+    # -- 3. Load signal output written by run_signal.py (no yfinance call needed).
+    #        Falls back to ingest() only if Supabase data is missing/stale.
+    import json
+    from signals.etf_universe import UNIVERSE
+    from dashboard.supabase_client import get_setting
 
-    # Build close_prices dict for the most recent day (used for qty conversion)
-    close_prices: dict[str, float] = {
-        t: float(close[t].iloc[-1])
-        for t in UNIVERSE
-        if t in close.columns and not close[t].iloc[-1] != close[t].iloc[-1]
-    }
+    _stored_date    = get_setting("signal_as_of_date")
+    _stored_weights = get_setting("signal_target_weights")
+    _stored_prices  = get_setting("signal_close_prices")
+
+    if _stored_date and _stored_weights and _stored_prices:
+        as_of_date   = _stored_date
+        target_weights: dict[str, float] = json.loads(_stored_weights)
+        close_prices:   dict[str, float] = json.loads(_stored_prices)
+        logger.info("loaded signal from Supabase: as_of_date=%s", as_of_date)
+    else:
+        logger.warning("signal not in Supabase -- falling back to yfinance ingest")
+        from signals.etf_universe import ingest, load_universe_close
+        ingest(UNIVERSE)
+        close = load_universe_close()
+        as_of_date = str(close.index[-1].date())
+        close_prices = {
+            t: float(close[t].iloc[-1])
+            for t in UNIVERSE
+            if t in close.columns and not close[t].iloc[-1] != close[t].iloc[-1]
+        }
+        target_weights = {}  # computed below in step 6
+    logger.info("as_of_date: %s", as_of_date)
 
     # -- 4. Decision gate
     from dashboard.supabase_client import (
@@ -132,22 +147,25 @@ def main() -> int:
     current_notionals = get_current_positions(client, dry_run=dry_run)
     logger.info("current positions: %s", current_notionals)
 
-    # -- Run v8.2 signal (same pipeline as run_signal.py)
-    from signals.trend_signal import (
-        apply_rebalance_control,
-        compute_trend,
-        shift_to_next_day,
-        to_position_matrix,
-    )
-    desired = to_position_matrix(
-        compute_trend(close, L=120, long_short=True, k_dead_zone=0.5)
-    )
-    held = apply_rebalance_control(desired, rebal_freq=1, band_pct=0.20)
-    target = shift_to_next_day(held)
-    target_weights = {
-        t: float(target.iloc[-1].get(t) or 0.0)
-        for t in UNIVERSE
-    }
+    # -- Run v8.2 signal only if not already loaded from Supabase
+    if not target_weights:
+        from signals.etf_universe import load_universe_close
+        from signals.trend_signal import (
+            apply_rebalance_control,
+            compute_trend,
+            shift_to_next_day,
+            to_position_matrix,
+        )
+        close = load_universe_close()
+        desired = to_position_matrix(
+            compute_trend(close, L=120, long_short=True, k_dead_zone=0.5)
+        )
+        held = apply_rebalance_control(desired, rebal_freq=1, band_pct=0.20)
+        target = shift_to_next_day(held)
+        target_weights = {
+            t: float(target.iloc[-1].get(t) or 0.0)
+            for t in UNIVERSE
+        }
     logger.info("target weights: %s", {k: round(v, 4) for k, v in target_weights.items()})
 
     # -- 7. Compute orders, apply guards

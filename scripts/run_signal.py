@@ -75,8 +75,22 @@ def main() -> int:
         {t: round(float(weights.get(t) or 0), 4) for t in UNIVERSE},
     )
 
-    # -- 5. Write to Supabase
-    from dashboard.supabase_client import write_decision
+    # -- 5. Write signal output + close prices to Supabase so the execution
+    #        cron can read them directly without calling yfinance again.
+    import json
+    target_weights = {t: round(float(weights.get(t) or 0), 6) for t in UNIVERSE}
+    close_prices   = {
+        t: round(float(close[t].iloc[-1]), 6)
+        for t in UNIVERSE
+        if t in close.columns and float(close[t].iloc[-1]) == float(close[t].iloc[-1])
+    }
+
+    from dashboard.supabase_client import set_setting, write_decision
+    set_setting("signal_as_of_date",  as_of_date)
+    set_setting("signal_target_weights", json.dumps(target_weights))
+    set_setting("signal_close_prices",   json.dumps(close_prices))
+    logger.info("stored target_weights and close_prices to Supabase for %s", as_of_date)
+
     ok = write_decision(as_of_date, "proposed")
     if not ok:
         logger.warning(

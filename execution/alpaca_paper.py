@@ -510,11 +510,21 @@ def submit_orders(
         side = OrderSide.BUY if spec.side == "buy" else OrderSide.SELL
         use_qty = spec.position_intent in _SHORT_QTY_INTENTS
 
-        # sell_to_close: close the exact fractional long position Alpaca holds,
-        # then block until the order fills before the open leg is submitted.
-        # Submitting sell_to_open before the close settles causes a 422
-        # "position intent mismatch" because Alpaca still sees the long.
-        if spec.position_intent == "sell_to_close":
+        # sell_to_close leg=1 of a zero-crossing: close the ENTIRE long position
+        # using close_position() so Alpaca closes the exact fractional shares held.
+        # Then block until filled before the open leg (leg=2 sell_to_open) runs.
+        # Only applies to zero-crossings (leg=1 with a corresponding leg=2 for
+        # the same ticker). Partial reductions (leg=1, no leg=2) use notional.
+        _is_zero_cross_close = (
+            spec.position_intent == "sell_to_close"
+            and spec.leg == 1
+            and any(
+                o.ticker == spec.ticker and o.leg == 2
+                for o in orders
+                if o.guard_status == "PENDING"
+            )
+        )
+        if _is_zero_cross_close:
             import time
             try:
                 resp = client.close_position(spec.ticker)

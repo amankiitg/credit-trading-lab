@@ -36,32 +36,21 @@ FRAMING_CAPTION = (
 
 @st.cache_data(ttl=300)
 def _get_proposed_trade() -> tuple[list[dict], str, float]:
-    """Compute delta orders for tomorrow using yesterday's close.
+    """Return delta orders using signal weights stored by run_signal.py.
 
-    No look-ahead: close.index[-1] is yesterday's closing date.
-    Returns (rows, as_of_date, nav) where rows show the actual incremental
-    orders the cron will submit (target - current position), not target sizes.
+    Reads target_weights, close_prices, and as_of_date from Supabase —
+    the same values the execution cron will use. No yfinance call here.
+    Returns (rows, as_of_date, nav).
     """
-    from signals.etf_universe import UNIVERSE, ingest, load_universe_close
-    from signals.trend_signal import (
-        apply_rebalance_control,
-        compute_trend,
-        shift_to_next_day,
-        to_position_matrix,
-    )
+    import json
+    from signals.etf_universe import UNIVERSE
 
-    ingest(UNIVERSE)
-    close = load_universe_close()
-    as_of_date = str(close.index[-1].date())
+    # Signal output written by run_signal.py every evening
+    as_of_date      = get_setting("signal_as_of_date") or "—"
+    weights_json    = get_setting("signal_target_weights")
+    target_weights: dict[str, float] = json.loads(weights_json) if weights_json else {}
 
-    desired = to_position_matrix(
-        compute_trend(close, L=120, long_short=True, k_dead_zone=0.5)
-    )
-    held = apply_rebalance_control(desired, rebal_freq=1, band_pct=0.20)
-    target = shift_to_next_day(held)
-    weights = target.iloc[-1]
-
-    # NAV: use live value written by execution cron; fall back to $100k
+    # NAV: live value written by execution cron; fall back to $100k
     nav_str = get_setting("live_nav")
     nav = float(nav_str) if nav_str else 100_000.0
 
@@ -73,7 +62,7 @@ def _get_proposed_trade() -> tuple[list[dict], str, float]:
 
     rows = []
     for ticker in UNIVERSE:
-        w = float(weights.get(ticker) or 0.0)
+        w = float(target_weights.get(ticker) or 0.0)
         if w != w:
             w = 0.0
         target_notional = w * nav
@@ -109,11 +98,13 @@ def render(user_email: str) -> None:
     with st.spinner("Computing today's signal..."):
         proposed_rows, as_of_date, nav = _get_proposed_trade()
 
+    if not target_weights:
+        st.warning("Signal not yet available — run_signal cron has not fired today.")
     st.caption(
-        f"As-of date (yesterday's close): **{as_of_date}** · "
+        f"Signal as-of: **{as_of_date}** · "
         f"NAV: **${nav:,.0f}** · "
-        "No look-ahead: positions for tomorrow computed from data through this date only. "
-        "Delta = target − current; tickers within the 20% rebalance band show 'skip'."
+        "Source: weights written by evening signal cron (same values execution cron uses). "
+        "Delta = target − current; rows < $250 show 'skip'."
     )
 
     df_trade = pd.DataFrame(proposed_rows)

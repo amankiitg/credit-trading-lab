@@ -98,7 +98,7 @@ def render(user_email: str) -> None:
     with st.spinner("Computing today's signal..."):
         proposed_rows, as_of_date, nav = _get_proposed_trade()
 
-    if not target_weights:
+    if as_of_date == "—" or not proposed_rows:
         st.warning("Signal not yet available — run_signal cron has not fired today.")
     st.caption(
         f"Signal as-of: **{as_of_date}** · "

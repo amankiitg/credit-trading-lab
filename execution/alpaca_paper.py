@@ -490,9 +490,12 @@ def submit_orders(
 
     Short-side intents (sell_to_open, buy_to_close) are submitted as integer
     qty (whole shares) because Alpaca paper rejects fractional sell_to_open.
-    Long-side intents continue to use notional. close_prices is required for
-    the qty conversion; if absent, short orders are submitted as notional
-    (which may fail on paper -- pass close_prices in production).
+    sell_to_close (closing a long before a zero-crossing) uses close_position()
+    so Alpaca closes the exact fractional shares it holds -- avoids the
+    notional->qty rounding mismatch that causes 403 insufficient-qty errors.
+    Plain long reductions (notional sell, no zero-crossing) continue to use
+    notional. close_prices is required for the qty conversion; if absent,
+    short orders are submitted as notional (which may fail on paper).
 
     Returns one entry per PENDING spec: either the Alpaca order ID for
     successfully submitted orders, or the sentinel 'SKIPPED_QTY_ZERO' for
@@ -506,6 +509,23 @@ def submit_orders(
         pi = PositionIntent(spec.position_intent)
         side = OrderSide.BUY if spec.side == "buy" else OrderSide.SELL
         use_qty = spec.position_intent in _SHORT_QTY_INTENTS
+
+        # sell_to_close: close the exact fractional long position Alpaca holds.
+        # Using notional causes a 403 because Alpaca's real-time price differs
+        # from the yfinance close used to compute current_n.
+        if spec.position_intent == "sell_to_close":
+            try:
+                resp = client.close_position(spec.ticker)
+                order_id = str(resp.id)
+                logger.info(
+                    "close_position %s accepted order_id=%s (~$%.0f)",
+                    spec.ticker, order_id, spec.notional,
+                )
+                order_ids.append(order_id)
+            except Exception as exc:
+                logger.error("close_position %s failed: %s", spec.ticker, exc)
+                order_ids.append("SKIPPED_QTY_ZERO")
+            continue
 
         if use_qty and close_prices is not None:
             price = close_prices.get(spec.ticker, 0.0)

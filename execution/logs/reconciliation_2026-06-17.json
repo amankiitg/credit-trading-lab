@@ -1,0 +1,29 @@
+{
+  "date": "2026-06-17",
+  "generated_at": "2026-06-17T13:42:01.961202",
+  "total_legs_intended": 1,
+  "total_fills_captured": 1,
+  "flagged_discrepancies": 0,
+  "by_ticker": {
+    "SPY": {
+      "legs": [
+        {
+          "order_id": "2d649792-4930-4129-8235-578f9c53a286",
+          "side": "sell",
+          "position_intent": "sell_to_close",
+          "intended_notional": 99.9841,
+          "filled_notional": 99.98,
+          "fill_price": 750.734,
+          "discrepancy": -0.0041,
+          "flagged": false,
+          "simulated_cost": 0.019996,
+          "status": "FILLED",
+          "guard_status": "PENDING"
+        }
+      ],
+      "total_intended": 99.98414,
+      "total_filled": 99.97999967695401,
+      "total_cost": 0.019995999935390803
+    }
+  }
+}

@@ -101,10 +101,8 @@ def render(user_email: str) -> None:
     if as_of_date == "—" or not proposed_rows:
         st.warning("Signal not yet available — run_signal cron has not fired today.")
     st.caption(
-        f"Signal as-of: **{as_of_date}** · "
-        f"NAV: **${nav:,.0f}** · "
-        "Source: weights written by evening signal cron (same values execution cron uses). "
-        "Delta = target − current; rows < $250 show 'skip'."
+        f"Signal as-of: **{as_of_date}** · NAV: **${nav:,.0f}** · "
+        "Delta = target − current position; rows < $250 are skipped."
     )
 
     df_trade = pd.DataFrame(proposed_rows)

@@ -5,6 +5,12 @@
 -- These tables complement the v8.5 schema (decisions, positions, pnl_log, settings).
 -- Safe to re-run (IF NOT EXISTS guards).
 
+-- Fix decisions check constraint: v8.5 only allowed APPROVE/REJECT (uppercase).
+-- v8.6 run_signal.py writes 'proposed'; run_execution.py reads 'approve'/'reject'.
+ALTER TABLE decisions DROP CONSTRAINT IF EXISTS decisions_decision_check;
+ALTER TABLE decisions ADD CONSTRAINT decisions_decision_check
+    CHECK (decision IN ('proposed', 'approve', 'reject'));
+
 -- Idempotency log for cron jobs.
 -- Written at the END of a successful run so partial runs retry.
 CREATE TABLE IF NOT EXISTS cron_runs (

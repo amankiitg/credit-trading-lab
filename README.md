@@ -1,5 +1,7 @@
 # Credit Trading Lab
 
+**Live dashboard:** [credit-lab-dashboard.onrender.com](https://credit-lab-dashboard.onrender.com/)
+
 Research platform for credit relative-value trading strategies. Combines a Python data pipeline with a C++17 pricing engine to build duration-hedged RV signals for HY/IG credit spreads. The central thesis: equity markets incorporate risk faster than credit, creating predictable lag-driven dislocations.
 
 ## Research Conclusion (sprints v1–v6.6)
@@ -210,11 +212,13 @@ jupyter nbconvert --to notebook --execute \
   --ExecutePreprocessor.kernel_name=credit-lab
 ```
 
-### Dashboard (Sprint 4)
+### Dashboard (Sprint 4+)
 ```bash
-# Launch the Streamlit signal visualizer → http://localhost:8501
+# Launch the Streamlit signal visualizer locally → http://localhost:8501
 streamlit run dashboard/app.py
 ```
+
+**Deployed (v8.6):** [https://credit-lab-dashboard.onrender.com/](https://credit-lab-dashboard.onrender.com/)
 
 ## C++ Library Overview
 

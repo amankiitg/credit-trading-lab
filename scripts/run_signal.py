@@ -113,10 +113,14 @@ def main() -> int:
     }
 
     from dashboard.supabase_client import set_setting, write_decision
-    set_setting("signal_as_of_date",  as_of_date)
-    set_setting("signal_target_weights", json.dumps(target_weights))
-    set_setting("signal_close_prices",   json.dumps(close_prices))
-    logger.info("stored target_weights and close_prices to Supabase for %s", as_of_date)
+    ok_date    = set_setting("signal_as_of_date",        as_of_date)
+    ok_weights = set_setting("signal_target_weights",    json.dumps(target_weights))
+    ok_prices  = set_setting("signal_close_prices",      json.dumps(close_prices))
+    if ok_date and ok_weights and ok_prices:
+        logger.info("stored target_weights and close_prices to Supabase for %s", as_of_date)
+    else:
+        logger.error("set_setting failed (date=%s weights=%s prices=%s) -- aborting", ok_date, ok_weights, ok_prices)
+        return 1
 
     ok = write_decision(as_of_date, "proposed")
     if not ok:

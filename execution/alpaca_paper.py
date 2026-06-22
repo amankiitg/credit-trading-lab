@@ -510,10 +510,12 @@ def submit_orders(
         side = OrderSide.BUY if spec.side == "buy" else OrderSide.SELL
         use_qty = spec.position_intent in _SHORT_QTY_INTENTS
 
-        # sell_to_close: close the exact fractional long position Alpaca holds.
-        # Using notional causes a 403 because Alpaca's real-time price differs
-        # from the yfinance close used to compute current_n.
+        # sell_to_close: close the exact fractional long position Alpaca holds,
+        # then block until the order fills before the open leg is submitted.
+        # Submitting sell_to_open before the close settles causes a 422
+        # "position intent mismatch" because Alpaca still sees the long.
         if spec.position_intent == "sell_to_close":
+            import time
             try:
                 resp = client.close_position(spec.ticker)
                 order_id = str(resp.id)
@@ -522,6 +524,20 @@ def submit_orders(
                     spec.ticker, order_id, spec.notional,
                 )
                 order_ids.append(order_id)
+                # Wait for the close to reach a terminal state before continuing
+                deadline = time.monotonic() + FILL_POLL_TIMEOUT_SECS
+                while time.monotonic() < deadline:
+                    o = client.get_order_by_id(order_id)
+                    if o.status in (
+                        OrderStatus.FILLED, OrderStatus.CANCELED,
+                        OrderStatus.EXPIRED, OrderStatus.REJECTED,
+                    ):
+                        logger.info("close_position %s settled: status=%s", spec.ticker, o.status)
+                        break
+                    time.sleep(FILL_POLL_INTERVAL_SECS)
+                else:
+                    logger.warning("close_position %s did not settle within %ds -- proceeding anyway",
+                                   spec.ticker, FILL_POLL_TIMEOUT_SECS)
             except Exception as exc:
                 logger.error("close_position %s failed: %s", spec.ticker, exc)
                 order_ids.append("SKIPPED_QTY_ZERO")

@@ -37,12 +37,20 @@ def ingest(
     end: str | None = None,
     raw_dir: Path = RAW_DIR,
 ) -> None:
-    """Fetch tickers via the existing yfinance boundary and write to raw_dir."""
+    """Fetch tickers via the existing yfinance boundary and write to raw_dir.
+
+    Falls back to committed parquet (stale but functional) if yfinance is
+    rate-limited or unavailable, so the cron doesn't crash on a transient
+    Yahoo Finance error.
+    """
     end = end or date.today().isoformat()
-    data = fetch(tickers, start, end)
-    for t, df in data.items():
-        print(f"{t}: {len(df)} rows, {df.index.min().date()} -> {df.index.max().date()}")
-    write_raw(data, raw_dir)
+    try:
+        data = fetch(tickers, start, end)
+        for t, df in data.items():
+            print(f"{t}: {len(df)} rows, {df.index.min().date()} -> {df.index.max().date()}")
+        write_raw(data, raw_dir)
+    except Exception as exc:
+        print(f"[ingest] yfinance failed ({type(exc).__name__}: {exc}) -- using committed parquet", flush=True)
 
 
 def load_universe_close(

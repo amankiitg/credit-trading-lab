@@ -48,9 +48,36 @@ def main() -> int:
         logger.info("already ran for %s -- exit 0 (idempotent)", today)
         return 0
 
-    # -- 3. Refresh closes from yfinance then load
+    # -- 3. Refresh closes from yfinance with retry (up to 4 hours).
+    #        Rate limits from Yahoo Finance are transient; the execution cron
+    #        fires 17 hours later so we have plenty of runway to retry.
+    import time
     from signals.etf_universe import UNIVERSE, ingest, load_universe_close
-    ingest(UNIVERSE)
+
+    RETRY_INTERVAL_SECS = 10 * 60   # 10 minutes between attempts
+    MAX_RETRY_SECS      = 4 * 3600  # give up after 4 hours
+    deadline = time.monotonic() + MAX_RETRY_SECS
+    attempt  = 0
+    while True:
+        attempt += 1
+        try:
+            ingest(UNIVERSE)
+            break
+        except Exception as exc:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.error(
+                    "ingest failed after %d attempts over 4 hours: %s -- aborting",
+                    attempt, exc,
+                )
+                return 1
+            wait = min(RETRY_INTERVAL_SECS, remaining)
+            logger.warning(
+                "ingest attempt %d failed (%s: %s) -- retrying in %.0fs",
+                attempt, type(exc).__name__, exc, wait,
+            )
+            time.sleep(wait)
+
     close = load_universe_close()
     as_of_date = str(close.index[-1].date())
     logger.info("as_of_date: %s (latest close available)", as_of_date)

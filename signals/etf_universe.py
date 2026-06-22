@@ -44,13 +44,10 @@ def ingest(
     Yahoo Finance error.
     """
     end = end or date.today().isoformat()
-    try:
-        data = fetch(tickers, start, end)
-        for t, df in data.items():
-            print(f"{t}: {len(df)} rows, {df.index.min().date()} -> {df.index.max().date()}")
-        write_raw(data, raw_dir)
-    except Exception as exc:
-        print(f"[ingest] yfinance failed ({type(exc).__name__}: {exc}) -- using committed parquet", flush=True)
+    data = fetch(tickers, start, end)
+    for t, df in data.items():
+        print(f"{t}: {len(df)} rows, {df.index.min().date()} -> {df.index.max().date()}")
+    write_raw(data, raw_dir)
 
 
 def load_universe_close(

@@ -72,7 +72,7 @@ MAX_TRADED_NOTIONAL_PER_RUN: float = float(
     os.environ.get("MAX_TRADED_NOTIONAL_PER_RUN", "16000")
 )
 MAX_ORDERS_PER_RUN: int = 20
-DELTA_MIN_NOTIONAL: float = 10.0
+DELTA_MIN_NOTIONAL: float = 250.0  # matches Panel H display threshold
 DUST_THRESHOLD_USD: float = 1.0  # positions below this are closed via close_position
 DRY_RUN_DEFAULT: bool = os.environ.get("DRY_RUN_DEFAULT", "true").lower() != "false"
 PAPER_NAV_DEFAULT: float = 100_000.0

@@ -130,21 +130,21 @@ with tab_signal:
 
     view_mode = st.radio("View", ["RV Signals", "Directional Spreads"], horizontal=True)
 
-    with st.sidebar:
-        st.markdown("### Signal Viewer Controls")
-        date_range = st.date_input(
+    with st.expander("Controls", expanded=True):
+        c1, c2, c3, c4, c5 = st.columns([2, 1, 1, 1, 1])
+        date_range = c1.date_input(
             "Date range",
             value=(date_min, date_max),
             min_value=date_min,
             max_value=date_max,
         )
-        regime_shading = st.selectbox(
+        regime_shading = c2.selectbox(
             "Regime shading",
             ["none", "vol_regime", "equity_regime", "equity_credit_lag"],
         )
-        entry_t  = st.slider("Entry threshold (|z|)", 1.0, 4.0, 2.0, 0.1)
-        exit_t   = st.slider("Exit threshold (|z|)",  0.0, 2.0, 0.5, 0.1)
-        stop_t   = st.slider("Stop threshold (|z|)",  2.0, 6.0, 4.0, 0.1)
+        entry_t = c3.slider("Entry |z|", 1.0, 4.0, 2.0, 0.1)
+        exit_t  = c4.slider("Exit |z|",  0.0, 2.0, 0.5, 0.1)
+        stop_t  = c5.slider("Stop |z|",  2.0, 6.0, 4.0, 0.1)
 
     if view_mode == "RV Signals":
         pair = st.selectbox(

@@ -90,10 +90,11 @@ else:
 
 # ----------------------------------------------------------------- tabs
 
-tab_attr, tab_ops, tab_research = st.tabs([
+tab_attr, tab_ops, tab_research, tab_signal = st.tabs([
     "Attribution Lab",
     "Trades and Positions",
     "Research History",
+    "Signal Viewer",
 ])
 
 with tab_attr:
@@ -111,3 +112,58 @@ with tab_ops:
 with tab_research:
     from dashboard.views import research_history as research_history_view
     research_history_view.render()
+
+with tab_signal:
+    from dashboard.loader import load_features
+    from dashboard.views import rv as rv_view
+    from dashboard.views import directional as dir_view
+
+    df_feat = load_features()
+    date_min = df_feat.index.min().date()
+    date_max = df_feat.index.max().date()
+
+    st.subheader("Signal Viewer — HY/IG RV Signals (v1–v6)")
+    st.caption(
+        "Historical residual, z-score, and entry/exit markers for the three RV pairs. "
+        "All signals failed the v6.5 accounting audit — shown here for transparency."
+    )
+
+    view_mode = st.radio("View", ["RV Signals", "Directional Spreads"], horizontal=True)
+
+    with st.sidebar:
+        st.markdown("### Signal Viewer Controls")
+        date_range = st.date_input(
+            "Date range",
+            value=(date_min, date_max),
+            min_value=date_min,
+            max_value=date_max,
+        )
+        regime_shading = st.selectbox(
+            "Regime shading",
+            ["none", "vol_regime", "equity_regime", "equity_credit_lag"],
+        )
+        entry_t  = st.slider("Entry threshold (|z|)", 1.0, 4.0, 2.0, 0.1)
+        exit_t   = st.slider("Exit threshold (|z|)",  0.0, 2.0, 0.5, 0.1)
+        stop_t   = st.slider("Stop threshold (|z|)",  2.0, 6.0, 4.0, 0.1)
+
+    if view_mode == "RV Signals":
+        pair = st.selectbox(
+            "RV pair",
+            ["rv_hy_ig", "rv_credit_rates", "rv_xterm"],
+            format_func=lambda x: {
+                "rv_hy_ig": "HY / IG spread (pair 1)",
+                "rv_credit_rates": "HY spread / 10y rates (pair 2)",
+                "rv_xterm": "HY-IG / yield curve slope (pair 3)",
+            }[x],
+        )
+        rv_view.render(
+            df_feat, pair=pair, date_range=date_range,
+            entry=entry_t, exit_t=exit_t, stop=stop_t,
+            regime_shading=regime_shading,
+        )
+    else:
+        dir_view.render(
+            df_feat, date_range=date_range,
+            entry=entry_t, exit_t=exit_t, stop=stop_t,
+            regime_shading=regime_shading,
+        )

@@ -89,8 +89,12 @@ def _get_proposed_trade() -> tuple[list[dict], str, float]:
     return rows, as_of_date, nav
 
 
-def render(user_email: str) -> None:
-    """Render all operational panels."""
+def render(
+    user_email: str,
+    is_authenticated: bool = False,
+    secrets_configured: bool = False,
+) -> None:
+    """Render all operational panels. Auth is only required for approve/reject."""
 
     # ---------------------------------------------------------------- Panel H
     st.markdown("### H - Proposed Next Trade")
@@ -113,66 +117,72 @@ def render(user_email: str) -> None:
         hide_index=True,
     )
 
-    # Check existing decision for today
-    existing = fetch_decision_for_date(as_of_date)
+    # ---- approve / reject: requires sign-in ----
     supabase_ok = bool(os.environ.get("SUPABASE_SECRET_KEY"))
 
-    # ---- standing auto-approve toggle ----
-    auto_approve = get_auto_approve()
-    new_val = st.toggle(
-        "Auto-approve: execute every day unless I explicitly reject",
-        value=auto_approve,
-        disabled=not supabase_ok,
-        help="When ON, the v8.6 cron runs each morning without needing a daily approval. "
-             "Turn OFF to require an explicit approve each day.",
-    )
-    if new_val != auto_approve:
-        set_auto_approve(new_val)
-        if new_val:
-            st.success("Auto-approve ON -- trades will execute daily unless you reject.")
+    if not is_authenticated and secrets_configured:
+        st.info("Sign in to approve or reject today's trades.")
+        if st.button("Sign in with Google", key="signin_btn"):
+            st.login("google")
+        st.markdown("---")
+        # skip decision/auto-approve UI for unauthenticated visitors
+    else:
+        existing = fetch_decision_for_date(as_of_date)
+
+        auto_approve = get_auto_approve()
+        new_val = st.toggle(
+            "Auto-approve: execute every day unless I explicitly reject",
+            value=auto_approve,
+            disabled=not supabase_ok,
+            help="When ON, the v8.6 cron runs each morning without needing a daily approval. "
+                 "Turn OFF to require an explicit approve each day.",
+        )
+        if new_val != auto_approve:
+            set_auto_approve(new_val)
+            if new_val:
+                st.success("Auto-approve ON -- trades will execute daily unless you reject.")
+            else:
+                st.info("Auto-approve OFF -- you must approve each morning to trade.")
+
+        if auto_approve:
+            st.caption(
+                "Cron logic: execute unless `decision = reject` for today. "
+                "No row or `decision = approve` both trigger execution."
+            )
         else:
-            st.info("Auto-approve OFF -- you must approve each morning to trade.")
+            st.caption(
+                "Cron logic: execute only if `decision = approve` for today. "
+                "No row or `decision = reject` both skip execution."
+            )
 
-    if auto_approve:
-        st.caption(
-            "Cron logic: execute unless `decision = reject` for today. "
-            "No row or `decision = approve` both trigger execution."
-        )
-    else:
-        st.caption(
-            "Cron logic: execute only if `decision = approve` for today. "
-            "No row or `decision = reject` both skip execution."
-        )
+        st.markdown("**Today's decision:**")
 
-    st.markdown("**Today's decision:**")
+        if not supabase_ok:
+            st.warning(
+                "Supabase credentials not configured -- decisions cannot be saved. "
+                "Set SUPABASE_URL and SUPABASE_SECRET_KEY in .env and restart."
+            )
 
-    if not supabase_ok:
-        st.warning(
-            "Supabase credentials not configured -- decisions cannot be saved. "
-            "Set SUPABASE_URL and SUPABASE_SECRET_KEY in .env and restart."
-        )
+        if existing == "approve":
+            st.success(f"Approved for {as_of_date} -- trades will execute at next cron run.")
+            if st.button("Change to: Reject / skip today", disabled=not supabase_ok, key=f"reject_{as_of_date}"):
+                if write_decision(as_of_date, "reject"):
+                    st.rerun()
 
-    if existing == "approve":
-        st.success(f"Approved for {as_of_date} -- trades will execute at next cron run.")
-        if st.button("Change to: Reject / skip today", disabled=not supabase_ok, key=f"reject_{as_of_date}"):
-            if write_decision(as_of_date, "reject"):
-                st.rerun()
+        elif existing == "reject":
+            st.error(f"Rejected for {as_of_date} -- no trades will execute.")
+            if st.button("Change to: Approve all trades", type="primary", disabled=not supabase_ok, key=f"approve_{as_of_date}"):
+                if write_decision(as_of_date, "approve"):
+                    st.rerun()
 
-    elif existing == "reject":
-        st.error(f"Rejected for {as_of_date} -- no trades will execute.")
-        if st.button("Change to: Approve all trades", type="primary", disabled=not supabase_ok, key=f"approve_{as_of_date}"):
-            if write_decision(as_of_date, "approve"):
-                st.rerun()
-
-    else:
-        # No decision yet -- show both options
-        col_approve, col_reject = st.columns(2)
-        if col_approve.button("Approve all trades", type="primary", disabled=not supabase_ok, key=f"approve_{as_of_date}"):
-            if write_decision(as_of_date, "approve"):
-                st.rerun()
-        if col_reject.button("Reject / skip today", disabled=not supabase_ok, key=f"reject_{as_of_date}"):
-            if write_decision(as_of_date, "reject"):
-                st.rerun()
+        else:
+            col_approve, col_reject = st.columns(2)
+            if col_approve.button("Approve all trades", type="primary", disabled=not supabase_ok, key=f"approve_{as_of_date}"):
+                if write_decision(as_of_date, "approve"):
+                    st.rerun()
+            if col_reject.button("Reject / skip today", disabled=not supabase_ok, key=f"reject_{as_of_date}"):
+                if write_decision(as_of_date, "reject"):
+                    st.rerun()
 
     st.markdown("---")
 

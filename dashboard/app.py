@@ -67,6 +67,7 @@ st.set_page_config(
 )
 
 # ----------------------------------------------------------------- auth gate
+# Dashboard is publicly visible. Auth is only required for approve/reject in Panel H.
 _ALLOWED_EMAIL = os.environ.get("ALLOWED_EMAIL", "")
 try:
     _secrets_configured = (
@@ -78,27 +79,14 @@ except Exception as _e:
     _secrets_configured = False
 
 if _secrets_configured:
-    if not st.user.is_logged_in:
-        st.login("google")
-        st.stop()
-
-    _user_email: str = st.user.email or ""
-    if _user_email != _ALLOWED_EMAIL:
-        st.error(
-            f"Access denied. This dashboard is restricted to one authorized account. "
-            f"You are signed in as **{_user_email}**. "
-            f"Please sign out and use the authorized account."
-        )
-        st.stop()
-else:
-    # Local dev fallback: no OIDC redirect, use ALLOWED_EMAIL as passthrough.
-    # Do NOT deploy in this mode.
-    st.warning(
-        "Google OIDC not configured. Running in local dev mode -- "
-        "create .streamlit/secrets.toml to enable auth.",
-        icon="⚠",
+    _user_email: str = st.user.email or "" if st.user.is_logged_in else ""
+    _is_authenticated: bool = (
+        st.user.is_logged_in and _user_email == _ALLOWED_EMAIL
     )
+else:
+    # Local dev: no OIDC, treat as authenticated passthrough.
     _user_email = _ALLOWED_EMAIL or "local"
+    _is_authenticated = True
 
 # ----------------------------------------------------------------- tabs
 
@@ -110,4 +98,8 @@ with tab_attr:
 
 with tab_ops:
     from dashboard.views import operational as operational_view
-    operational_view.render(user_email=_user_email)
+    operational_view.render(
+        user_email=_user_email,
+        is_authenticated=_is_authenticated,
+        secrets_configured=_secrets_configured,
+    )

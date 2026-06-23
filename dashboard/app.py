@@ -90,7 +90,11 @@ else:
 
 # ----------------------------------------------------------------- tabs
 
-tab_attr, tab_ops = st.tabs(["Attribution Lab", "Trades and Positions"])
+tab_attr, tab_ops, tab_research = st.tabs([
+    "Attribution Lab",
+    "Trades and Positions",
+    "Research History",
+])
 
 with tab_attr:
     from dashboard.views import attribution as attribution_view
@@ -103,3 +107,7 @@ with tab_ops:
         is_authenticated=_is_authenticated,
         secrets_configured=_secrets_configured,
     )
+
+with tab_research:
+    from dashboard.views import research_history as research_history_view
+    research_history_view.render()

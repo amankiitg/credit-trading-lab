@@ -35,42 +35,79 @@ FRAMING_CAPTION = (
 
 
 @st.cache_data(ttl=300)
-def _get_proposed_trade() -> tuple[list[dict], str, float]:
+def _fetch_live_prices(tickers: tuple[str, ...]) -> dict[str, float]:
+    """Fetch latest available prices from yfinance (5-min cache)."""
+    import yfinance as yf
+    from datetime import date, timedelta
+    end = (date.today() + timedelta(days=1)).isoformat()
+    data = yf.download(
+        list(tickers), start="2026-01-01", end=end,
+        auto_adjust=True, progress=False,
+    )["Close"]
+    if data.empty:
+        return {}
+    last = data.iloc[-1]
+    return {t: float(last[t]) for t in tickers if t in last.index and float(last[t]) == float(last[t])}
+
+
+@st.cache_data(ttl=300)
+def _get_proposed_trade() -> tuple[list[dict], str, float, str]:
     """Return delta orders using signal weights stored by run_signal.py.
 
-    Reads target_weights, close_prices, and as_of_date from Supabase —
-    the same values the execution cron will use. No yfinance call here.
-    Returns (rows, as_of_date, nav).
+    Panel H revalues Supabase positions using today's yfinance prices so that
+    the delta estimate matches what the execution cron will see at Alpaca.
+    Without this, overnight price moves cause Panel H to show 'skip' for tickers
+    that the cron will actually trade (the core Panel-H/cron gap).
+
+    Returns (rows, as_of_date, nav, price_as_of).
     """
     import json
     from signals.etf_universe import UNIVERSE
 
-    # Signal output written by run_signal.py every evening
-    as_of_date      = get_setting("signal_as_of_date") or "—"
-    weights_json    = get_setting("signal_target_weights")
+    as_of_date   = get_setting("signal_as_of_date") or "—"
+    weights_json = get_setting("signal_target_weights")
+    prices_json  = get_setting("signal_close_prices")
     target_weights: dict[str, float] = json.loads(weights_json) if weights_json else {}
+    signal_prices: dict[str, float]  = json.loads(prices_json)  if prices_json  else {}
 
-    # NAV: live value written by execution cron; fall back to $100k
     nav_str = get_setting("live_nav")
     nav = float(nav_str) if nav_str else 100_000.0
 
-    # Current positions from Supabase (latest snapshot after last execution)
+    # Supabase positions: signed_notional at last execution's fill prices
     pos_rows = fetch_positions(latest_only=True)
-    current_notionals: dict[str, float] = {
+    last_notionals: dict[str, float] = {
         r["ticker"]: float(r["signed_notional"]) for r in pos_rows
     }
+
+    # Revalue to today's prices: implied_qty = last_notional / signal_close_price
+    # then current_notional = implied_qty × today_price.
+    # This closes the overnight-drift gap between Panel H and the execution cron.
+    live_prices = _fetch_live_prices(tuple(UNIVERSE))
+    price_as_of = "live" if live_prices else "last signal close"
+
+    current_notionals: dict[str, float] = {}
+    for ticker in UNIVERSE:
+        last_n = last_notionals.get(ticker, 0.0)
+        sig_px = signal_prices.get(ticker, 0.0)
+        live_px = live_prices.get(ticker, 0.0)
+        if sig_px and live_px and last_n:
+            # revalue: preserve sign (short positions have negative notional)
+            sign = 1 if last_n >= 0 else -1
+            implied_qty = abs(last_n) / sig_px
+            current_notionals[ticker] = sign * implied_qty * live_px
+        else:
+            current_notionals[ticker] = last_n  # fallback: use stale Supabase value
 
     rows = []
     for ticker in UNIVERSE:
         w = float(target_weights.get(ticker) or 0.0)
         if w != w:
             w = 0.0
-        target_notional = w * nav
-        current_notional = current_notionals.get(ticker, 0.0)
-        delta = target_notional - current_notional
-        current_w = current_notional / nav if nav > 0 else 0.0
+        target_notional   = w * nav
+        current_notional  = current_notionals.get(ticker, 0.0)
+        delta             = target_notional - current_notional
+        current_w         = current_notional / nav if nav > 0 else 0.0
 
-        # Mirror the cron's minimum-order guard ($250 threshold)
         if abs(delta) < 250:
             action = "skip — within band"
         elif delta > 0:
@@ -79,14 +116,14 @@ def _get_proposed_trade() -> tuple[list[dict], str, float]:
             action = "sell / short"
 
         rows.append({
-            "ticker": ticker,
-            "current ($)": round(current_notional, 0),
-            "current wt": round(current_w, 4),
-            "target wt": round(w, 4),
-            "delta ($)": round(delta, 0),
-            "action": action,
+            "ticker":       ticker,
+            "current ($)":  round(current_notional, 0),
+            "current wt":   round(current_w, 4),
+            "target wt":    round(w, 4),
+            "delta ($)":    round(delta, 0),
+            "action":       action,
         })
-    return rows, as_of_date, nav
+    return rows, as_of_date, nav, price_as_of
 
 
 def render(
@@ -100,11 +137,14 @@ def render(
     st.markdown("### H - Proposed Next Trade")
 
     with st.spinner("Computing today's signal..."):
-        proposed_rows, as_of_date, nav = _get_proposed_trade()
+        proposed_rows, as_of_date, nav, price_as_of = _get_proposed_trade()
 
     if as_of_date == "—" or not proposed_rows:
         st.warning("Signal not yet available — run_signal cron has not fired today.")
-    st.caption(f"Signal as-of: {as_of_date}  |  NAV: ${nav:,.0f}  |  Delta = target minus current position")
+    st.caption(
+        f"Signal as-of: {as_of_date}  |  NAV: ${nav:,.0f}  |  "
+        f"Positions revalued at {price_as_of} prices  |  Delta = target minus current"
+    )
 
     df_trade = pd.DataFrame(proposed_rows)
     st.dataframe(

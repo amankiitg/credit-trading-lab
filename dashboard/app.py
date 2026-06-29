@@ -61,7 +61,7 @@ else:
 import streamlit as st  # noqa: E402
 
 st.set_page_config(
-    page_title="Attribution Lab -- v8.6",
+    page_title="Credit Trading Lab",
     page_icon=":test_tube:",
     layout="wide",
 )
@@ -83,6 +83,20 @@ if _secrets_configured:
     _is_authenticated: bool = (
         st.user.is_logged_in and _user_email == _ALLOWED_EMAIL
     )
+    # Detect fresh login (logged-out → logged-in transition) and auto-navigate
+    # to the Trade Approval tab where the sign-in button lives.
+    _was_logged_in = st.session_state.get("_was_logged_in", False)
+    if st.user.is_logged_in and not _was_logged_in:
+        st.session_state["_was_logged_in"] = True
+        import streamlit.components.v1 as _components
+        _components.html("""<script>
+        setTimeout(function () {
+            var tabs = window.parent.document.querySelectorAll('[data-baseweb="tab"]');
+            if (tabs.length > 1) tabs[1].click();
+        }, 300);
+        </script>""", height=0)
+    elif not st.user.is_logged_in:
+        st.session_state["_was_logged_in"] = False
 else:
     # Local dev: no OIDC, treat as authenticated passthrough.
     _user_email = _ALLOWED_EMAIL or "local"
@@ -91,9 +105,9 @@ else:
 # ----------------------------------------------------------------- tabs
 
 tab_attr, tab_ops, tab_research = st.tabs([
-    "Attribution Lab",
-    "Trades and Positions",
-    "Research History",
+    "Strategy Analytics",
+    "Trade Approval",
+    "Research Archive",
 ])
 
 with tab_attr:

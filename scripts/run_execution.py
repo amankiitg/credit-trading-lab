@@ -137,14 +137,25 @@ def main() -> int:
     client = connect(dry_run=dry_run)
     logger.info("dry_run=%s", dry_run)
 
-    # -- 6. Live NAV and current positions
-    nav = get_live_nav(client) if not dry_run else 100_000.0
-    logger.info("nav=%.2f", nav)
+    # -- 6. NAV and current positions
+    # Use the frozen Supabase NAV and positions for delta computation so that
+    # execution matches exactly what Panel H showed when the user approved.
+    # Live Alpaca NAV is read separately to update Supabase after the run.
+    nav_live = get_live_nav(client) if not dry_run else 100_000.0
 
-    # Write live NAV to Supabase so dashboard sidebar can display it
-    set_setting("live_nav", str(round(nav, 2)))
+    _nav_str = get_setting("live_nav")
+    nav = float(_nav_str) if _nav_str else nav_live
+    logger.info("nav=%.2f (frozen Supabase; live Alpaca=%.2f)", nav, nav_live)
 
-    current_notionals = get_current_positions(client, dry_run=dry_run)
+    from dashboard.supabase_client import fetch_positions as _fetch_positions
+    _pos_rows = _fetch_positions(latest_only=True)
+    current_notionals: dict[str, float] = {
+        r["ticker"]: float(r["signed_notional"]) for r in _pos_rows
+    }
+    if not current_notionals:
+        # First ever run — no Supabase snapshot yet; read live from Alpaca
+        logger.info("no Supabase positions found — reading live from Alpaca (first run)")
+        current_notionals = get_current_positions(client, dry_run=dry_run)
     logger.info("current positions: %s", current_notionals)
 
     # -- Run v8.2 signal only if not already loaded from Supabase
@@ -235,6 +246,9 @@ def main() -> int:
                 for _, r in today_rows.iterrows()
             ]
             write_live_attribution(live_rows)
+
+    # Update live_nav with real post-trade Alpaca NAV so tonight's Panel H is accurate.
+    set_setting("live_nav", str(round(nav_live, 2)))
 
     # Write positions snapshot to Supabase -- fetch AFTER fills so the first
     # run (flat account before trades) still records real post-fill positions.

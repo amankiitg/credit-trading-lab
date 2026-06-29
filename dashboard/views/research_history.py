@@ -27,15 +27,14 @@ FRAMING_CAPTION = (
 )
 
 
-@st.cache_data(ttl=3600)
-def _load() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    bt  = pd.read_parquet("data/results/backtest_trades.parquet")
-    rp  = pd.read_parquet("data/results/regime_performance.parquet")
-    fa  = pd.read_parquet("data/results/failure_analysis.parquet")
-    feat = pd.read_parquet("data/processed/features.parquet")
+@st.cache_data(ttl=3600, max_entries=1)
+def _load() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    bt = pd.read_parquet("data/results/backtest_trades.parquet")
+    rp = pd.read_parquet("data/results/regime_performance.parquet")
+    fa = pd.read_parquet("data/results/failure_analysis.parquet")
     bt["exit_fill_date"]  = pd.to_datetime(bt["exit_fill_date"])
     bt["entry_fill_date"] = pd.to_datetime(bt["entry_fill_date"])
-    return bt, rp, fa, feat
+    return bt, rp, fa
 
 
 def _fmt_dollar(ax):
@@ -50,7 +49,7 @@ def _equity_curve(trades: pd.DataFrame) -> pd.Series:
 
 
 def render() -> None:
-    bt, rp, fa, feat = _load()
+    bt, rp, fa = _load()
 
     st.subheader("Research History — HY/IG Credit RV Programme (v1–v6.6)")
     st.info(VERDICT_CAPTION)

@@ -41,13 +41,12 @@ SLEEVE_COLORS = {
 }
 
 
-@st.cache_data(ttl=3600)
-def _load_attribution() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+@st.cache_data(ttl=3600, max_entries=1)
+def _load_attribution() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Load and pre-process the attribution frames. Cached for 1 hour."""
     attr = pd.read_parquet("data/processed/attribution.parquet")
     attr["date"] = pd.to_datetime(attr["date"])
 
-    # Day-level broadcast columns (same value for all tickers on a given date)
     day_cols = [
         "gross_pnl", "net_pnl", "directional", "selection",
         "net_exposure", "beta_explained", "residual", "r_squared",
@@ -55,7 +54,6 @@ def _load_attribution() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     ]
     daily = attr.groupby("date", as_index=False)[day_cols].mean()
 
-    # Sleeve-level per-ticker columns
     sleeve = (
         attr.groupby(["date", "asset_class"], as_index=False)
         [["pnl", "carry", "price_change"]]
@@ -65,7 +63,29 @@ def _load_attribution() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     mctr = pd.read_parquet("data/processed/attribution_mctr_by_sleeve.parquet")
     mctr["date"] = pd.to_datetime(mctr["date"])
 
-    return daily, sleeve, mctr
+    # Return raw attr so Panel C doesn't re-read from disk
+    attr_ls = attr[["date", "weight", "pnl"]].copy()
+    return daily, sleeve, mctr, attr_ls
+
+
+@st.cache_data(ttl=3600, max_entries=1)
+def _load_factor_regression() -> tuple:
+    """Run rolling factor regression once and cache the result for 1 hour."""
+    from signals.etf_universe import load_universe_close
+    from risk.attribution import (
+        NOTIONAL_DEFAULT,
+        build_v82_book,
+        factor_returns,
+        gross_pnl_series,
+        rolling_factor_regression,
+    )
+    close = load_universe_close()
+    _, result = build_v82_book(close)
+    gross = gross_pnl_series(result)
+    book_ret = gross / NOTIONAL_DEFAULT
+    fret = factor_returns(close)
+    fr = rolling_factor_regression(book_ret, fret)
+    return fr, NOTIONAL_DEFAULT
 
 
 def _fmt_dollar(ax):
@@ -74,7 +94,7 @@ def _fmt_dollar(ax):
 
 def render() -> None:
     """Render all attribution panels in the current Streamlit context."""
-    daily, sleeve, mctr = _load_attribution()
+    daily, sleeve, mctr, attr_ls = _load_attribution()
 
     # ---------------------------------------------------------------- header
     st.subheader("Attribution Lab -- carry-dominated book, single rate cycle")
@@ -145,14 +165,12 @@ def render() -> None:
     # ---------------------------------------------------------------- Panel C: long vs short
     st.markdown("### C - Long vs Short P&L")
 
-    # Derive long/short from per-ticker pnl and weight sign
-    attr_raw = pd.read_parquet("data/processed/attribution.parquet")
-    attr_raw["date"] = pd.to_datetime(attr_raw["date"])
-    attr_raw["pnl_long"] = attr_raw["pnl"].where(attr_raw["weight"].fillna(0) > 0, 0)
-    attr_raw["pnl_short"] = attr_raw["pnl"].where(attr_raw["weight"].fillna(0) < 0, 0)
+    # Derive long/short from cached attr_ls slice (avoids re-reading parquet)
+    attr_ls["pnl_long"]  = attr_ls["pnl"].where(attr_ls["weight"].fillna(0) > 0, 0)
+    attr_ls["pnl_short"] = attr_ls["pnl"].where(attr_ls["weight"].fillna(0) < 0, 0)
 
     ls_daily = (
-        attr_raw.groupby("date", as_index=False)[["pnl_long", "pnl_short"]].sum()
+        attr_ls.groupby("date", as_index=False)[["pnl_long", "pnl_short"]].sum()
         .sort_values("date")
     )
     ls_cum = ls_daily[["pnl_long", "pnl_short"]].cumsum()
@@ -205,17 +223,7 @@ def render() -> None:
     # The betas were stored in the rolling_factor_regression result, not in attribution.parquet
     # We reconstruct them here from the risk.attribution module
     try:
-        from signals.etf_universe import load_universe_close
-        from risk.attribution import (
-            build_v82_book, factor_returns, gross_pnl_series,
-            rolling_factor_regression, NOTIONAL_DEFAULT
-        )
-        close = load_universe_close()
-        _, result = build_v82_book(close)
-        gross = gross_pnl_series(result)
-        book_ret = gross / NOTIONAL_DEFAULT
-        fret = factor_returns(close)
-        fr = rolling_factor_regression(book_ret, fret)
+        fr, NOTIONAL_DEFAULT = _load_factor_regression()
 
         fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
         ax1 = axes[0]

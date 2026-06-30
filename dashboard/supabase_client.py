@@ -42,8 +42,11 @@ def get_supabase_client():
         return None
 
     url = url.removesuffix("/rest/v1/")
-    from supabase import create_client
-    _client = create_client(url, key)
+    from supabase import ClientOptions, create_client
+    _client = create_client(
+        url, key,
+        options=ClientOptions(postgrest_client_timeout=10),
+    )
     return _client
 
 

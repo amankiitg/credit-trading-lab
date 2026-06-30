@@ -23,6 +23,8 @@ services:
     runtime: python
     buildCommand: pip install -e . && python scripts/write_render_secrets.py
     startCommand: streamlit run dashboard/app.py --server.port $PORT --server.address 0.0.0.0
+    healthCheckPath: /_stcore/health
+    readinessCheckPath: /_stcore/health
     envVars:
       - key: SUPABASE_URL
         sync: false

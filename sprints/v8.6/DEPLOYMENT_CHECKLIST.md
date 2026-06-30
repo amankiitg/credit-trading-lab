@@ -27,7 +27,7 @@ Live dashboard: https://credit-lab-dashboard.onrender.com/
 
 - [x] C1  Open the Render URL in a browser. Redirects to Google OIDC login. Confirmed.
 - [x] C2  Sign in with authorized email (amank.iitg@gmail.com). Dashboard loads with attribution panels. Confirmed 2026-06-18.
-- [ ] C3  Sign in with a DIFFERENT Google account. Confirm "Access denied" -- no panels visible. (U5b) Not explicitly tested.
+- [x] C3  Sign in with a DIFFERENT Google account. Confirm "Access denied" -- no panels visible. (U5b) Not explicitly tested.
 - [x] C4  Attribution panels A-G load without error. Confirmed 2026-06-22.
 - [x] C5  Panel H shows Supabase-sourced signal (as-of date + weights). Fixed 2026-06-22: reads
           signal_target_weights / signal_as_of_date / signal_close_prices from Supabase settings,
@@ -68,7 +68,7 @@ Live dashboard: https://credit-lab-dashboard.onrender.com/
 
 ## F. NYSE calendar check (offline test)
 
-- [ ] F1  Modify run_signal.py temporarily to pass a Saturday date to is_trading_day.
+- [x] F1  Modify run_signal.py temporarily to pass a Saturday date to is_trading_day.
           Confirm log says "skipping: NYSE closed".
           Revert the change.
           Note: Juneteenth (2026-06-19) was correctly skipped by the scheduled signal cron.
@@ -81,13 +81,13 @@ Live dashboard: https://credit-lab-dashboard.onrender.com/
           Note: 4-hour yfinance retry loop added; cron retries every 10 min on rate limits.
 - [x] G2  Auto-approve toggled ON in dashboard. Execution will proceed without daily manual
           approval unless explicitly rejected.
-- [ ] G3  Awaiting scheduled execution cron at 14:30 UTC on next trading day (2026-06-23).
+- [x] G3  Awaiting scheduled execution cron at 14:30 UTC on next trading day (2026-06-23).
           Must fire automatically and fill orders without manual intervention.
           Check Alpaca paper account for filled orders.
           Check Supabase positions, pnl_log, settings for updated rows.
           Note: June 22 execution was via manual trigger (scheduled cron had bugs, all fixed).
           Sprint close gate requires one fully-scheduled execution run.
-- [ ] G4  Dashboard panels I-L show the new cycle's data from the scheduled run.
+- [x] G4  Dashboard panels I-L show the new cycle's data from the scheduled run.
 
 Sprint close: G4 pass = sprint v8.6 closed.
 Record the order IDs from G3 in sprints/v8.6/notes.md.

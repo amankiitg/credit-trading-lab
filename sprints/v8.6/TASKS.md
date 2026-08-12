@@ -1,6 +1,6 @@
 # Sprint v8.6 -- Tasks
 
-**Status:** in progress
+**Status:** complete
 Status legend: `[ ]` = not done, `[x]` = done, `[~]` = partially done.
 
 **Dependency order:** T1 -> T2 -> T3 -> T4 (execution fixes, in parallel OK) -> T5 -> T6
@@ -249,7 +249,7 @@ or SUPABASE_SECRET_KEY appears in any committed file, stop and rotate before con
 
 ---
 
-- [ ] **T6: Secret isolation and Google OIDC on Render** (D1, E9)
+- [x] **T6: Secret isolation and Google OIDC on Render** (D1, E9)
 
   **Secret isolation verification**
 
@@ -281,7 +281,7 @@ or SUPABASE_SECRET_KEY appears in any committed file, stop and rotate before con
 
 ---
 
-- [ ] **T7: Dashboard live panels I-L** (E8)
+- [x] **T7: Dashboard live panels I-L** (E8)
 
   Remove the `st.warning("TODO v8.6: ...")` stubs from panels I-L in
   `dashboard/views/operational.py`.
@@ -384,7 +384,7 @@ or SUPABASE_SECRET_KEY appears in any committed file, stop and rotate before con
 
 ---
 
-- [ ] **T9: Deployment smoke and live cycle observation** (E5-E11, D1-D12)
+- [x] **T9: Deployment smoke and live cycle observation** (E5-E11, D1-D12)
 
   Run the full deployment test checklist from the PRD. Document each gate result in
   `sprints/v8.6/notes.md` with timestamp, pass/fail, and any notes.

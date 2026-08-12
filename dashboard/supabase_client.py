@@ -271,6 +271,21 @@ def write_live_attribution(rows: list[dict]) -> bool:
         return False
 
 
+# ---------------------------------------------------------------- stop states (v9.1 advisory)
+
+def fetch_stop_states() -> list[dict]:
+    """Return all rows from stop_states table (one per ticker)."""
+    client = get_supabase_client()
+    if client is None:
+        return []
+    try:
+        resp = client.table("stop_states").select("*").execute()
+        return resp.data or []
+    except Exception as exc:
+        _log.error("fetch_stop_states failed: %s", exc)
+        return []
+
+
 # ---------------------------------------------------------------- cron run log (idempotency)
 
 def check_cron_run(job_name: str, run_date: str) -> bool:

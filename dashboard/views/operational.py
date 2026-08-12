@@ -113,38 +113,25 @@ def _get_proposed_trade() -> tuple[list[dict], str, float]:
     return rows, as_of_date, nav
 
 
-def _render_panel_m(nav: float, proposed_rows: list[dict]) -> None:
-    """Render Panel M: Live Risk & Attribution (v9.1 T9).
-
-    Three blocks:
-      1. MCTR/PCTR bar chart from live weights + 63d covariance
-      2. P&L contribution table (1d / 5d / since-entry)
-      3. Factor attribution (beta_explained vs residual, rolling R²)
-    """
+def _render_mctr_pctr(nav: float, positions_data: list[dict]) -> None:
+    """Render MCTR/PCTR bar chart from live weights + 63d covariance (v9.1 T8)."""
     import numpy as np
     from signals.etf_universe import UNIVERSE, load_universe_close
 
-    # --- Block 1: MCTR/PCTR ---
-    positions = fetch_positions(latest_only=True)
-    if not positions:
-        st.info("No live positions — MCTR/PCTR requires open positions.")
-        return
-
     # Build live weight vector
     w_dict: dict[str, float] = {}
-    for pos in positions:
+    for pos in positions_data:
         t = pos["ticker"]
         notional = float(pos.get("signed_notional", 0))
         w_dict[t] = notional / nav if nav > 0 else 0.0
 
     live_tickers = [t for t in UNIVERSE if t in w_dict]
     if not live_tickers:
-        st.info("No positions in universe — MCTR/PCTR skipped.")
+        st.info("No positions in universe.")
         return
 
     weights = pd.Series({t: w_dict[t] for t in live_tickers})
 
-    # Get 63d returns from cached closes
     try:
         close = load_universe_close()
     except Exception:
@@ -153,19 +140,18 @@ def _render_panel_m(nav: float, proposed_rows: list[dict]) -> None:
 
     rets = close[live_tickers].pct_change().dropna(how="all").tail(63)
     if len(rets) < 20:
-        st.info(f"Only {len(rets)} days of returns — need ≥20 for covariance estimate.")
+        st.info(f"Only {len(rets)} days of returns — need ≥20 for covariance.")
         return
 
     from risk.live_risk import mctr_pctr
     try:
         risk_df = mctr_pctr(weights, rets)
     except Exception as exc:
-        st.warning(f"MCTR/PCTR computation failed: {exc}")
+        st.warning(f"MCTR/PCTR failed: {exc}")
         return
 
-    # MCTR/PCTR bar chart
     import matplotlib.pyplot as plt
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 3.5))
 
     colors = ["#2ecc71" if w > 0 else "#e74c3c" for w in risk_df["weight"]]
     ax1.bar(risk_df.index, risk_df["pctr"] * 100, color=colors, alpha=0.8)
@@ -176,15 +162,14 @@ def _render_panel_m(nav: float, proposed_rows: list[dict]) -> None:
 
     ax2.bar(risk_df.index, risk_df["mctr"], color=colors, alpha=0.8)
     ax2.axhline(0, color="black", lw=0.5)
-    ax2.set_title("MCTR (Annualized Marginal Contribution)")
-    ax2.set_ylabel("Annualized σ")
+    ax2.set_title("MCTR (Marginal Contribution, Annualized)")
     ax2.tick_params(axis="x", rotation=45)
 
     fig.tight_layout()
     st.pyplot(fig, width="stretch")
     plt.close(fig)
 
-    with st.expander("MCTR/PCTR detail"):
+    with st.expander("MCTR/PCTR detail table"):
         st.dataframe(
             risk_df.style.map(
                 lambda v: "color: #2ecc71" if v > 0 else "color: #e74c3c",
@@ -193,36 +178,6 @@ def _render_panel_m(nav: float, proposed_rows: list[dict]) -> None:
             width="stretch",
         )
         st.caption(f"PCTR sum: {risk_df['pctr'].sum():.6f} (must = 1.0 within 1e-6)")
-
-    # --- Block 2: P&L contribution ---
-    st.markdown("**P&L Contribution (from live_attribution)**")
-    attr_rows = fetch_live_attribution(limit=20)
-    if attr_rows:
-        df_attr = pd.DataFrame(attr_rows)
-        # Show latest run_date's per-ticker breakdown
-        latest_date = df_attr["run_date"].max()
-        df_latest = df_attr[df_attr["run_date"] == latest_date]
-
-        st.caption(f"Latest run: {latest_date}")
-        # Show per-ticker net P&L
-        if not df_latest.empty:
-            display_cols = ["ticker", "asset_class", "weight", "net_pnl", "gross_pnl"]
-            available = [c for c in display_cols if c in df_latest.columns]
-            st.dataframe(
-                df_latest[available].style.map(
-                    lambda v: "color: #2ecc71" if isinstance(v, (int, float)) and v > 0
-                    else ("color: #e74c3c" if isinstance(v, (int, float)) and v < 0 else ""),
-                    subset=["net_pnl", "gross_pnl"],
-                ),
-                width="stretch", hide_index=True,
-            )
-            total_net = df_latest["net_pnl"].sum() if "net_pnl" in df_latest.columns else 0
-            total_gross = df_latest["gross_pnl"].sum() if "gross_pnl" in df_latest.columns else 0
-            st.caption(f"Total net P&L: ${total_net:,.2f}  |  Total gross P&L: ${total_gross:,.2f}")
-        else:
-            st.info("No attribution rows for latest run date.")
-    else:
-        st.info("No live_attribution data yet — will populate after execution cron runs.")
 
 
 def render(
@@ -414,111 +369,129 @@ def render(
     st.markdown("---")
 
     # ================================================================
-    # Panel M -- Live Risk & Attribution (v9.1 T9)
+    # Panel I -- Live Portfolio Snapshot
     # ================================================================
-    st.markdown("### M - Live Risk & Attribution")
+    st.markdown("### I - Live Portfolio Snapshot")
 
-    with st.spinner("Computing live risk decomposition..."):
-        try:
-            _render_panel_m(nav, proposed_rows)
-        except Exception as exc:
-            st.warning(f"Panel M unavailable: {exc}")
-
-    st.markdown("---")
-
-    # ---------------------------------------------------------------- Panel I: equity curve
-    st.markdown("### I - Equity Curve & Live GMV")
-
-    pnl_rows = fetch_pnl_log()
     positions_data = fetch_positions(latest_only=True)
 
-    # --- GMV / NAV / Unrealized summary row ---
     col_gmv, col_nav, col_unreal = st.columns(3)
-
     if positions_data:
         total_gmv = sum(abs(float(p.get("signed_notional", 0))) for p in positions_data)
-        col_gmv.metric("Live GMV", f"${total_gmv:,.0f}",
-                        help="Sum of absolute position notionals from live positions table")
+        col_gmv.metric("Live GMV", f"${total_gmv:,.0f}")
     else:
         col_gmv.metric("Live GMV", "—")
-
-    col_nav.metric("Live NAV (Alpaca)", f"${nav:,.0f}",
-                   help="Live account equity from Alpaca — updated by execution cron")
-
+    col_nav.metric("Live NAV", f"${nav:,.0f}")
     if positions_data:
-        total_cost = sum(float(p.get("signed_notional", 0)) for p in positions_data)
-        unrealized = nav - total_cost if total_cost != 0 else 0
-        col_unreal.metric("Unrealized P&L (est.)", f"${unrealized:+,.0f}",
-                          delta=f"{unrealized/total_cost*100:.1f}%" if total_cost != 0 else None)
+        net_exposure = sum(float(p.get("signed_notional", 0)) for p in positions_data)
+        unrealized = nav - net_exposure if net_exposure != 0 else 0
+        col_unreal.metric("Net Exposure", f"${net_exposure:+,.0f}",
+                          delta=f"{net_exposure/nav*100:.1f}% of NAV" if nav else None)
     else:
-        col_unreal.metric("Unrealized P&L", "—")
+        col_unreal.metric("Net Exposure", "—")
 
-    # --- Realized equity curve ---
-    if pnl_rows:
+    # NAV breakdown by asset class
+    if positions_data:
         import matplotlib.pyplot as plt
-        import matplotlib.dates as mdates
+        TICKER_CLASS = {
+            "SPY": "equity", "EFA": "equity", "EEM": "equity",
+            "IEF": "rates", "TLT": "rates",
+            "HYG": "credit", "LQD": "credit",
+            "GLD": "commodity",
+        }
+        class_gmv: dict[str, float] = {}
+        for p in positions_data:
+            t = p.get("ticker", "")
+            notional = float(p.get("signed_notional", 0))
+            cls = TICKER_CLASS.get(t, "other")
+            class_gmv[cls] = class_gmv.get(cls, 0) + abs(notional)
 
-        fig, ax = plt.subplots(figsize=(14, 4.5))
-        df_pnl = pd.DataFrame(pnl_rows).sort_values("trade_date")
-        df_pnl["cumulative_net_pnl"] = df_pnl["net_pnl"].cumsum()
-        ax.plot(pd.to_datetime(df_pnl["trade_date"]), df_pnl["cumulative_net_pnl"],
-                color="#1b5e8a", lw=2.0)
-        ax.scatter(pd.to_datetime(df_pnl["trade_date"].iloc[-1]),
-                   df_pnl["cumulative_net_pnl"].iloc[-1],
-                   color="#1b5e8a", s=40, zorder=5)
-        ax.axhline(0, color="black", lw=0.5)
-        ax.set_title("Cumulative Net P&L (realized Alpaca fills)")
-        ax.set_ylabel("Cumulative Net P&L ($)")
-        ax.grid(alpha=0.2)
-        ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
-        fig.autofmt_xdate()
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 3.5))
+        classes = list(class_gmv.keys())
+        values = [class_gmv[c] for c in classes]
+        colors = {"equity": "#3498db", "rates": "#2ecc71", "credit": "#e74c3c",
+                  "commodity": "#f39c12", "other": "#95a5a6"}
+        bar_colors = [colors.get(c, "#95a5a6") for c in classes]
+
+        ax1.bar(classes, values, color=bar_colors, alpha=0.85)
+        ax1.set_title("GMV by Asset Class")
+        ax1.set_ylabel("$")
+        ax1.tick_params(axis="x", rotation=30)
+
+        ax2.pie(values, labels=classes, colors=bar_colors, autopct="%1.0f%%",
+                startangle=90)
+        ax2.set_title("NAV Allocation")
+
         fig.tight_layout()
         st.pyplot(fig, width="stretch")
         plt.close(fig)
-        st.caption(FRAMING_CAPTION)
     else:
-        st.info("No fills recorded yet — pnl_log is empty. Run the execution cron to populate.")
+        st.info("No positions yet — asset class breakdown will appear after execution.")
 
     st.markdown("---")
 
     # ---------------------------------------------------------------- Panel J: open positions
     st.markdown("### J - Open Positions")
-    positions_data = fetch_positions()
     if positions_data:
         df_pos = pd.DataFrame(positions_data)
-
-        # Add weight column (% of NAV) and GMV contribution
         if "signed_notional" in df_pos.columns and nav > 0:
             df_pos["weight %"] = (df_pos["signed_notional"].astype(float) / nav * 100).round(2)
             df_pos["|notional|"] = df_pos["signed_notional"].astype(float).abs()
 
-        # Summary row
         total_gmv = df_pos["|notional|"].sum() if "|notional|" in df_pos.columns else 0
         net_exposure = df_pos["signed_notional"].astype(float).sum() if "signed_notional" in df_pos.columns else 0
 
         col1, col2, col3 = st.columns(3)
-        col1.metric("GMV (gross deployed)", f"${total_gmv:,.0f}")
-        col2.metric("Net exposure", f"${net_exposure:+,.0f}")
+        col1.metric("GMV", f"${total_gmv:,.0f}")
+        col2.metric("Net Exposure", f"${net_exposure:+,.0f}")
         col3.metric("Leverage", f"{total_gmv/nav:.2f}x" if nav > 0 else "—")
 
         st.dataframe(df_pos, width="stretch", hide_index=True)
         st.caption("Weights shown as % of live NAV. Long = positive, short = negative.")
     else:
-        st.warning(
-            "No open positions — positions table is empty. "
-            "Run the execution cron to populate."
-        )
+        st.info("No open positions — run the execution cron to populate.")
 
     st.markdown("---")
 
-    # ---------------------------------------------------------------- Panel K: daily P&L table
-    st.markdown("### K - Daily P&L Log")
+    # ================================================================
+    # Panel K -- NAV Tracker (cumulative P&L)
+    # ================================================================
+    st.markdown("### K - NAV Tracker")
+    pnl_rows = fetch_pnl_log()
+    if pnl_rows:
+        import matplotlib.pyplot as plt
+        import matplotlib.dates as mdates
+        df_pnl = pd.DataFrame(pnl_rows).sort_values("trade_date")
+        df_pnl["cumulative_net_pnl"] = df_pnl["net_pnl"].cumsum()
+
+        fig, ax = plt.subplots(figsize=(14, 3))
+        ax.fill_between(pd.to_datetime(df_pnl["trade_date"]), 0,
+                         df_pnl["cumulative_net_pnl"],
+                         color="#1b5e8a", alpha=0.15)
+        ax.plot(pd.to_datetime(df_pnl["trade_date"]), df_pnl["cumulative_net_pnl"],
+                color="#1b5e8a", lw=2.0, marker="o", markersize=3)
+        ax.axhline(0, color="black", lw=0.5)
+        ax.set_title("Cumulative Net P&L (NAV change from fills)")
+        ax.set_ylabel("$")
+        ax.grid(alpha=0.2)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d"))
+        fig.tight_layout()
+        st.pyplot(fig, width="stretch")
+        plt.close(fig)
+    else:
+        st.info("No P&L data yet — NAV tracker will appear after fills.")
+
+    st.markdown("---")
+
+    # ================================================================
+    # Panel L -- Daily P&L Log
+    # ================================================================
+    st.markdown("### L - Daily P&L Log")
     if pnl_rows:
         df_log = pd.DataFrame(pnl_rows)
         st.dataframe(
             df_log[["trade_date", "gross_pnl", "net_pnl", "turnover_cost", "borrow_cost"]],
-            width="stretch",
-            hide_index=True,
+            width="stretch", hide_index=True,
         )
         st.caption(
             f"Net P&L total: ${df_log['net_pnl'].sum():,.0f}  |  "
@@ -526,7 +499,48 @@ def render(
         )
         st.caption(FRAMING_CAPTION)
     else:
-        st.warning(
-            "**TODO v8.6**: Daily P&L log from paper fills. "
-            "No fills recorded yet -- pnl_log table is empty."
-        )
+        st.info("No fills recorded yet — pnl_log is empty.")
+
+    st.markdown("---")
+
+    # ================================================================
+    # Panel M-A -- Risk Contribution (MCTR/PCTR)
+    # ================================================================
+    st.markdown("### M-A — Risk Contribution (MCTR/PCTR)")
+
+    with st.spinner("Computing risk decomposition..."):
+        if positions_data:
+            _render_mctr_pctr(nav, positions_data)
+        else:
+            st.info("No positions — MCTR/PCTR requires open positions.")
+
+    st.markdown("---")
+
+    # ================================================================
+    # Panel M-B -- Per-Ticker P&L
+    # ================================================================
+    st.markdown("### M-B — Per-Ticker P&L (latest run)")
+
+    attr_rows = fetch_live_attribution(limit=20)
+    if attr_rows:
+        df_attr = pd.DataFrame(attr_rows)
+        latest_date = df_attr["run_date"].max()
+        df_latest = df_attr[df_attr["run_date"] == latest_date]
+        st.caption(f"Latest execution: {latest_date}")
+        if not df_latest.empty:
+            display_cols = ["ticker", "asset_class", "weight", "net_pnl", "gross_pnl"]
+            available = [c for c in display_cols if c in df_latest.columns]
+            st.dataframe(
+                df_latest[available].style.map(
+                    lambda v: "color: #2ecc71" if isinstance(v, (int, float)) and v > 0
+                    else ("color: #e74c3c" if isinstance(v, (int, float)) and v < 0 else ""),
+                    subset=["net_pnl", "gross_pnl"],
+                ),
+                width="stretch", hide_index=True,
+            )
+            total_net = df_latest["net_pnl"].sum() if "net_pnl" in df_latest.columns else 0
+            st.caption(f"Total net P&L: ${total_net:,.2f}")
+        else:
+            st.info("No attribution rows for latest run.")
+    else:
+        st.info("No live_attribution data yet — populates after execution cron runs.")

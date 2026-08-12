@@ -286,6 +286,22 @@ def fetch_stop_states() -> list[dict]:
         return []
 
 
+def fetch_live_attribution(run_date: str | None = None, limit: int = 50) -> list[dict]:
+    """Return per-ticker P&L rows from live_attribution table."""
+    client = get_supabase_client()
+    if client is None:
+        return []
+    try:
+        query = client.table("live_attribution").select("*").order("run_date", desc=True).limit(limit)
+        if run_date:
+            query = query.eq("run_date", run_date)
+        resp = query.execute()
+        return resp.data or []
+    except Exception as exc:
+        _log.error("fetch_live_attribution failed: %s", exc)
+        return []
+
+
 # ---------------------------------------------------------------- cron run log (idempotency)
 
 def check_cron_run(job_name: str, run_date: str) -> bool:

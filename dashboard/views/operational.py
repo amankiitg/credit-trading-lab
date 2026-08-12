@@ -19,6 +19,7 @@ import streamlit as st
 
 from dashboard.supabase_client import (
     fetch_decision_for_date,
+    fetch_live_attribution,
     fetch_pnl_log,
     fetch_positions,
     fetch_stop_states,
@@ -237,16 +238,34 @@ def _render_panel_m(nav: float, proposed_rows: list[dict]) -> None:
         st.caption(f"PCTR sum: {risk_df['pctr'].sum():.6f} (must = 1.0 within 1e-6)")
 
     # --- Block 2: P&L contribution ---
-    st.markdown("**P&L Contribution (from pnl_log)**")
-    pnl_rows = fetch_pnl_log(limit=30)
-    if pnl_rows:
-        df_pnl = pd.DataFrame(pnl_rows).sort_values("trade_date")
-        latest = df_pnl.iloc[-1] if len(df_pnl) > 0 else None
-        if latest is not None:
-            st.metric("Latest Daily P&L", f"${latest.get('net_pnl', 0):,.0f}")
-        st.caption("Per-ticker contribution requires live_attribution data (v8.6+).")
+    st.markdown("**P&L Contribution (from live_attribution)**")
+    attr_rows = fetch_live_attribution(limit=20)
+    if attr_rows:
+        df_attr = pd.DataFrame(attr_rows)
+        # Show latest run_date's per-ticker breakdown
+        latest_date = df_attr["run_date"].max()
+        df_latest = df_attr[df_attr["run_date"] == latest_date]
+
+        st.caption(f"Latest run: {latest_date}")
+        # Show per-ticker net P&L
+        if not df_latest.empty:
+            display_cols = ["ticker", "asset_class", "weight", "net_pnl", "gross_pnl"]
+            available = [c for c in display_cols if c in df_latest.columns]
+            st.dataframe(
+                df_latest[available].style.map(
+                    lambda v: "color: #2ecc71" if isinstance(v, (int, float)) and v > 0
+                    else ("color: #e74c3c" if isinstance(v, (int, float)) and v < 0 else ""),
+                    subset=["net_pnl", "gross_pnl"],
+                ),
+                width="stretch", hide_index=True,
+            )
+            total_net = df_latest["net_pnl"].sum() if "net_pnl" in df_latest.columns else 0
+            total_gross = df_latest["gross_pnl"].sum() if "gross_pnl" in df_latest.columns else 0
+            st.caption(f"Total net P&L: ${total_net:,.2f}  |  Total gross P&L: ${total_gross:,.2f}")
+        else:
+            st.info("No attribution rows for latest run date.")
     else:
-        st.info("No P&L log data yet.")
+        st.info("No live_attribution data yet — will populate after execution cron runs.")
 
     # --- Block 3: Factor attribution (full-history reconstruction) ---
     st.markdown("**Factor Attribution (betas from full-history reconstruction)**")

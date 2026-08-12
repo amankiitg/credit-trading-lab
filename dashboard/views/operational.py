@@ -484,26 +484,6 @@ def render(
     st.markdown("---")
 
     # ================================================================
-    # Panel L -- Daily P&L Log
-    # ================================================================
-    st.markdown("### L - Daily P&L Log")
-    if pnl_rows:
-        df_log = pd.DataFrame(pnl_rows)
-        st.dataframe(
-            df_log[["trade_date", "gross_pnl", "net_pnl", "turnover_cost", "borrow_cost"]],
-            width="stretch", hide_index=True,
-        )
-        st.caption(
-            f"Net P&L total: ${df_log['net_pnl'].sum():,.0f}  |  "
-            f"Turnover cost total: ${df_log['turnover_cost'].sum():,.0f}"
-        )
-        st.caption(FRAMING_CAPTION)
-    else:
-        st.info("No fills recorded yet — pnl_log is empty.")
-
-    st.markdown("---")
-
-    # ================================================================
     # Panel M-A -- Risk Contribution (MCTR/PCTR)
     # ================================================================
     st.markdown("### M-A — Risk Contribution (MCTR/PCTR)")
@@ -517,29 +497,41 @@ def render(
     st.markdown("---")
 
     # ================================================================
-    # Panel M-B -- Per-Ticker P&L
+    # Panel M-B -- P&L by Factor / Asset Class
     # ================================================================
-    st.markdown("### M-B — Per-Ticker P&L (latest run)")
+    st.markdown("### M-B — P&L by Factor (latest run)")
 
     attr_rows = fetch_live_attribution(limit=20)
     if attr_rows:
+        import matplotlib.pyplot as plt
+        import numpy as np
         df_attr = pd.DataFrame(attr_rows)
         latest_date = df_attr["run_date"].max()
         df_latest = df_attr[df_attr["run_date"] == latest_date]
         st.caption(f"Latest execution: {latest_date}")
-        if not df_latest.empty:
-            display_cols = ["ticker", "asset_class", "weight", "net_pnl", "gross_pnl"]
-            available = [c for c in display_cols if c in df_latest.columns]
-            st.dataframe(
-                df_latest[available].style.map(
-                    lambda v: "color: #2ecc71" if isinstance(v, (int, float)) and v > 0
-                    else ("color: #e74c3c" if isinstance(v, (int, float)) and v < 0 else ""),
-                    subset=["net_pnl", "gross_pnl"],
-                ),
-                width="stretch", hide_index=True,
-            )
-            total_net = df_latest["net_pnl"].sum() if "net_pnl" in df_latest.columns else 0
-            st.caption(f"Total net P&L: ${total_net:,.2f}")
+        if not df_latest.empty and "asset_class" in df_latest.columns:
+            # Aggregate net P&L by asset class
+            class_pnl = df_latest.groupby("asset_class")["net_pnl"].sum().sort_values()
+            factor_colors = {
+                "equity": "#3498db", "rates": "#2ecc71", "credit": "#e74c3c",
+                "commodity": "#f39c12",
+            }
+            bar_colors = [factor_colors.get(c, "#95a5a6") for c in class_pnl.index]
+
+            fig, ax = plt.subplots(figsize=(10, 3))
+            bars = ax.barh(class_pnl.index, class_pnl.values, color=bar_colors, alpha=0.85)
+            ax.axvline(0, color="black", lw=0.5)
+            ax.set_title("Net P&L by Factor / Asset Class")
+            ax.set_xlabel("$")
+            for bar, val in zip(bars, class_pnl.values):
+                ax.text(val + (0.02 if val >= 0 else -0.08), bar.get_y() + bar.get_height()/2,
+                        f"${val:+,.2f}", va="center", fontsize=9)
+            fig.tight_layout()
+            st.pyplot(fig, width="stretch")
+            plt.close(fig)
+
+            total = class_pnl.sum()
+            st.caption(f"Total net P&L: ${total:+,.2f}")
         else:
             st.info("No attribution rows for latest run.")
     else:

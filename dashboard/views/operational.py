@@ -42,49 +42,6 @@ def _get_stop_states() -> list[dict]:
     return fetch_stop_states()
 
 
-@st.cache_data(ttl=3600)
-def _get_mtm_equity(nav: float = 100_000.0) -> tuple[pd.Series, pd.Series, float] | None:
-    """Compute mark-to-market equity curve scaled to the live NAV.
-
-    Runs the v8.2 signal pipeline at $1M reference notional, then scales
-    dollar P&L proportionally so GMV ≈ 2× NAV (the strategy's typical
-    gross leverage).  Keeps the curve apples-to-apples with realized P&L.
-
-    Returns (equity_mtm, daily_pnl_mtm, gmv_latest) or None if data unavailable.
-    """
-    try:
-        from signals.etf_universe import load_universe_close
-        from signals.trend_signal import (
-            apply_rebalance_control,
-            compute_trend,
-            shift_to_next_day,
-            to_position_matrix,
-        )
-        from backtest.multi_asset import run_multi_asset
-        from execution.costs import CostParams
-
-        REF_NOTIONAL = 1_000_000.0
-        close = load_universe_close()
-        tidy = compute_trend(close, L=120, long_short=True, k_dead_zone=0.5)
-        desired = to_position_matrix(tidy)
-        held = apply_rebalance_control(desired, rebal_freq=1, band_pct=0.20)
-        target = shift_to_next_day(held)
-
-        result = run_multi_asset(target, close, notional=REF_NOTIONAL, cost_params=CostParams())
-
-        # Scale to live NAV so GMV makes sense vs the actual account
-        scale = nav / REF_NOTIONAL if REF_NOTIONAL > 0 else 1.0
-        equity_mtm = result.equity * scale
-        daily_pnl_mtm = result.daily_pnl * scale
-
-        latest_target = target.iloc[-1]
-        gmv = float(latest_target.abs().sum() * nav)
-
-        return equity_mtm, daily_pnl_mtm, gmv
-    except Exception:
-        return None
-
-
 @st.cache_data(ttl=300)
 def _get_drift_alert() -> dict | None:
     """Position drift flagged by run_execution.py's check_position_drift.
@@ -266,78 +223,6 @@ def _render_panel_m(nav: float, proposed_rows: list[dict]) -> None:
             st.info("No attribution rows for latest run date.")
     else:
         st.info("No live_attribution data yet — will populate after execution cron runs.")
-
-    # --- Block 3: Factor attribution (full-history reconstruction) ---
-    st.markdown("**Factor Attribution (betas from full-history reconstruction)**")
-    try:
-        from risk.attribution import factor_returns, rolling_factor_regression
-
-        # Reconstruct book returns from signal weights over full history
-        from signals.trend_signal import (
-            apply_rebalance_control,
-            compute_trend,
-            shift_to_next_day,
-            to_position_matrix,
-        )
-        tidy = compute_trend(close, L=120, long_short=True, k_dead_zone=0.5)
-        desired = to_position_matrix(tidy)
-        held = apply_rebalance_control(desired, rebal_freq=1, band_pct=0.20)
-        target = shift_to_next_day(held)
-
-        # Book daily return = sum_i(target_i * ret_i)
-        common_cols = [c for c in close.columns if c in target.columns]
-        common_idx = target.index.intersection(close.index)
-        t_aligned = target.loc[common_idx, common_cols]
-        c_aligned = close.loc[common_idx, common_cols]
-        ret_aligned = c_aligned.pct_change()
-        book_ret = (t_aligned * ret_aligned).sum(axis=1, skipna=True)
-
-        # Factor returns: eq=SPY, rates=IEF, credit=HYG-IEF, gold=GLD
-        factor_tickers = ["SPY", "IEF", "HYG", "GLD"]
-        available_factors = [f for f in factor_tickers if f in close.columns]
-        if len(available_factors) >= 2:
-            factor_rets = pd.DataFrame({
-                f: close[f].pct_change() for f in available_factors
-            }, index=close.index).dropna()
-
-            # Rolling factor regression: 252d window through t-1
-            reg_result = rolling_factor_regression(
-                book_ret, factor_rets, window=252,
-            )
-            betas = reg_result.betas
-            r2 = reg_result.r_squared
-            explained = reg_result.beta_explained
-            residual = reg_result.residual
-
-            if betas is not None and len(betas) > 0:
-                latest_betas = betas.iloc[-1] if len(betas) > 0 else None
-                if latest_betas is not None:
-                    st.markdown("**Latest factor betas (252d rolling, through t-1):**")
-                    beta_display = pd.DataFrame({
-                        "factor": latest_betas.index,
-                        "beta": [f"{b:.3f}" for b in latest_betas.values],
-                    })
-                    st.dataframe(beta_display, hide_index=True, width="stretch")
-
-                # Rolling R²
-                if r2 is not None and len(r2) > 0:
-                    fig_r2, ax_r2 = plt.subplots(figsize=(10, 3))
-                    ax_r2.plot(r2.index, r2.values, lw=1.0, color="#1b5e8a")
-                    ax_r2.set_title("Rolling R² (252d window)")
-                    ax_r2.set_ylabel("R²")
-                    ax_r2.set_ylim(0, 1)
-                    ax_r2.grid(alpha=0.25)
-                    fig_r2.tight_layout()
-                    st.pyplot(fig_r2, width="stretch")
-                    plt.close(fig_r2)
-
-                st.caption("Betas from full-history signal reconstruction, not the days-old live series.")
-            else:
-                st.info("Factor regression produced no results.")
-        else:
-            st.info(f"Need ≥2 factor tickers available; got {available_factors}.")
-    except Exception as exc:
-        st.info(f"Factor attribution unavailable: {exc}")
 
 
 def render(
@@ -542,23 +427,24 @@ def render(
     st.markdown("---")
 
     # ---------------------------------------------------------------- Panel I: equity curve
-    st.markdown("### I - Equity Curve — Realized + Mark-to-Market")
+    st.markdown("### I - Equity Curve & Live GMV")
 
     pnl_rows = fetch_pnl_log()
-    mtm_data = _get_mtm_equity(nav)
-
-    # --- GMV & NAV summary row ---
-    col_gmv, col_nav, col_unreal = st.columns(3)
-    if mtm_data is not None:
-        _, _, gmv_latest = mtm_data
-        col_gmv.metric("GMV (deployed capital)", f"${gmv_latest:,.0f}",
-                        help="Sum of absolute position notionals — total capital at risk")
-    else:
-        col_gmv.metric("GMV", "—")
-    col_nav.metric("Live NAV (Alpaca)", f"${nav:,.0f}",
-                   help="Live account equity from Alpaca")
-    # Unrealized P&L = live NAV - total invested (approximated from positions)
     positions_data = fetch_positions(latest_only=True)
+
+    # --- GMV / NAV / Unrealized summary row ---
+    col_gmv, col_nav, col_unreal = st.columns(3)
+
+    if positions_data:
+        total_gmv = sum(abs(float(p.get("signed_notional", 0))) for p in positions_data)
+        col_gmv.metric("Live GMV", f"${total_gmv:,.0f}",
+                        help="Sum of absolute position notionals from live positions table")
+    else:
+        col_gmv.metric("Live GMV", "—")
+
+    col_nav.metric("Live NAV (Alpaca)", f"${nav:,.0f}",
+                   help="Live account equity from Alpaca — updated by execution cron")
+
     if positions_data:
         total_cost = sum(float(p.get("signed_notional", 0)) for p in positions_data)
         unrealized = nav - total_cost if total_cost != 0 else 0
@@ -567,58 +453,31 @@ def render(
     else:
         col_unreal.metric("Unrealized P&L", "—")
 
-    # --- Equity curve chart ---
-    if pnl_rows or mtm_data is not None:
+    # --- Realized equity curve ---
+    if pnl_rows:
         import matplotlib.pyplot as plt
         import matplotlib.dates as mdates
 
-        fig, ax = plt.subplots(figsize=(14, 5))
-
-        # Fills-based (realized) equity
-        if pnl_rows:
-            df_pnl = pd.DataFrame(pnl_rows).sort_values("trade_date")
-            df_pnl["cumulative_net_pnl"] = df_pnl["net_pnl"].cumsum()
-            ax.plot(pd.to_datetime(df_pnl["trade_date"]), df_pnl["cumulative_net_pnl"],
-                    color="#1b5e8a", lw=2.0, label="Realized P&L (fills)", zorder=3)
-            realized_last = df_pnl["cumulative_net_pnl"].iloc[-1]
-            ax.scatter(pd.to_datetime(df_pnl["trade_date"].iloc[-1]), realized_last,
-                       color="#1b5e8a", s=40, zorder=5)
-
-        # MTM (strategy book) equity
-        if mtm_data is not None:
-            equity_mtm, _, _ = mtm_data
-            # Align to recent window for readability (last ~2 years)
-            recent = equity_mtm[equity_mtm.index >= "2024-01-01"]
-            ax.plot(recent.index, recent.values,
-                    color="#e67e22", lw=1.5, ls="--", alpha=0.85,
-                    label="MTM strategy book (signal-based)", zorder=2)
-            if len(recent) > 0:
-                ax.scatter(recent.index[-1], recent.values[-1],
-                           color="#e67e22", s=40, zorder=5)
-
+        fig, ax = plt.subplots(figsize=(14, 4.5))
+        df_pnl = pd.DataFrame(pnl_rows).sort_values("trade_date")
+        df_pnl["cumulative_net_pnl"] = df_pnl["net_pnl"].cumsum()
+        ax.plot(pd.to_datetime(df_pnl["trade_date"]), df_pnl["cumulative_net_pnl"],
+                color="#1b5e8a", lw=2.0)
+        ax.scatter(pd.to_datetime(df_pnl["trade_date"].iloc[-1]),
+                   df_pnl["cumulative_net_pnl"].iloc[-1],
+                   color="#1b5e8a", s=40, zorder=5)
         ax.axhline(0, color="black", lw=0.5)
-        ax.set_title("Equity Curve — Realized Fills vs Mark-to-Market Strategy Book")
-        ax.set_ylabel("Cumulative P&L ($)")
-        ax.legend(loc="upper left")
+        ax.set_title("Cumulative Net P&L (realized Alpaca fills)")
+        ax.set_ylabel("Cumulative Net P&L ($)")
         ax.grid(alpha=0.2)
-        ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
         fig.autofmt_xdate()
         fig.tight_layout()
         st.pyplot(fig, width="stretch")
         plt.close(fig)
-        st.caption(
-            "**Blue** = realized P&L from executed Alpaca fills.  "
-            "**Orange dashed** = mark-to-market P&L if the signal book were "
-            "held continuously (backtest-style, v6.5 costs).  "
-            "Differences come from execution timing, fill prices vs closes, "
-            "and discrete trade rounding."
-        )
         st.caption(FRAMING_CAPTION)
     else:
-        st.warning(
-            "No equity data yet — both pnl_log and close data are empty. "
-            "Run the signal & execution crons to populate."
-        )
+        st.info("No fills recorded yet — pnl_log is empty. Run the execution cron to populate.")
 
     st.markdown("---")
 

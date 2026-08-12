@@ -274,9 +274,13 @@ def _render_panel_m(nav: float, proposed_rows: list[dict]) -> None:
             }, index=close.index).dropna()
 
             # Rolling factor regression: 252d window through t-1
-            betas, r2, explained, residual = rolling_factor_regression(
+            reg_result = rolling_factor_regression(
                 book_ret, factor_rets, window=252,
             )
+            betas = reg_result.betas
+            r2 = reg_result.r_squared
+            explained = reg_result.beta_explained
+            residual = reg_result.residual
 
             if betas is not None and len(betas) > 0:
                 latest_betas = betas.iloc[-1] if len(betas) > 0 else None

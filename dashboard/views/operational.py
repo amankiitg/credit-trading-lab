@@ -379,7 +379,7 @@ def render(
     if not df_trade.empty:
         df_trade["risk status"] = risk_columns
 
-    # Warning banner for non-NORMAL states
+    # Warning banner for non-NORMAL states (from proposed trades AND from live stop_states)
     prefix = "ADVISORY (not traded) — " if advisory else ""
     if non_normal:
         lines = []
@@ -395,7 +395,29 @@ def render(
             "\n\n".join(lines)
         )
     elif stop_states_raw:
-        st.success(f"{prefix}All positions NORMAL — no stop states active.")
+        # Also check stop_states for non-normal states not in proposed trade table
+        live_non_normal = [
+            r for r in stop_states_raw
+            if r.get("state", "NORMAL") not in ("NORMAL", "None", None, "")
+        ]
+        if live_non_normal:
+            lines = []
+            for r in live_non_normal:
+                t = r["ticker"]
+                s = r.get("state", "NORMAL")
+                z_val = r.get("z")
+                z_info = f", z={z_val:.2f}" if z_val is not None else ""
+                if s == "REDUCED":
+                    recovery = "z ≥ -1.0 restores NORMAL"
+                else:
+                    recovery = "z ≥ -2.0 restores REDUCED"
+                lines.append(f"**{t}**: {s}{z_info} → {recovery}")
+            st.warning(
+                f"{prefix}**{len(live_non_normal)} ticker(s) in drawdown (live stop_states):**\n\n" +
+                "\n\n".join(lines)
+            )
+        else:
+            st.success(f"{prefix}All positions NORMAL — no stop states active.")
 
     if not df_trade.empty and "action" in df_trade.columns:
         st.dataframe(

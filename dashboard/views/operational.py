@@ -454,37 +454,88 @@ def render(
     st.markdown("---")
 
     # ================================================================
-    # Panel K -- NAV Tracker (cumulative P&L anchored to live NAV)
+    # Panel K -- NAV Tracker (factor-colored, anchored to live NAV)
     # ================================================================
     st.markdown("### K - NAV Tracker")
     pnl_rows = fetch_pnl_log()
-    if pnl_rows:
+    attr_all = fetch_live_attribution(limit=500)  # full history for cumulative
+    FACTOR_COLORS = {"equity": "#3498db", "rates": "#2ecc71", "credit": "#e74c3c",
+                     "commodity": "#f39c12"}
+
+    if pnl_rows and attr_all:
+        import matplotlib.pyplot as plt
+        import matplotlib.dates as mdates
+        import numpy as np
+
+        df_pnl = pd.DataFrame(pnl_rows).sort_values("trade_date")
+        df_pnl["cumulative_net_pnl"] = df_pnl["net_pnl"].cumsum()
+
+        # Anchor to live NAV
+        cumulative_now = df_pnl["cumulative_net_pnl"].iloc[-1]
+        starting_nav = nav - cumulative_now
+
+        # Factor breakdown over time from live_attribution
+        df_attr = pd.DataFrame(attr_all)
+        if "asset_class" in df_attr.columns and "run_date" in df_attr.columns:
+            factor_pnl = df_attr.groupby(["run_date", "asset_class"])["net_pnl"].sum().unstack(fill_value=0)
+            factor_pnl = factor_pnl.sort_index()
+            factor_cum = factor_pnl.cumsum()
+
+            fig, ax = plt.subplots(figsize=(14, 3.5))
+            dates = pd.to_datetime(factor_cum.index)
+            classes = [c for c in ["equity", "rates", "credit", "commodity"] if c in factor_cum.columns]
+
+            # Stacked area by factor
+            y_stack = np.zeros(len(dates))
+            for cls in classes:
+                vals = factor_cum[cls].values + starting_nav / len(classes)  # distribute starting NAV
+                # Better: anchor each factor's cumulative to its share of starting NAV
+                ax.fill_between(dates, y_stack + starting_nav, y_stack + starting_nav + factor_cum[cls].values,
+                                alpha=0.7, color=FACTOR_COLORS.get(cls, "#95a5a6"),
+                                label=cls.capitalize())
+                y_stack += factor_cum[cls].values
+
+            # Total NAV line on top
+            nav_series = starting_nav + df_pnl.set_index("trade_date")["cumulative_net_pnl"]
+            nav_series = nav_series.reindex(factor_cum.index)
+            ax.plot(dates, nav_series.values, color="black", lw=1.5, label="Total NAV")
+
+            ax.axhline(starting_nav, color="gray", lw=0.5, ls="--", alpha=0.5)
+            ax.set_title("NAV by Factor (stacked cumulative P&L per asset class)")
+            ax.set_ylabel("$")
+            ax.legend(fontsize=8, loc="upper left")
+            ax.grid(alpha=0.2)
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d"))
+            fig.tight_layout()
+            st.pyplot(fig, width="stretch")
+            plt.close(fig)
+            st.caption(f"Current NAV: ${nav:,.0f}  |  Starting NAV (inferred): ${starting_nav:,.0f}")
+        else:
+            st.info("live_attribution missing asset_class column — showing total only.")
+    elif pnl_rows:
+        # Fallback: total NAV only
         import matplotlib.pyplot as plt
         import matplotlib.dates as mdates
         df_pnl = pd.DataFrame(pnl_rows).sort_values("trade_date")
         df_pnl["cumulative_net_pnl"] = df_pnl["net_pnl"].cumsum()
-
-        # Anchor to live NAV: starting NAV = current NAV - cumulative P&L
         cumulative_now = df_pnl["cumulative_net_pnl"].iloc[-1]
         starting_nav = nav - cumulative_now
         df_pnl["nav_series"] = starting_nav + df_pnl["cumulative_net_pnl"]
 
         fig, ax = plt.subplots(figsize=(14, 3))
         ax.fill_between(pd.to_datetime(df_pnl["trade_date"]), starting_nav,
-                         df_pnl["nav_series"],
-                         color="#1b5e8a", alpha=0.15)
+                         df_pnl["nav_series"], color="#1b5e8a", alpha=0.15)
         ax.plot(pd.to_datetime(df_pnl["trade_date"]), df_pnl["nav_series"],
                 color="#1b5e8a", lw=2.0, marker="o", markersize=3)
-        ax.axhline(starting_nav, color="gray", lw=0.5, ls="--", label=f"Starting NAV ${starting_nav:,.0f}")
-        ax.legend(fontsize=8)
-        ax.set_title("Account NAV (live NAV anchored to cumulative P&L)")
+        ax.axhline(starting_nav, color="gray", lw=0.5, ls="--")
+        ax.set_title("Account NAV (no factor breakdown available)")
         ax.set_ylabel("$")
         ax.grid(alpha=0.2)
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d"))
         fig.tight_layout()
         st.pyplot(fig, width="stretch")
         plt.close(fig)
-        st.caption(f"Current NAV: ${nav:,.0f}  |  Starting NAV (inferred): ${starting_nav:,.0f}")
+        st.caption(f"Current NAV: ${nav:,.0f}  |  Starting NAV: ${starting_nav:,.0f}")
     else:
         st.info("No P&L data yet — NAV tracker will appear after fills.")
 

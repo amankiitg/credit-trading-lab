@@ -42,12 +42,14 @@ def _get_stop_states() -> list[dict]:
 
 
 @st.cache_data(ttl=3600)
-def _get_mtm_equity() -> tuple[pd.Series, pd.Series, float] | None:
-    """Compute mark-to-market equity curve from signal weights + close prices.
+def _get_mtm_equity(nav: float = 100_000.0) -> tuple[pd.Series, pd.Series, float] | None:
+    """Compute mark-to-market equity curve scaled to the live NAV.
+
+    Runs the v8.2 signal pipeline at $1M reference notional, then scales
+    dollar P&L proportionally so GMV ≈ 2× NAV (the strategy's typical
+    gross leverage).  Keeps the curve apples-to-apples with realized P&L.
 
     Returns (equity_mtm, daily_pnl_mtm, gmv_latest) or None if data unavailable.
-    Wrapped broadly: Render's web service has no yfinance cache on disk, and
-    the cron services write to Supabase, not the web filesystem.
     """
     try:
         from signals.etf_universe import load_universe_close
@@ -60,18 +62,24 @@ def _get_mtm_equity() -> tuple[pd.Series, pd.Series, float] | None:
         from backtest.multi_asset import run_multi_asset
         from execution.costs import CostParams
 
+        REF_NOTIONAL = 1_000_000.0
         close = load_universe_close()
         tidy = compute_trend(close, L=120, long_short=True, k_dead_zone=0.5)
         desired = to_position_matrix(tidy)
         held = apply_rebalance_control(desired, rebal_freq=1, band_pct=0.20)
         target = shift_to_next_day(held)
 
-        result = run_multi_asset(target, close, notional=1_000_000.0, cost_params=CostParams())
+        result = run_multi_asset(target, close, notional=REF_NOTIONAL, cost_params=CostParams())
+
+        # Scale to live NAV so GMV makes sense vs the actual account
+        scale = nav / REF_NOTIONAL if REF_NOTIONAL > 0 else 1.0
+        equity_mtm = result.equity * scale
+        daily_pnl_mtm = result.daily_pnl * scale
 
         latest_target = target.iloc[-1]
-        gmv = float(latest_target.abs().sum() * 1_000_000.0)
+        gmv = float(latest_target.abs().sum() * nav)
 
-        return result.equity, result.daily_pnl, gmv
+        return equity_mtm, daily_pnl_mtm, gmv
     except Exception:
         return None
 
@@ -518,7 +526,7 @@ def render(
     st.markdown("### I - Equity Curve — Realized + Mark-to-Market")
 
     pnl_rows = fetch_pnl_log()
-    mtm_data = _get_mtm_equity()
+    mtm_data = _get_mtm_equity(nav)
 
     # --- GMV & NAV summary row ---
     col_gmv, col_nav, col_unreal = st.columns(3)

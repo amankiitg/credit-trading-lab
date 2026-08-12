@@ -454,7 +454,7 @@ def render(
     st.markdown("---")
 
     # ================================================================
-    # Panel K -- NAV Tracker (cumulative P&L)
+    # Panel K -- NAV Tracker (cumulative P&L anchored to live NAV)
     # ================================================================
     st.markdown("### K - NAV Tracker")
     pnl_rows = fetch_pnl_log()
@@ -464,20 +464,27 @@ def render(
         df_pnl = pd.DataFrame(pnl_rows).sort_values("trade_date")
         df_pnl["cumulative_net_pnl"] = df_pnl["net_pnl"].cumsum()
 
+        # Anchor to live NAV: starting NAV = current NAV - cumulative P&L
+        cumulative_now = df_pnl["cumulative_net_pnl"].iloc[-1]
+        starting_nav = nav - cumulative_now
+        df_pnl["nav_series"] = starting_nav + df_pnl["cumulative_net_pnl"]
+
         fig, ax = plt.subplots(figsize=(14, 3))
-        ax.fill_between(pd.to_datetime(df_pnl["trade_date"]), 0,
-                         df_pnl["cumulative_net_pnl"],
+        ax.fill_between(pd.to_datetime(df_pnl["trade_date"]), starting_nav,
+                         df_pnl["nav_series"],
                          color="#1b5e8a", alpha=0.15)
-        ax.plot(pd.to_datetime(df_pnl["trade_date"]), df_pnl["cumulative_net_pnl"],
+        ax.plot(pd.to_datetime(df_pnl["trade_date"]), df_pnl["nav_series"],
                 color="#1b5e8a", lw=2.0, marker="o", markersize=3)
-        ax.axhline(0, color="black", lw=0.5)
-        ax.set_title("Cumulative Net P&L (NAV change from fills)")
+        ax.axhline(starting_nav, color="gray", lw=0.5, ls="--", label=f"Starting NAV ${starting_nav:,.0f}")
+        ax.legend(fontsize=8)
+        ax.set_title("Account NAV (live NAV anchored to cumulative P&L)")
         ax.set_ylabel("$")
         ax.grid(alpha=0.2)
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d"))
         fig.tight_layout()
         st.pyplot(fig, width="stretch")
         plt.close(fig)
+        st.caption(f"Current NAV: ${nav:,.0f}  |  Starting NAV (inferred): ${starting_nav:,.0f}")
     else:
         st.info("No P&L data yet — NAV tracker will appear after fills.")
 

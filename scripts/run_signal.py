@@ -91,9 +91,8 @@ def main() -> int:
         shift_to_next_day,
         to_position_matrix,
     )
-    desired = to_position_matrix(
-        compute_trend(close, L=120, long_short=True, k_dead_zone=0.5)
-    )
+    tidy = compute_trend(close, L=120, long_short=True, k_dead_zone=0.5)
+    desired = to_position_matrix(tidy)
     held = apply_rebalance_control(desired, rebal_freq=1, band_pct=0.20)
     target = shift_to_next_day(held)
     weights = target.iloc[-1]

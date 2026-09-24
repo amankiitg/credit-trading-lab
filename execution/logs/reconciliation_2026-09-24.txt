@@ -1,0 +1,71 @@
+
+A module that was compiled using NumPy 1.x cannot be run in
+NumPy 2.2.6 as it may crash. To support both 1.x and 2.x
+versions of NumPy, modules must be compiled with NumPy 2.0.
+Some module may need to rebuild instead e.g. with 'pybind11>=2.12'.
+
+If you are a user of the module, the easiest solution will be to
+downgrade to 'numpy<2' or try to upgrade the affected module.
+We expect that some modules will need time to support NumPy 2.
+
+Traceback (most recent call last):  File "/Users/amankesarwani/PycharmProjects/credit-trading-lab/scripts/sync_positions_from_alpaca.py", line 167, in <module>
+    sys.exit(main())
+  File "/Users/amankesarwani/PycharmProjects/credit-trading-lab/scripts/sync_positions_from_alpaca.py", line 58, in main
+    from execution.alpaca_paper import (
+  File "/Users/amankesarwani/PycharmProjects/credit-trading-lab/execution/alpaca_paper.py", line 32, in <module>
+    from alpaca.trading.client import TradingClient
+  File "/Users/amankesarwani/miniconda3/lib/python3.10/site-packages/alpaca/trading/__init__.py", line 1, in <module>
+    from alpaca.trading.client import *
+  File "/Users/amankesarwani/miniconda3/lib/python3.10/site-packages/alpaca/trading/client.py", line 31, in <module>
+    from alpaca.trading.requests import (
+  File "/Users/amankesarwani/miniconda3/lib/python3.10/site-packages/alpaca/trading/requests.py", line 4, in <module>
+    import pandas as pd
+  File "/Users/amankesarwani/miniconda3/lib/python3.10/site-packages/pandas/__init__.py", line 49, in <module>
+    from pandas.core.api import (
+  File "/Users/amankesarwani/miniconda3/lib/python3.10/site-packages/pandas/core/api.py", line 28, in <module>
+    from pandas.core.arrays import Categorical
+  File "/Users/amankesarwani/miniconda3/lib/python3.10/site-packages/pandas/core/arrays/__init__.py", line 1, in <module>
+    from pandas.core.arrays.arrow import ArrowExtensionArray
+  File "/Users/amankesarwani/miniconda3/lib/python3.10/site-packages/pandas/core/arrays/arrow/__init__.py", line 5, in <module>
+    from pandas.core.arrays.arrow.array import ArrowExtensionArray
+  File "/Users/amankesarwani/miniconda3/lib/python3.10/site-packages/pandas/core/arrays/arrow/array.py", line 53, in <module>
+    from pandas.core import (
+  File "/Users/amankesarwani/miniconda3/lib/python3.10/site-packages/pandas/core/ops/__init__.py", line 8, in <module>
+    from pandas.core.ops.array_ops import (
+  File "/Users/amankesarwani/miniconda3/lib/python3.10/site-packages/pandas/core/ops/array_ops.py", line 56, in <module>
+    from pandas.core.computation import expressions
+  File "/Users/amankesarwani/miniconda3/lib/python3.10/site-packages/pandas/core/computation/expressions.py", line 21, in <module>
+    from pandas.core.computation.check import NUMEXPR_INSTALLED
+  File "/Users/amankesarwani/miniconda3/lib/python3.10/site-packages/pandas/core/computation/check.py", line 5, in <module>
+    ne = import_optional_dependency("numexpr", errors="warn")
+  File "/Users/amankesarwani/miniconda3/lib/python3.10/site-packages/pandas/compat/_optional.py", line 135, in import_optional_dependency
+    module = importlib.import_module(name)
+  File "/Users/amankesarwani/miniconda3/lib/python3.10/importlib/__init__.py", line 126, in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+  File "/Users/amankesarwani/miniconda3/lib/python3.10/site-packages/numexpr/__init__.py", line 24, in <module>
+    from numexpr.interpreter import MAX_THREADS, use_vml, __BLOCK_SIZE1__
+AttributeError: _ARRAY_API not found
+2026-09-24 11:15:07,915 INFO: live NAV from Alpaca: 101089.45
+2026-09-24 11:15:07,915 INFO: live NAV from Alpaca: $101089.45
+2026-09-24 11:15:08,603 INFO: HTTP Request: GET https://omnsjnosbaiqkrmnknqw.supabase.co/rest/v1/positions?select=trade_date&order=trade_date.desc&limit=1 "HTTP/2 200 OK"
+2026-09-24 11:15:08,873 INFO: HTTP Request: GET https://omnsjnosbaiqkrmnknqw.supabase.co/rest/v1/positions?select=%2A&trade_date=eq.2026-09-23&order=ticker.asc "HTTP/2 200 OK"
+2026-09-24 11:15:08,874 INFO: cached snapshot: trade_date=2026-09-23 (8 rows)
+2026-09-24 11:15:08,874 INFO: reconciliation diff for 2026-09-24 (live minus cached):
+2026-09-24 11:15:08,874 INFO:   ticker     Alpaca(live)   Supabase(cached)           diff  material
+2026-09-24 11:15:08,874 INFO:   SPY           27,364.86          27,572.80        -207.94  no
+2026-09-24 11:15:08,874 INFO:   EFA           26,324.39          26,158.64         165.76  no
+2026-09-24 11:15:08,874 INFO:   EEM           15,556.06          15,468.69          87.36  no
+2026-09-24 11:15:08,874 INFO:   TLT          -27,381.69         -27,411.54          29.85  no
+2026-09-24 11:15:08,874 INFO:   IEF          -27,150.10         -27,153.00           2.90  no
+2026-09-24 11:15:08,874 INFO:   HYG           28,309.03          28,149.18         159.85  no
+2026-09-24 11:15:08,874 INFO:   LQD          -26,375.92         -26,587.58         211.65  no
+2026-09-24 11:15:08,874 INFO:   GLD          -20,628.66         -20,810.98         182.32  no
+2026-09-24 11:15:08,874 INFO: 0 of 8 tickers differ by at least DELTA_MIN_NOTIONAL ($250)
+2026-09-24 11:15:09,237 INFO: HTTP Request: POST https://omnsjnosbaiqkrmnknqw.supabase.co/rest/v1/settings "HTTP/2 200 OK"
+2026-09-24 11:15:09,238 INFO: updated live_nav in Supabase: 101089.45
+2026-09-24 11:15:09,386 INFO: HTTP Request: POST https://omnsjnosbaiqkrmnknqw.supabase.co/rest/v1/positions?columns=%22signed_notional%22%2C%22side%22%2C%22ticker%22%2C%22weight%22%2C%22trade_date%22 "HTTP/2 201 Created"
+2026-09-24 11:15:09,387 INFO: wrote 8 position rows to Supabase for 2026-09-24
+2026-09-24 11:15:09,723 INFO: HTTP Request: GET https://omnsjnosbaiqkrmnknqw.supabase.co/rest/v1/positions?select=trade_date&order=trade_date.desc&limit=1 "HTTP/2 200 OK"
+2026-09-24 11:15:09,861 INFO: HTTP Request: GET https://omnsjnosbaiqkrmnknqw.supabase.co/rest/v1/positions?select=%2A&trade_date=eq.2026-09-24&order=ticker.asc "HTTP/2 200 OK"
+2026-09-24 11:15:09,862 INFO: verified: Supabase matches Alpaca on 8 tickers (max residual $0.0000)
+2026-09-24 11:15:09,862 INFO: sync complete. Panel H and J will refresh within 5 minutes (cache TTL).

@@ -302,6 +302,26 @@ def fetch_live_attribution(run_date: str | None = None, limit: int = 50) -> list
         return []
 
 
+# ---------------------------------------------------------------- rejection audit
+
+def write_order_rejections(rows: list[dict]) -> bool:
+    """Append rows to order_rejections: every leg that never became an order.
+
+    Append-only on purpose. Alpaca does not persist a submit-time rejection as
+    an order record, so this table is the only durable audit trail for those
+    legs, and a row must never be overwritten by a later run.
+    """
+    client = get_supabase_client()
+    if client is None or not rows:
+        return False
+    try:
+        client.table("order_rejections").insert(rows).execute()
+        return True
+    except Exception as exc:
+        _log.error("write_order_rejections failed: %s", exc)
+        return False
+
+
 # ---------------------------------------------------------------- cron run log (idempotency)
 
 def check_cron_run(job_name: str, run_date: str) -> bool:

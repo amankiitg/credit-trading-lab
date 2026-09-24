@@ -12,11 +12,20 @@ What it does:
   5. Connect to Alpaca paper account.
   6. Get live NAV, current positions, run v8.2 signal.
   7. Compute delta orders, apply guards (with live NAV).
-  8. Submit orders: longs via notional, shorts via whole-share qty.
-  9. Poll fills, build fill records, mark costs.
+  7b. Pre-check the Alpaca shortable flag for any name the signal wants short.
+      A non-shortable name has its sell_to_open leg skipped and logged; legs
+      that reduce an existing position still go through.
+  8. Submit orders one leg at a time: longs via notional, shorts via whole-share
+      qty. A rejected leg is classified, logged with a reason code, and skipped,
+      so one bad order cannot abort the run. A transport failure (unknown
+      submission state) halts submission cleanly instead.
+  9. Poll fills, build fill records, mark costs. Persist every rejected or
+      skipped leg to Supabase order_rejections, which is the only durable audit
+      trail for a leg Alpaca never saw.
   10. Close any dust positions.
   11. Reconcile. Run feed_attribution. Write fills to Supabase.
-  12. Record completed run in cron_runs.
+  12. Record the completed run in cron_runs. A halted run is deliberately NOT
+      recorded so the next tick retries the legs that never landed.
 
 Env vars required:
   SUPABASE_URL, SUPABASE_SECRET_KEY
@@ -90,6 +99,7 @@ def main() -> int:
         set_setting,
         write_cron_run,
         write_live_attribution,
+        write_order_rejections,
         write_pnl_log,
         write_positions,
     )
@@ -119,17 +129,21 @@ def main() -> int:
     # -- 5. Connect to Alpaca
     from execution.alpaca_paper import (
         DRY_RUN_DEFAULT,
+        apply_shortable_filter,
+        build_fill_records,
+        build_rejection_rows,
         close_dust_positions,
         compute_delta_orders,
         apply_guards,
-        build_fill_records,
         connect,
         feed_attribution,
         get_current_positions,
         get_live_nav,
+        get_shortable_flags,
         mark_costs,
         poll_fills,
         reconcile,
+        shorts_requiring_check,
         submit_orders,
     )
 
@@ -158,6 +172,46 @@ def main() -> int:
         current_notionals = get_current_positions(client, dry_run=dry_run)
     logger.info("current positions: %s", current_notionals)
 
+    # -- 6b. Drift check: does the frozen Supabase snapshot above still match
+    #        the real Alpaca account? Delta orders are computed from the
+    #        snapshot on purpose (P4: execute exactly what Panel H showed at
+    #        approval time), so a divergence here would otherwise compute
+    #        deltas against a phantom book with no visible signal. Alert
+    #        only — execution below still uses current_notionals as-is.
+    from execution.alpaca_paper import check_position_drift
+    drift = check_position_drift(client, current_notionals, dry_run=dry_run)
+    if drift:
+        logger.warning(
+            "POSITION DRIFT: cached (Supabase) vs live (Alpaca) disagree for %d ticker(s): %s",
+            len(drift), {t: round(d["diff"], 2) for t, d in drift.items()},
+        )
+        set_setting("position_drift_alert", json.dumps({
+            "detected_at": today,
+            "detail": {
+                t: {k: round(v, 2) for k, v in d.items()} for t, d in drift.items()
+            },
+        }))
+
+        from execution.alerts import send_alert_email
+        drift_lines = "\n".join(
+            f"  {t}: cached ${d['cached']:,.2f}  live ${d['live']:,.2f}  diff ${d['diff']:,.2f}"
+            for t, d in drift.items()
+        )
+        send_alert_email(
+            subject=f"[credit-trading-lab] Position drift detected for {today}",
+            body=(
+                f"The cached position snapshot disagreed with live Alpaca "
+                f"positions before today's run_execution computed deltas:\n\n"
+                f"{drift_lines}\n\n"
+                f"This run still executed against the cached (pre-drift) "
+                f"snapshot, per the frozen-snapshot execution design -- see "
+                f"Panel H on the dashboard for the corrected current state "
+                f"and full context."
+            ),
+        )
+    else:
+        set_setting("position_drift_alert", "")
+
     # -- Run v8.2 signal only if not already loaded from Supabase
     if not target_weights:
         from signals.etf_universe import load_universe_close
@@ -183,26 +237,71 @@ def main() -> int:
     orders = compute_delta_orders(target_weights, current_notionals, paper_nav=nav)
     guarded = apply_guards(orders, dry_run=dry_run, _nav=nav)
 
+    # -- 7b. Shortability pre-check, live, before anything is submitted.
+    #        Only sell_to_open legs can be affected: buy_to_close (reduce a
+    #        short) and sell_to_close (reduce a long) must still go through, so
+    #        a broker restriction on opening shorts never traps an existing one.
+    #        A skipped leg is logged and persisted to order_rejections.
+    if not dry_run:
+        check_tickers = shorts_requiring_check(guarded)
+        if check_tickers:
+            shortable = get_shortable_flags(client, check_tickers)
+            logger.info("shortable flags: %s", shortable)
+            guarded = apply_shortable_filter(guarded, shortable)
+
     pending_count = sum(1 for o in guarded if o.guard_status == "PENDING")
     logger.info(
-        "orders: %d total, %d pending, %d rejected",
+        "orders: %d total, %d pending, %d blocked before submit",
         len(guarded), pending_count, len(guarded) - pending_count,
     )
 
-    # -- 8. Submit orders (longs notional, shorts whole-share qty)
-    submitted_ids = submit_orders(client, guarded, close_prices=close_prices)
+    # -- 8. Submit orders one leg at a time (longs notional, shorts whole-share
+    #       qty). A rejected leg is classified, logged, and skipped; the run
+    #       continues through the remaining legs so one bad order cannot strand a
+    #       partial book. A transport failure halts submission and is turned into
+    #       a clean halt below, never an unhandled traceback.
+    outcomes = submit_orders(client, guarded, close_prices=close_prices)
+    run_halted = any(o.halts_run for o in outcomes)
+    halted_legs = sum(1 for o in outcomes if o.halts_run)
+    if run_halted:
+        logger.error(
+            "submission halted: %d leg(s) failed with unknown state; remaining "
+            "legs were not attempted. State will be written and cron_runs left "
+            "unrecorded so the next tick retries.",
+            halted_legs,
+        )
 
     # -- 9. Poll fills
-    real_ids = [oid for oid in submitted_ids if oid not in ("", "SKIPPED_QTY_ZERO")]
+    real_ids = [o.order_id for o in outcomes if o.submitted and o.order_id]
     fill_data = poll_fills(client, real_ids) if real_ids else {}
 
-    fills = build_fill_records(guarded, submitted_ids, fill_data)
+    fills = build_fill_records(guarded, outcomes, fill_data)
 
     # Mark costs using post-execution short notionals
     short_notionals = {
         t: abs(n) for t, n in current_notionals.items() if n < 0
     }
     fills = mark_costs(fills, current_short_notionals=short_notionals)
+
+    # -- 9b. Persist the rejection audit trail. This is the ONLY durable record
+    #        of a leg that never became an order: Alpaca keeps nothing for a
+    #        submit-time rejection, and this box's filesystem is ephemeral.
+    rejection_rows = build_rejection_rows(fills, run_date=date.fromisoformat(today))
+    if rejection_rows:
+        if write_order_rejections(rejection_rows):
+            logger.info(
+                "order_rejections: persisted %d leg(s): %s",
+                len(rejection_rows),
+                [(r["ticker"], r["reason_code"]) for r in rejection_rows],
+            )
+        else:
+            logger.error(
+                "order_rejections write FAILED for %d leg(s) -- the local "
+                "reconciliation JSON is the only remaining record",
+                len(rejection_rows),
+            )
+    else:
+        logger.info("order_rejections: no rejected or skipped legs this run")
 
     # -- 10. Dust cleanup
     dust_closed = close_dust_positions(client, dry_run=dry_run)
@@ -279,7 +378,17 @@ def main() -> int:
         "borrow_cost": 0.0,
     })
 
-    # -- 12. Record run
+    # -- 12. Record run. A halted run is deliberately NOT recorded: cron_runs is
+    #        the idempotency gate, so leaving it unwritten lets the next tick
+    #        retry the legs that never landed.
+    if run_halted:
+        logger.error(
+            "run_execution HALTED cleanly for %s: state written to Supabase, "
+            "cron_runs not recorded so the next tick retries",
+            today,
+        )
+        return 2
+
     record_run("run_execution", today)
     logger.info("run_execution complete for %s", today)
     return 0

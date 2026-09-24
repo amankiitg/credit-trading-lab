@@ -22,20 +22,33 @@ import pytest
 from execution.alpaca_paper import (
     DELTA_MIN_NOTIONAL,
     DUST_THRESHOLD_USD,
+    GUARD_SKIPPED_NOT_SHORTABLE,
     MAX_ORDERS_PER_RUN,
     MAX_POSITION_PCT_OF_NAV,
     MAX_TRADED_NOTIONAL_PER_RUN,
     PAPER_NAV_DEFAULT,
+    REASON_ALPACA_ERROR,
+    REASON_NOT_SHORTABLE_AT_SUBMIT,
+    REASON_QTY_ZERO,
+    REASON_SKIPPED_AFTER_HALT,
+    REASON_SUBMIT_EXCEPTION,
     FillRecord,
     OrderSpec,
+    SubmitOutcome,
     apply_guards,
+    apply_shortable_filter,
     build_fill_records,
+    build_rejection_rows,
+    classify_submit_failure,
     close_dust_positions,
     compute_delta_orders,
+    diff_positions,
     feed_attribution,
     get_live_nav,
+    get_shortable_flags,
     mark_costs,
     reconcile,
+    shorts_requiring_check,
     submit_orders,
 )
 from execution.costs import CostParams
@@ -676,7 +689,10 @@ def test_short_submit_uses_qty() -> None:
     assert "qty" in call_kwargs, f"Expected qty in call kwargs, got: {call_kwargs}"
     assert call_kwargs["qty"] == 15, f"Expected qty=15, got {call_kwargs['qty']}"
     assert "notional" not in call_kwargs, "notional must not appear for short orders"
-    assert result == ["test-order-id"]
+    assert len(result) == 1
+    assert result[0].order_id == "test-order-id"
+    assert result[0].status == "SUBMITTED"
+    assert result[0].reason_code == ""
 
 
 def test_long_submit_uses_notional() -> None:
@@ -706,11 +722,14 @@ def test_long_submit_uses_notional() -> None:
     call_kwargs = mock_req_cls.call_args[1]
     assert "notional" in call_kwargs, f"Expected notional in kwargs, got: {call_kwargs}"
     assert "qty" not in call_kwargs, "qty must not appear for long orders"
-    assert result == ["long-order"]
+    assert len(result) == 1
+    assert result[0].order_id == "long-order"
+    assert result[0].status == "SUBMITTED"
 
 
 def test_qty_zero_skipped() -> None:
-    """When floor(notional/price)=0, the order is skipped with SKIPPED_QTY_ZERO sentinel."""
+    """When floor(notional/price)=0, the leg is skipped with a QTY_ROUNDS_TO_ZERO
+    reason code and nothing is submitted."""
     from unittest.mock import patch, MagicMock
     import execution.alpaca_paper as ap_mod
 
@@ -729,7 +748,10 @@ def test_qty_zero_skipped() -> None:
 
         result = submit_orders(mock_client, [spec], close_prices=close_prices)
 
-    assert result == ["SKIPPED_QTY_ZERO"]
+    assert len(result) == 1
+    assert result[0].status == "SKIPPED"
+    assert result[0].reason_code == REASON_QTY_ZERO
+    assert result[0].order_id == ""
     mock_client.submit_order.assert_not_called()
 
 
@@ -806,6 +828,122 @@ def test_non_universe_dust_ignored() -> None:
 
     assert closed == []
     mock_client.close_position.assert_not_called()
+
+
+# ---------------------------------------------------------------- position drift check
+
+def test_drift_detected_when_live_disagrees_with_cache() -> None:
+    """Live Alpaca positions differing from the cached snapshot by more than
+    DELTA_MIN_NOTIONAL are flagged, with cached/live/diff for each ticker."""
+    from alpaca.trading.enums import PositionSide
+
+    from execution.alpaca_paper import check_position_drift
+
+    spy_pos = MagicMock()
+    spy_pos.symbol = "SPY"
+    spy_pos.side = PositionSide.LONG
+    spy_pos.market_value = "0.00"  # broker actually flat
+
+    mock_client = MagicMock()
+    mock_client.get_all_positions.return_value = [spy_pos]
+
+    cached = {"SPY": 26_643.0}  # stale Supabase snapshot still shows a big position
+
+    drift = check_position_drift(mock_client, cached, dry_run=False)
+
+    assert "SPY" in drift
+    assert drift["SPY"]["cached"] == 26_643.0
+    assert drift["SPY"]["live"] == 0.0
+    assert drift["SPY"]["diff"] == pytest.approx(-26_643.0)
+
+
+def test_no_drift_when_live_matches_cache() -> None:
+    """No ticker is flagged when live positions agree with the cache."""
+    from alpaca.trading.enums import PositionSide
+
+    from execution.alpaca_paper import check_position_drift
+
+    hyg_pos = MagicMock()
+    hyg_pos.symbol = "HYG"
+    hyg_pos.side = PositionSide.LONG
+    hyg_pos.market_value = "293.90"
+
+    mock_client = MagicMock()
+    mock_client.get_all_positions.return_value = [hyg_pos]
+
+    cached = {"HYG": 293.90}
+
+    drift = check_position_drift(mock_client, cached, dry_run=False)
+    assert drift == {}
+
+
+def test_drift_check_skipped_in_dry_run() -> None:
+    """dry_run=True never calls Alpaca and always reports no drift."""
+    from execution.alpaca_paper import check_position_drift
+
+    mock_client = MagicMock()
+    drift = check_position_drift(mock_client, {"SPY": 26_643.0}, dry_run=True)
+
+    assert drift == {}
+    mock_client.get_all_positions.assert_not_called()
+
+
+def test_drift_below_threshold_not_flagged() -> None:
+    """A gap smaller than DELTA_MIN_NOTIONAL is normal day-to-day noise, not drift."""
+    from alpaca.trading.enums import PositionSide
+
+    from execution.alpaca_paper import DELTA_MIN_NOTIONAL, check_position_drift
+
+    lqd_pos = MagicMock()
+    lqd_pos.symbol = "LQD"
+    lqd_pos.side = PositionSide.LONG
+    lqd_pos.market_value = "27000.00"
+
+    mock_client = MagicMock()
+    mock_client.get_all_positions.return_value = [lqd_pos]
+
+    cached = {"LQD": 27_000.0 + (DELTA_MIN_NOTIONAL - 1)}
+
+    drift = check_position_drift(mock_client, cached, dry_run=False)
+    assert drift == {}
+
+
+# ---------------------------------------------------------------- full-universe reconciliation diff
+
+def test_diff_positions_reports_every_universe_ticker() -> None:
+    """Task 0 reconciliation: the diff must cover the whole book, not only the
+    gaps, so a stale cache stays visible even where the numbers happen to agree.
+    """
+    from execution.alpaca_paper import UNIVERSE as _UNIVERSE
+    from execution.alpaca_paper import diff_positions
+
+    live = {"SPY": 1000.0, "TLT": -2000.0}
+    cached = {"SPY": 900.0, "TLT": -2000.0}
+
+    rows = diff_positions(live, cached)
+
+    assert [r["ticker"] for r in rows] == list(_UNIVERSE)
+    by_ticker = {r["ticker"]: r for r in rows}
+    assert by_ticker["SPY"]["live"] == 1000.0
+    assert by_ticker["SPY"]["cached"] == 900.0
+    assert by_ticker["SPY"]["diff"] == pytest.approx(100.0)
+    assert by_ticker["TLT"]["diff"] == pytest.approx(0.0)
+    # a ticker absent from both sides appears as an explicit flat 0/0 row
+    assert by_ticker["GLD"]["live"] == 0.0
+    assert by_ticker["GLD"]["cached"] == 0.0
+
+
+def test_diff_positions_material_flag_uses_delta_min_notional() -> None:
+    """`material` marks rows the execution layer itself would treat as a real
+    position, so it reuses DELTA_MIN_NOTIONAL rather than a separate constant.
+    """
+    from execution.alpaca_paper import DELTA_MIN_NOTIONAL, diff_positions
+
+    below = diff_positions({"SPY": DELTA_MIN_NOTIONAL - 1.0}, {"SPY": 0.0})
+    assert below[0]["material"] is False
+
+    at = diff_positions({"SPY": DELTA_MIN_NOTIONAL}, {"SPY": 0.0})
+    assert at[0]["material"] is True
 
 
 # ---------------------------------------------------------------- T2: live NAV
@@ -895,6 +1033,7 @@ def test_feed_attribution_schema_match(tmp_path: Path) -> None:
         "date", "ticker", "asset_class", "weight", "pnl", "carry", "price_change",
         "gross_pnl", "net_pnl", "turnover_cost", "borrow_cost",
         "directional", "selection", "net_exposure", "beta_explained", "residual", "r_squared",
+        "backfilled",
     ]
 
     fill = FillRecord(
@@ -991,3 +1130,476 @@ def test_feed_attribution_appends_to_existing(tmp_path: Path) -> None:
     df = pd.read_parquet(parquet_path)
     assert len(df) == 2  # original + new
     assert set(df["ticker"]) == {"IEF", "GLD"}
+
+
+def test_feed_attribution_marks_backfilled_rows(tmp_path: Path) -> None:
+    """A reconstructed row must be distinguishable from a row written live."""
+    import pandas as pd
+
+    parquet_path = str(tmp_path / "attribution.parquet")
+    fill = FillRecord(
+        ticker="EFA",
+        order_id="oid-efa",
+        side="buy",
+        position_intent="buy_to_open",
+        intended_notional=475.28,
+        filled_notional=475.27,
+        fill_price=104.44,
+        simulated_cost=0.0951,
+        status="FILLED",
+        guard_status="PENDING",
+        backfilled=True,
+    )
+
+    feed_attribution(
+        [fill],
+        close_prices={"EFA": 104.06},
+        run_date=date(2026, 9, 24),
+        nav=101_013.45,
+        parquet_path=parquet_path,
+        backfilled=True,
+    )
+
+    df = pd.read_parquet(parquet_path)
+    assert bool(df.iloc[0]["backfilled"]) is True
+    assert df["backfilled"].dtype == bool
+
+
+# ================================================================
+# Sprint v9.2 -- run-level resilience (T1) and shortability (T2)
+#
+# Motivating live incident, 2026-09-24 14:31 UTC: 7 legs intended
+# (EFA, EEM, TLT, IEF, HYG, LQD, GLD), 5 filled, LQD rejected with
+# 42210000 "asset cannot be sold short", GLD never attempted, and no
+# state written back because the exception propagated out of main().
+# ================================================================
+
+# ---------------------------------------------------------------- T1: classification
+
+def test_classify_submit_failure_codes() -> None:
+    """A broker rejection is a per-leg fact; an unknown-state failure halts."""
+    from alpaca.common.exceptions import APIError
+
+    code, halts = classify_submit_failure(
+        APIError('{"code":42210000,"message":"asset LQD cannot be sold short"}')
+    )
+    assert code == REASON_NOT_SHORTABLE_AT_SUBMIT
+    assert halts is False
+
+    code, halts = classify_submit_failure(
+        APIError('{"code":40310000,"message":"insufficient qty available"}')
+    )
+    assert code == REASON_ALPACA_ERROR
+    assert halts is False
+
+    code, halts = classify_submit_failure(TimeoutError("read timed out"))
+    assert code == REASON_SUBMIT_EXCEPTION
+    assert halts is True
+
+
+# ---------------------------------------------------------------- T1: one bad leg cannot abort the book
+
+def _ok_order(order_id: str) -> MagicMock:
+    order = MagicMock()
+    order.id = order_id
+    return order
+
+
+def test_one_rejected_leg_does_not_abort_the_run() -> None:
+    """The exact 2026-09-24 shape: leg 1 is rejected, leg 2 must still be sent.
+
+    Before this change the rejection raised out of submit_orders and the whole
+    run died, which is why GLD was never attempted.
+    """
+    from alpaca.common.exceptions import APIError
+
+    spec_a = _pending_spec("LQD", "sell", 290.39, "sell_to_open", -26_877.96)
+    spec_b = _pending_spec("GLD", "sell", 580.74, "sell_to_open", -21_391.72)
+
+    mock_client = MagicMock()
+    mock_client.submit_order.side_effect = [
+        APIError('{"code":42210000,"message":"asset LQD cannot be sold short"}'),
+        _ok_order("gld-order-id"),
+    ]
+
+    outcomes = submit_orders(
+        mock_client, [spec_a, spec_b], close_prices={"LQD": 100.0, "GLD": 400.0}
+    )
+
+    assert len(outcomes) == 2, "one outcome per PENDING leg, no silent drops"
+    assert outcomes[0].status == "REJECTED"
+    assert outcomes[0].reason_code == REASON_NOT_SHORTABLE_AT_SUBMIT
+    assert outcomes[0].halts_run is False
+    assert "sold short" in outcomes[0].detail
+
+    assert outcomes[1].status == "SUBMITTED"
+    assert outcomes[1].order_id == "gld-order-id"
+    assert mock_client.submit_order.call_count == 2, "the run continued past the failure"
+
+
+def test_transport_failure_halts_remaining_legs() -> None:
+    """Unknown submission state stops the sequence and marks the rest un-attempted.
+
+    Continuing after a connection failure would stack more unknown state on top
+    of an unknown state, so the remaining legs are skipped by policy and
+    recorded, not silently dropped.
+    """
+    spec_a = _pending_spec("SPY", "buy", 5000.0, "buy_to_open", 5000.0)
+    spec_b = _pending_spec("LQD", "sell", 290.39, "sell_to_open", -26_877.96)
+
+    mock_client = MagicMock()
+    mock_client.submit_order.side_effect = ConnectionError("connection reset by peer")
+
+    outcomes = submit_orders(mock_client, [spec_a, spec_b], close_prices={"LQD": 100.0})
+
+    assert outcomes[0].status == "UNKNOWN"
+    assert outcomes[0].reason_code == REASON_SUBMIT_EXCEPTION
+    assert outcomes[0].halts_run is True
+    assert outcomes[1].status == "NOT_ATTEMPTED"
+    assert outcomes[1].reason_code == REASON_SKIPPED_AFTER_HALT
+    assert mock_client.submit_order.call_count == 1, "must not keep submitting blind"
+
+
+def test_build_fill_records_raises_when_a_leg_has_no_outcome() -> None:
+    """P1: a PENDING leg with no outcome must raise, never vanish."""
+    spec = _pending_spec("SPY", "buy", 1000.0, "buy_to_open", 1000.0)
+    with pytest.raises(ValueError, match="silently dropped"):
+        build_fill_records([spec], [], {})
+
+
+def test_build_rejection_rows_audits_only_rejected_legs() -> None:
+    """Every rejected or skipped leg reaches the Supabase audit table."""
+    fills = [
+        FillRecord(
+            "LQD", "", "sell", "sell_to_open", 290.39, 0.0, 0.0, 0.0,
+            "REJECTED", "PENDING", leg=1,
+            reason_code=REASON_NOT_SHORTABLE_AT_SUBMIT,
+            detail="APIError: asset LQD cannot be sold short",
+        ),
+        FillRecord(
+            "GLD", "", "sell", "sell_to_open", 580.74, 0.0, 0.0, 0.0,
+            "NOT_ATTEMPTED", "PENDING", leg=1,
+            reason_code=REASON_SKIPPED_AFTER_HALT,
+        ),
+        FillRecord(
+            "EFA", "oid-efa", "buy", "buy_to_open", 475.28, 475.28, 104.0, 0.05,
+            "FILLED", "PENDING",
+        ),
+    ]
+
+    rows = build_rejection_rows(fills, run_date=date(2026, 9, 24))
+
+    assert len(rows) == 2, "a leg that reached Alpaca is already auditable there"
+    assert {r["ticker"] for r in rows} == {"LQD", "GLD"}
+    lqd = next(r for r in rows if r["ticker"] == "LQD")
+    assert lqd["reason_code"] == REASON_NOT_SHORTABLE_AT_SUBMIT
+    assert lqd["run_date"] == "2026-09-24"
+    assert lqd["detail"] == "APIError: asset LQD cannot be sold short"
+    assert lqd["backfilled"] is False
+
+
+# ---------------------------------------------------------------- T2: shortability policy
+
+def test_shortable_filter_skips_only_sell_to_open() -> None:
+    """Task 2 policy: block opening or growing a short, never reducing one."""
+    orders = [
+        _pending_spec("LQD", "sell", 290.0, "sell_to_open", -26_877.96),
+        _pending_spec("HYG", "buy", 300.0, "buy_to_close", -28_000.0),
+        _pending_spec("IEF", "sell", 250.0, "sell_to_close", 0.0),
+        _pending_spec("SPY", "buy", 500.0, "buy_to_open", 27_000.0),
+    ]
+    shortable = {"LQD": False, "HYG": True, "IEF": True, "SPY": True}
+
+    filtered = apply_shortable_filter(orders, shortable)
+    status = {s.ticker: s.guard_status for s in filtered}
+
+    assert status["LQD"] == GUARD_SKIPPED_NOT_SHORTABLE
+    assert status["HYG"] == "PENDING", "reducing a short must still go through"
+    assert status["IEF"] == "PENDING", "closing a long must still go through"
+    assert status["SPY"] == "PENDING"
+
+
+def test_shortable_filter_blocks_increasing_a_short_but_not_reducing_it() -> None:
+    """The live LQD case, driven through the real delta maths.
+
+    LQD was already short and the signal wanted it shorter, which is a
+    sell_to_open. Wanting it less short is a buy_to_close and must be allowed
+    even though the asset is not shortable.
+    """
+    current = {"LQD": -26_587.58}
+    nav = 101_013.45
+
+    increasing = compute_delta_orders({"LQD": -0.266083}, current, paper_nav=nav)
+    assert [o.position_intent for o in increasing] == ["sell_to_open"]
+    assert apply_shortable_filter(increasing, {"LQD": False})[0].guard_status == (
+        GUARD_SKIPPED_NOT_SHORTABLE
+    )
+
+    reducing = compute_delta_orders({"LQD": -0.257490}, current, paper_nav=nav)
+    assert [o.position_intent for o in reducing] == ["buy_to_close"]
+    assert apply_shortable_filter(reducing, {"LQD": False})[0].guard_status == "PENDING"
+
+
+def test_shortable_filter_does_not_touch_already_blocked_legs() -> None:
+    """A leg the guards already rejected keeps its own reason, not a new one."""
+    spec = _pending_spec("LQD", "sell", 290.0, "sell_to_open", -26_877.96)
+    already_rejected = replace(spec, guard_status="REJECTED_CAP")
+
+    out = apply_shortable_filter([already_rejected], {"LQD": False})
+
+    assert out[0].guard_status == "REJECTED_CAP"
+
+
+def test_shorts_requiring_check_only_lists_pending_sell_to_open() -> None:
+    orders = [
+        _pending_spec("LQD", "sell", 100.0, "sell_to_open", -100.0),
+        _pending_spec("HYG", "buy", 100.0, "buy_to_close", 0.0),
+        replace(
+            _pending_spec("GLD", "sell", 100.0, "sell_to_open", -100.0),
+            guard_status="DRY_RUN",
+        ),
+    ]
+    assert shorts_requiring_check(orders) == ["LQD"]
+
+
+def test_get_shortable_flags_reads_the_asset_endpoint() -> None:
+    client = MagicMock()
+    client.get_asset.side_effect = lambda t: MagicMock(shortable=(t != "LQD"))
+
+    flags = get_shortable_flags(client, ["SPY", "LQD"])
+
+    assert flags == {"SPY": True, "LQD": False}
+    assert client.get_asset.call_count == 2
+
+
+def test_get_shortable_flags_fails_closed_on_lookup_error() -> None:
+    """An unverifiable short must be skipped, not submitted on an assumption."""
+    client = MagicMock()
+    client.get_asset.side_effect = ConnectionError("asset endpoint unavailable")
+
+    assert get_shortable_flags(client, ["GLD"]) == {"GLD": False}
+
+
+# ---------------------------------------------------------------- run-level, end to end
+
+def _run_execution_with_stub(
+    tmp_path: Path,
+    monkeypatch,
+    *,
+    shortable_map: dict[str, bool],
+    submit_failure: dict[str, Exception] | None = None,
+) -> dict:
+    """Drive scripts.run_execution.main() with Alpaca and Supabase stubbed.
+
+    The Alpaca stub keeps a real book: every accepted leg changes it, and
+    get_all_positions reports that book back. So the positions the run records
+    can be compared against what actually executed, rather than against a
+    hardcoded expectation.
+    """
+    import json as _json
+    from datetime import date as _date
+
+    import dashboard.supabase_client as sb_mod
+    import execution.alpaca_paper as ap_mod
+    import execution.calendar_utils as cal_mod
+    import scripts.run_execution as run_mod
+
+    today = _date.today().isoformat()
+    submit_failure = submit_failure or {}
+
+    # Fills must mark at the same prices the whole-share conversion used, or a
+    # short leg would appear to fill for less than it was sized for.
+    prices = {"SPY": 500.0, "LQD": 100.0, "GLD": 400.0}
+
+    book: dict[str, float] = {}
+    submitted_orders: dict[str, MagicMock] = {}
+
+    def _get_all_positions():
+        out = []
+        for sym, signed in book.items():
+            pos = MagicMock()
+            pos.symbol = sym
+            pos.market_value = str(abs(signed))
+            pos.side = ap_mod.PositionSide.LONG if signed > 0 else ap_mod.PositionSide.SHORT
+            out.append(pos)
+        return out
+
+    def _submit(order_data):
+        sym = order_data.symbol
+        if sym in submit_failure:
+            raise submit_failure[sym]
+        mark = prices.get(sym, 100.0)
+        if order_data.notional is not None:
+            amount = float(order_data.notional)
+            qty = amount / mark
+        else:
+            qty = float(order_data.qty)
+            amount = qty * mark
+        sign = 1.0 if order_data.side.value == "buy" else -1.0
+        book[sym] = book.get(sym, 0.0) + sign * amount
+
+        order = MagicMock()
+        order.id = f"oid-{sym}-{order_data.position_intent}"
+        order.status = ap_mod.OrderStatus.FILLED
+        order.filled_avg_price = str(mark)
+        order.filled_qty = str(qty)
+        submitted_orders[order.id] = order
+        return order
+
+    client = MagicMock()
+    client.get_account.return_value.equity = "100000"
+    client.get_all_positions.side_effect = _get_all_positions
+    client.get_asset.side_effect = lambda t: MagicMock(shortable=shortable_map.get(t, True))
+    client.submit_order.side_effect = _submit
+    client.get_order_by_id.side_effect = lambda oid: submitted_orders[oid]
+
+    monkeypatch.setattr(ap_mod, "connect", lambda dry_run=False: client)
+    monkeypatch.setattr(ap_mod, "DRY_RUN_DEFAULT", False)
+    monkeypatch.setattr(ap_mod, "LOG_DIR", tmp_path / "logs")
+
+    feed_calls: list = []
+    monkeypatch.setattr(
+        ap_mod, "feed_attribution",
+        lambda fills, close_prices, run_date=None, nav=100_000.0, **kw: (
+            feed_calls.append(list(fills)) or 0
+        ),
+    )
+
+    monkeypatch.setattr(cal_mod, "is_trading_day", lambda d: True)
+    monkeypatch.setattr(cal_mod, "check_already_ran", lambda job, d: False)
+    recorded: dict = {}
+    monkeypatch.setattr(
+        cal_mod, "record_run", lambda job, d: recorded.setdefault("run", (job, d))
+    )
+
+    settings = {
+        "signal_as_of_date": today,
+        "signal_target_weights": _json.dumps({"SPY": 0.05, "LQD": -0.06, "GLD": -0.02}),
+        "signal_close_prices": _json.dumps({"SPY": 500.0, "LQD": 100.0, "GLD": 400.0}),
+        "live_nav": "100000",
+    }
+    monkeypatch.setattr(sb_mod, "get_setting", lambda k: settings.get(k))
+    monkeypatch.setattr(
+        sb_mod, "set_setting", lambda k, v: settings.__setitem__(k, v) or True
+    )
+    monkeypatch.setattr(sb_mod, "get_auto_approve", lambda: True)
+    monkeypatch.setattr(sb_mod, "fetch_decision_for_date", lambda d: "approve")
+    monkeypatch.setattr(sb_mod, "fetch_positions", lambda latest_only=True: [])
+
+    written: dict[str, list] = {"positions": [], "pnl": [], "rejections": [], "attribution": []}
+    monkeypatch.setattr(
+        sb_mod, "write_positions", lambda rows: written["positions"].extend(rows) or True
+    )
+    monkeypatch.setattr(
+        sb_mod, "write_pnl_log", lambda row: written["pnl"].append(row) or True
+    )
+    monkeypatch.setattr(
+        sb_mod, "write_order_rejections",
+        lambda rows: written["rejections"].extend(rows) or True,
+    )
+    monkeypatch.setattr(
+        sb_mod, "write_live_attribution",
+        lambda rows: written["attribution"].extend(rows) or True,
+    )
+    monkeypatch.setattr(sb_mod, "write_cron_run", lambda job, d: True)
+
+    exit_code = run_mod.main()
+
+    return {
+        "exit_code": exit_code,
+        "book": book,
+        "written": written,
+        "recorded": recorded,
+        "feed_calls": feed_calls,
+        "submit_calls": client.submit_order.call_count,
+        "reconcile_log": tmp_path / "logs" / f"reconciliation_{today}.json",
+    }
+
+
+def test_run_completes_when_a_short_leg_is_rejected_at_submit(tmp_path, monkeypatch) -> None:
+    """Task 1 end to end: the run survives the live LQD rejection.
+
+    The asset endpoint says LQD is shortable, so the leg is submitted and Alpaca
+    rejects it. The run must finish (exit 0), log the rejection with a reason
+    code, and record positions consistent with what actually executed.
+    """
+    from alpaca.common.exceptions import APIError
+
+    result = _run_execution_with_stub(
+        tmp_path, monkeypatch,
+        shortable_map={"SPY": True, "LQD": True, "GLD": True},
+        submit_failure={
+            "LQD": APIError('{"code":42210000,"message":"asset LQD cannot be sold short"}')
+        },
+    )
+
+    assert result["exit_code"] == 0, "a rejected leg must not fail the run"
+    assert result["submit_calls"] == 3, "all three legs were attempted"
+
+    # The rejection is logged with its reason code, and GLD still traded.
+    rejections = result["written"]["rejections"]
+    assert len(rejections) == 1
+    assert rejections[0]["ticker"] == "LQD"
+    assert rejections[0]["reason_code"] == REASON_NOT_SHORTABLE_AT_SUBMIT
+    assert rejections[0]["status"] == "REJECTED"
+
+    # Recorded positions equal the book the broker actually holds.
+    assert result["book"] == {"SPY": 5000.0, "GLD": -2000.0}
+    recorded = {r["ticker"]: r["signed_notional"] for r in result["written"]["positions"]}
+    assert recorded == pytest.approx(result["book"])
+    assert "LQD" not in recorded, "a rejected leg must not appear as a position"
+
+    # The run is complete, so cron_runs is written and the rejection JSON exists.
+    assert result["recorded"]["run"][0] == "run_execution"
+    assert result["reconcile_log"].exists()
+
+    import json as _json
+    report = _json.loads(result["reconcile_log"].read_text())
+    assert report["rejected_or_skipped_legs"] == 1
+    lqd_leg = report["by_ticker"]["LQD"]["legs"][0]
+    assert lqd_leg["reason_code"] == REASON_NOT_SHORTABLE_AT_SUBMIT
+    assert lqd_leg["status"] == "REJECTED"
+
+
+def test_run_skips_a_non_shortable_leg_before_submitting(tmp_path, monkeypatch) -> None:
+    """Task 2 end to end: the pre-check means LQD is never sent at all."""
+    result = _run_execution_with_stub(
+        tmp_path, monkeypatch,
+        shortable_map={"SPY": True, "LQD": False, "GLD": True},
+    )
+
+    assert result["exit_code"] == 0
+    assert result["submit_calls"] == 2, "the non-shortable leg must not be submitted"
+
+    rejections = result["written"]["rejections"]
+    assert len(rejections) == 1
+    assert rejections[0]["ticker"] == "LQD"
+    assert rejections[0]["reason_code"] == GUARD_SKIPPED_NOT_SHORTABLE
+    assert rejections[0]["status"] == GUARD_SKIPPED_NOT_SHORTABLE
+
+    assert result["book"] == {"SPY": 5000.0, "GLD": -2000.0}
+    assert result["recorded"]["run"][0] == "run_execution"
+
+
+def test_run_halts_cleanly_and_stays_unrecorded_on_transport_failure(
+    tmp_path, monkeypatch
+) -> None:
+    """An unknown-state failure halts with state written and cron_runs left unwritten.
+
+    Not recording the run matters: cron_runs is the idempotency gate, so leaving
+    it unwritten is what lets the next tick retry the legs that never landed.
+    """
+    result = _run_execution_with_stub(
+        tmp_path, monkeypatch,
+        shortable_map={"SPY": True, "LQD": True, "GLD": True},
+        submit_failure={"SPY": ConnectionError("connection reset by peer")},
+    )
+
+    assert result["exit_code"] == 2, "a halt must be visible to the scheduler"
+    assert "run" not in result["recorded"], "a halted run must not record cron_runs"
+
+    rejections = result["written"]["rejections"]
+    codes = {r["ticker"]: r["reason_code"] for r in rejections}
+    assert codes["SPY"] == REASON_SUBMIT_EXCEPTION
+    assert codes["LQD"] == REASON_SKIPPED_AFTER_HALT
+    assert codes["GLD"] == REASON_SKIPPED_AFTER_HALT

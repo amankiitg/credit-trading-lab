@@ -1,0 +1,179 @@
+{
+  "date": "2026-09-24",
+  "generated_at": "2026-09-24T15:24:38.125503",
+  "total_legs_intended": 7,
+  "total_fills_captured": 7,
+  "flagged_discrepancies": 4,
+  "rejected_or_skipped_legs": 2,
+  "backfilled_legs": 7,
+  "by_ticker": {
+    "EFA": {
+      "legs": [
+        {
+          "order_id": "eaf2e5b7-342b-45a2-8474-16ef641a81ff",
+          "leg": 1,
+          "side": "buy",
+          "position_intent": "buy_to_open",
+          "intended_notional": 475.2767,
+          "filled_notional": 475.27,
+          "fill_price": 104.44,
+          "discrepancy": -0.0067,
+          "flagged": false,
+          "simulated_cost": 0.095054,
+          "status": "FILLED",
+          "reason_code": "",
+          "detail": "",
+          "backfilled": true,
+          "guard_status": "PENDING"
+        }
+      ],
+      "total_intended": 475.27674814999773,
+      "total_filled": 475.26999994403997,
+      "total_cost": 0.095053999988808
+    },
+    "EEM": {
+      "legs": [
+        {
+          "order_id": "32b6643b-e241-4c1b-b036-329c8004b8a7",
+          "leg": 1,
+          "side": "buy",
+          "position_intent": "buy_to_open",
+          "intended_notional": 277.1808,
+          "filled_notional": 277.17,
+          "fill_price": 67.41,
+          "discrepancy": -0.0108,
+          "flagged": false,
+          "simulated_cost": 0.055434,
+          "status": "FILLED",
+          "reason_code": "",
+          "detail": "",
+          "backfilled": true,
+          "guard_status": "PENDING"
+        }
+      ],
+      "total_intended": 277.18083554999794,
+      "total_filled": 277.16999994054,
+      "total_cost": 0.055433999988107996
+    },
+    "TLT": {
+      "legs": [
+        {
+          "order_id": "a486912c-aeaf-4e3f-b00a-b87ce9aa93e0",
+          "leg": 1,
+          "side": "sell",
+          "position_intent": "sell_to_open",
+          "intended_notional": 345.2388,
+          "filled_notional": 321.04,
+          "fill_price": 80.26,
+          "discrepancy": -24.1988,
+          "flagged": true,
+          "simulated_cost": 0.499312,
+          "status": "FILLED",
+          "reason_code": "",
+          "detail": "",
+          "backfilled": true,
+          "guard_status": "PENDING"
+        }
+      ],
+      "total_intended": 345.2388313499978,
+      "total_filled": 321.04,
+      "total_cost": 0.4993118095238095
+    },
+    "IEF": {
+      "legs": [
+        {
+          "order_id": "c8277280-9570-42c0-b63c-0024f9914a3f",
+          "leg": 1,
+          "side": "sell",
+          "position_intent": "sell_to_open",
+          "intended_notional": 257.3027,
+          "filled_notional": 180.36,
+          "fill_price": 90.18,
+          "discrepancy": -76.9427,
+          "flagged": true,
+          "simulated_cost": 0.467072,
+          "status": "FILLED",
+          "reason_code": "",
+          "detail": "",
+          "backfilled": true,
+          "guard_status": "PENDING"
+        }
+      ],
+      "total_intended": 257.302697850002,
+      "total_filled": 180.36,
+      "total_cost": 0.467072
+    },
+    "HYG": {
+      "legs": [
+        {
+          "order_id": "7739f99d-6cf3-49c6-aea2-2d6e981edb29",
+          "leg": 1,
+          "side": "buy",
+          "position_intent": "buy_to_open",
+          "intended_notional": 304.2903,
+          "filled_notional": 304.28,
+          "fill_price": 78.09,
+          "discrepancy": -0.0103,
+          "flagged": false,
+          "simulated_cost": 0.060856,
+          "status": "FILLED",
+          "reason_code": "",
+          "detail": "",
+          "backfilled": true,
+          "guard_status": "PENDING"
+        }
+      ],
+      "total_intended": 304.290310999997,
+      "total_filled": 304.27999997805006,
+      "total_cost": 0.06085599999561001
+    },
+    "LQD": {
+      "legs": [
+        {
+          "order_id": "",
+          "leg": 1,
+          "side": "sell",
+          "position_intent": "sell_to_open",
+          "intended_notional": 290.3868,
+          "filled_notional": 0.0,
+          "fill_price": 0.0,
+          "discrepancy": -290.3868,
+          "flagged": true,
+          "simulated_cost": 0.0,
+          "status": "REJECTED",
+          "reason_code": "ASSET_NOT_SHORTABLE_AT_SUBMIT",
+          "detail": "absorbed from the live 42210000 rejection: asset cannot be sold short (shortable=false on 2026-09-24)",
+          "backfilled": true,
+          "guard_status": "PENDING"
+        }
+      ],
+      "total_intended": 290.386816350001,
+      "total_filled": 0.0,
+      "total_cost": 0.0
+    },
+    "GLD": {
+      "legs": [
+        {
+          "order_id": "",
+          "leg": 1,
+          "side": "sell",
+          "position_intent": "sell_to_open",
+          "intended_notional": 580.7393,
+          "filled_notional": 0.0,
+          "fill_price": 0.0,
+          "discrepancy": -580.7393,
+          "flagged": true,
+          "simulated_cost": 0.0,
+          "status": "REJECTED",
+          "reason_code": "SKIPPED_AFTER_HALT",
+          "detail": "run crashed before this leg was reached",
+          "backfilled": true,
+          "guard_status": "PENDING"
+        }
+      ],
+      "total_intended": 580.7393199500002,
+      "total_filled": 0.0,
+      "total_cost": 0.0
+    }
+  }
+}

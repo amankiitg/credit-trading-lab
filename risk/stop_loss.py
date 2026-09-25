@@ -68,6 +68,53 @@ def canonical_state(value) -> str:
     return text if text in VALID_STATES else UNKNOWN_STATE
 
 
+def build_stop_rows(
+    universe: list[str],
+    states: pd.Series,
+    mults: pd.Series,
+    zs: pd.Series,
+    *,
+    advisory: bool = True,
+    now=None,
+) -> list[dict]:
+    """Build the stop_states rows written to Supabase.
+
+    updated_at is stamped here rather than left to the column default. A default
+    only fires on INSERT, so the upsert that rewrites these rows on every signal
+    run left updated_at frozen at the time of the first ever insert. The
+    stop_states rows still read 2026-08-12 on 2026-09-24 for exactly that reason,
+    which made the column useless for telling how fresh the states were. A BEFORE
+    UPDATE trigger is the durable guarantee; stamping it here makes the behaviour
+    explicit and testable.
+
+    State goes through canonical_state, so an unset cell becomes UNKNOWN rather
+    than the string "nan". A missing multiplier defaults to 1.0 (no stop) rather
+    than raising, and tickers absent from the state frame are skipped.
+
+    `now` is injectable so a test can show that two builds carry two different
+    timestamps.
+    """
+    from datetime import datetime, timezone
+
+    stamp = (now or datetime.now(timezone.utc)).isoformat()
+    rows: list[dict] = []
+    for ticker in universe:
+        if ticker not in mults.index:
+            continue
+        m_raw = mults.get(ticker)
+        z_raw = zs.get(ticker)
+        z_val = float(z_raw) if pd.notna(z_raw) else None
+        rows.append({
+            "ticker": ticker,
+            "state": canonical_state(states.get(ticker)),
+            "z": round(z_val, 6) if z_val is not None else None,
+            "multiplier": float(m_raw) if pd.notna(m_raw) else 1.0,
+            "advisory": advisory,
+            "updated_at": stamp,
+        })
+    return rows
+
+
 def _compute_monthly_vol(sigma_annual: pd.DataFrame) -> pd.DataFrame:
     """Scale annualized 63d vol to 1-month horizon (sqrt(21/252))."""
     return sigma_annual * np.sqrt(21.0 / TRADING_DAYS)

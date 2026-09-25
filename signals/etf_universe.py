@@ -39,9 +39,14 @@ def ingest(
 ) -> None:
     """Fetch tickers via the existing yfinance boundary and write to raw_dir.
 
-    Falls back to committed parquet (stale but functional) if yfinance is
-    rate-limited or unavailable, so the cron doesn't crash on a transient
-    Yahoo Finance error.
+    After fetching, any session that one ticker is missing but the others have is
+    repaired from Alpaca IEX daily bars before the parquets are written (see
+    signals/raw_repair.py). yfinance does drop individual sessions for a subset of
+    the universe, and an unrepaired hole silently changes the signal rather than
+    failing, so the repair belongs here rather than in a manual step.
+
+    The repair is holes only, and is capped per ticker. Anything it refuses is left
+    for the data-quality gate in run_signal to block on, with the reason logged.
     """
     from datetime import timedelta
     # yfinance end is exclusive, so pass today+1 to include today's close
@@ -49,6 +54,18 @@ def ingest(
     data = fetch(tickers, start, end)
     for t, df in data.items():
         print(f"{t}: {len(df)} rows, {df.index.min().date()} -> {df.index.max().date()}")
+
+    from signals.raw_repair import repair_frames
+    data, report = repair_frames(data)
+    if report["filled"]:
+        print(
+            f"hole repair: filled {len(report['filled'])} session(s) from "
+            f"alpaca_iex: "
+            + ", ".join(
+                f"{f['ticker']}@{f['date'].date()}" for f in report["filled"]
+            )
+        )
+
     write_raw(data, raw_dir)
 
 

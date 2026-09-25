@@ -26,6 +26,7 @@ from risk.stop_loss import (
     UNKNOWN_STATE,
     _run_single_episode,
     apply_stop_overlay,
+    build_stop_rows,
     canonical_state,
     compute_episodes,
 )
@@ -839,3 +840,81 @@ def test_canonical_state_is_what_gets_written() -> None:
     written = [canonical_state(v) for v in states.iloc[-1]]
     assert all(w in ("NORMAL", "REDUCED", "STOPPED", UNKNOWN_STATE) for w in written)
     assert "nan" not in written and "None" not in written
+
+
+# ------------------------------------------------- v9.4: the stop_states payload
+
+def _stop_inputs():
+    idx = ["SPY", "EFA", "HYG"]
+    states = pd.Series(["NORMAL", "STOPPED", None], index=idx)
+    mults = pd.Series([1.0, 0.5, 1.0], index=idx)
+    zs = pd.Series([0.1, -3.2, np.nan], index=idx)
+    return idx, states, mults, zs
+
+
+def test_stop_rows_restamp_updated_at_on_a_rewrite() -> None:
+    """v9.4 item 3: a re-run's rows must carry a later timestamp than the first write.
+
+    The column default only fires on INSERT, so the upsert that rewrites these rows
+    on every signal run left updated_at frozen at the first insert. The rows still
+    read 2026-08-12 on 2026-09-24 because of it, which made the column useless for
+    telling how fresh the states were. Stamping the payload is what moves the value.
+    """
+    from datetime import datetime, timezone
+
+    idx, states, mults, zs = _stop_inputs()
+    first = build_stop_rows(
+        idx, states, mults, zs, now=datetime(2026, 8, 12, 1, 12, tzinfo=timezone.utc)
+    )
+    second = build_stop_rows(
+        idx, states, mults, zs, now=datetime(2026, 9, 25, 2, 17, tzinfo=timezone.utc)
+    )
+
+    assert all(row["updated_at"] for row in first + second), "never blank"
+    assert {row["updated_at"] for row in first} == {"2026-08-12T01:12:00+00:00"}
+    assert {row["updated_at"] for row in second} == {"2026-09-25T02:17:00+00:00"}
+
+    before = {row["ticker"]: row["updated_at"] for row in first}
+    after = {row["ticker"]: row["updated_at"] for row in second}
+    assert before != after, "a rewrite must not look like the original insert"
+    assert all(after[t] > before[t] for t in before), "later write, later stamp"
+
+
+def test_stop_rows_default_the_stamp_to_now() -> None:
+    """Called without a clock, the rows are stamped now, not left empty."""
+    from datetime import datetime, timezone
+
+    idx, states, mults, zs = _stop_inputs()
+    rows = build_stop_rows(idx, states, mults, zs)
+
+    for row in rows:
+        stamped = datetime.fromisoformat(row["updated_at"])
+        assert abs((datetime.now(timezone.utc) - stamped).total_seconds()) < 60
+
+
+def test_stop_rows_emit_only_canonical_states() -> None:
+    """The None cell is UNKNOWN. Supabase held the literal "nan" without this."""
+    idx, states, mults, zs = _stop_inputs()
+    rows = {row["ticker"]: row for row in build_stop_rows(idx, states, mults, zs)}
+
+    assert [r["state"] for r in rows.values()] == ["NORMAL", "STOPPED", UNKNOWN_STATE]
+    assert rows["HYG"]["z"] is None, "a nan z must be written as NULL, not nan"
+    assert rows["EFA"]["multiplier"] == pytest.approx(0.5)
+    assert all(row["advisory"] is True for row in rows.values())
+
+
+def test_stop_rows_skip_a_ticker_absent_from_the_state_frame() -> None:
+    idx, states, mults, zs = _stop_inputs()
+    rows = build_stop_rows(idx + ["NEW"], states, mults, zs)
+    assert [row["ticker"] for row in rows] == idx
+
+
+def test_run_signal_builds_its_rows_through_build_stop_rows() -> None:
+    """Wiring guard: a future inline payload would silently lose the stamp."""
+    import inspect
+
+    import scripts.run_signal as run_signal
+
+    source = inspect.getsource(run_signal)
+    assert "build_stop_rows(UNIVERSE" in source
+    assert '"updated_at": datetime.now' not in source

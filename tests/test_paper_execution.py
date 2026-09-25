@@ -1479,6 +1479,7 @@ def _run_execution_with_stub(
     shortable_map: dict[str, bool],
     submit_failure: dict[str, Exception] | None = None,
     dry_run: bool = False,
+    signal_as_of: str | None = None,
 ) -> dict:
     """Drive scripts.run_execution.main() with Alpaca and Supabase stubbed.
 
@@ -1486,6 +1487,9 @@ def _run_execution_with_stub(
     get_all_positions reports that book back. So the positions the run records
     can be compared against what actually executed, rather than against a
     hardcoded expectation.
+
+    `signal_as_of` overrides the stored signal date, which is how the staleness
+    guard is reached; it defaults to today.
     """
     import json as _json
     from datetime import date as _date
@@ -1564,7 +1568,7 @@ def _run_execution_with_stub(
     )
 
     settings = {
-        "signal_as_of_date": today,
+        "signal_as_of_date": signal_as_of or today,
         "signal_target_weights": _json.dumps({"SPY": 0.05, "LQD": -0.06, "GLD": -0.02}),
         "signal_close_prices": _json.dumps({"SPY": 500.0, "LQD": 100.0, "GLD": 400.0}),
         "live_nav": "100000",
@@ -1671,6 +1675,74 @@ def test_run_skips_a_non_shortable_leg_before_submitting(tmp_path, monkeypatch) 
 
     assert result["book"] == {"SPY": 5000.0, "GLD": -2000.0}
     assert result["recorded"]["run"][0] == "run_execution"
+
+
+def _signal_date_sessions_ago(n: int) -> str:
+    """A session date exactly `n` NYSE sessions before the most recent one."""
+    import exchange_calendars as ec
+    import pandas as pd
+
+    cal = ec.get_calendar("XNYS")
+    today = pd.Timestamp(date.today())
+    sessions = cal.sessions_in_range(today - pd.Timedelta(days=60), today)
+    return str(sessions[-(n + 1)].date())
+
+
+def test_run_skips_a_stale_signal_without_trading(tmp_path, monkeypatch, caplog) -> None:
+    """v9.4 item 2: a signal past the staleness limit must not be traded.
+
+    On 2026-09-24 the execution cron traded a signal stored for 2026-09-22. The
+    book is sized for the market the signal was computed against, so using it two
+    sessions later puts on the wrong book. The run must skip, trade nothing, and
+    exit distinctly.
+
+    cron_runs must stay unwritten. That row is the idempotency gate, so writing it
+    on a skip would make every later tick that day skip too and the fresh signal
+    would never be traded.
+    """
+    import logging
+
+    stale = _signal_date_sessions_ago(3)
+    with caplog.at_level(logging.INFO):
+        result = _run_execution_with_stub(
+            tmp_path, monkeypatch,
+            shortable_map={"SPY": True, "LQD": True, "GLD": True},
+            signal_as_of=stale,
+        )
+
+    assert result["exit_code"] == 4, "a stale signal must skip with its own exit code"
+    assert result["submit_calls"] == 0, "not one leg may be submitted on a stale signal"
+    assert result["written"]["positions"] == [], "no positions may be recorded"
+    assert result["written"]["pnl"] == [], "no pnl row may be written"
+    assert "run" not in result["recorded"], "a skipped run must not be recorded"
+    assert not result["reconcile_log"].exists(), "nothing to reconcile"
+
+    assert "STALE SIGNAL" in caplog.text
+    assert "3 NYSE sessions older" in caplog.text
+    assert "SKIPPING the run without trading" in caplog.text
+
+
+def test_run_trades_a_signal_at_the_staleness_limit(tmp_path, monkeypatch, caplog) -> None:
+    """Negative control: exactly at the limit, the run still trades.
+
+    Without this, the skip test would also pass if the guard simply refused every
+    signal. Two sessions old is the documented limit and must go through.
+    """
+    import logging
+
+    at_limit = _signal_date_sessions_ago(2)
+    with caplog.at_level(logging.INFO):
+        result = _run_execution_with_stub(
+            tmp_path, monkeypatch,
+            shortable_map={"SPY": True, "LQD": True, "GLD": True},
+            signal_as_of=at_limit,
+        )
+
+    assert result["exit_code"] == 0
+    assert result["submit_calls"] == 3, "all three legs were attempted"
+    assert result["recorded"]["run"][0] == "run_execution"
+    assert "STALE SIGNAL" not in caplog.text
+    assert "is 2 NYSE session(s) old" in caplog.text
 
 
 def test_run_halts_cleanly_and_stays_unrecorded_on_transport_failure(

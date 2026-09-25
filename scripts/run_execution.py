@@ -15,6 +15,7 @@ What it does:
   7b. Pre-check the Alpaca shortable flag for any name the signal wants short.
       A non-shortable name has its sell_to_open leg skipped and logged; legs
       that reduce an existing position still go through.
+  7c. Refuse to trade a signal more than MAX_STALE_SESSIONS NYSE sessions old.
   8. Submit orders one leg at a time: longs via notional, shorts via whole-share
       qty. A rejected leg is classified, logged with a reason code, and skipped,
       so one bad order cannot abort the run. A transport failure (unknown
@@ -55,6 +56,12 @@ logger = logging.getLogger("run_execution")
 EXECUTION_JOB_MAX_SECS: float = float(
     os.environ.get("EXECUTION_JOB_MAX_SECS", str(30 * 60))
 )
+
+# How many NYSE sessions old the stored signal may be before the run refuses to
+# trade. A signal sized for an older market is not a signal for today: on
+# 2026-09-24 the stored signal was two sessions stale and the book was still
+# traded against it. Override with MAX_STALE_SESSIONS.
+MAX_STALE_SESSIONS: int = int(os.environ.get("MAX_STALE_SESSIONS", "2"))
 
 
 def main(max_secs: float | None = None) -> int:
@@ -128,6 +135,45 @@ def _run() -> int:
         }
         target_weights = {}  # computed below in step 6
     logger.info("as_of_date: %s", as_of_date)
+
+    # -- 3c. Staleness guard. Counted in NYSE sessions, not calendar days, so a
+    #        Friday signal used on Monday is one session old rather than three.
+    #        A signal older than the limit is not a signal for today, so the run
+    #        skips without trading and leaves cron_runs unwritten, which lets the
+    #        next tick retry once a fresh signal exists.
+    from execution.alpaca_paper import DRY_RUN_DEFAULT
+    from execution.calendar_utils import trading_days_elapsed
+
+    with step("3c signal staleness guard", logger):
+        try:
+            signal_age_sessions = trading_days_elapsed(as_of_date, today)
+        except Exception as exc:
+            logger.error(
+                "cannot determine the age of signal %s against run date %s "
+                "(%s: %s) -- refusing to trade on an unverifiable signal",
+                as_of_date, today, type(exc).__name__, exc,
+            )
+            return 4
+    logger.info(
+        "signal %s is %d NYSE session(s) old (run date %s, limit %d)",
+        as_of_date, signal_age_sessions, today, MAX_STALE_SESSIONS,
+    )
+    if signal_age_sessions > MAX_STALE_SESSIONS:
+        if DRY_RUN_DEFAULT:
+            logger.warning(
+                "STALE SIGNAL (dry run): %s is %d NYSE sessions older than %s, "
+                "over the %d session limit. A real run would SKIP here.",
+                as_of_date, signal_age_sessions, today, MAX_STALE_SESSIONS,
+            )
+        else:
+            logger.error(
+                "STALE SIGNAL: %s is %d NYSE sessions older than %s, over the "
+                "%d session limit. SKIPPING the run without trading. cron_runs "
+                "is not recorded, so the next tick retries once a fresh signal "
+                "exists.",
+                as_of_date, signal_age_sessions, today, MAX_STALE_SESSIONS,
+            )
+            return 4
 
     # -- 4. Decision gate
     from dashboard.supabase_client import (

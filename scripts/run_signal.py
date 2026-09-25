@@ -161,7 +161,7 @@ def _run() -> int:
     # -- 4b. v9.1: Stop-ladder overlay (ADVISORY MODE ONLY -- gate REJECTED).
     #        Compute stop states for display in Panel H but NEVER modify weights.
     #        Per T6 gate decision: F2/F3/F4/F5 all fail → advisory mode.
-    from risk.stop_loss import canonical_state, compute_episodes
+    from risk.stop_loss import build_stop_rows, compute_episodes
     sigma_matrix = tidy.pivot(index="date", columns="ticker", values="sigma").sort_index()
     close_matrix = close[list(held.columns)]  # align columns
 
@@ -204,20 +204,12 @@ def _run() -> int:
         latest_state = states_df.iloc[-1]
         latest_z = z_df.iloc[-1]
 
-        stop_rows = []
-        for t in UNIVERSE:
-            if t in latest_mult.index:
-                m = float(latest_mult.get(t)) if pd.notna(latest_mult.get(t)) else 1.0
-                s = canonical_state(latest_state.get(t))
-                z_val = float(latest_z.get(t)) if pd.notna(latest_z.get(t)) else None
-                stop_rows.append({
-                    "ticker": t,
-                    "state": s,
-                    "z": round(z_val, 6) if z_val is not None else None,
-                    "multiplier": m,
-                    "advisory": True,
-                })
-                logger.info("  stop_state[%s]: %s (z=%.4f, m=%.2f)", t, s, z_val or 0, m)
+        stop_rows = build_stop_rows(UNIVERSE, latest_state, latest_mult, latest_z)
+        for row in stop_rows:
+            logger.info(
+                "  stop_state[%s]: %s (z=%.4f, m=%.2f)",
+                row["ticker"], row["state"], row["z"] or 0.0, row["multiplier"],
+            )
 
         logger.info("v9.1 stop overlay: advisory_mode=True (gate REJECTED, weights unchanged)")
     except JobTimeout as exc:

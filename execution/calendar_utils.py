@@ -34,6 +34,30 @@ def is_trading_day(date_str: str) -> bool:
         return True  # fail open so we don't silently skip live days
 
 
+def trading_days_elapsed(from_date: str, to_date: str) -> int:
+    """NYSE sessions in the half-open interval (from_date, to_date].
+
+    This is "how many sessions old is this signal", which is what a staleness
+    guard needs. Counting sessions rather than calendar days is the point: a
+    Friday signal used on Monday is one session old, not three.
+
+    Returns 0 when the two dates are the same session. Raises ValueError if
+    either date is not parseable. A calendar lookup failure raises too, because
+    unlike `is_trading_day` this feeds a guard that decides whether real money
+    trades, and silently guessing here is the wrong failure mode.
+    """
+    import pandas as pd
+
+    cal = _get_nyse()
+    start = pd.Timestamp(from_date)
+    end = pd.Timestamp(to_date)
+    if end <= start:
+        return 0
+    # sessions_in_range is inclusive at both ends.
+    sessions = cal.sessions_in_range(start, end)
+    return max(0, len(sessions) - 1)
+
+
 def check_already_ran(job_name: str, run_date: str) -> bool:
     """Return True if job_name already completed for run_date (idempotency guard).
 

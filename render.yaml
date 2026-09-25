@@ -29,12 +29,20 @@ services:
     # for no reason. With `paths` set, only a change to one of these triggers a
     # build. Everything else on the branch is ignored by this service.
     #
+    # signals/** and risk/** are here because the remaining Trade Approval tab
+    # imports them at runtime: signals.etf_universe (directly and via
+    # dashboard.loader.load_close_matrix) and risk.live_risk, for the MCTR panel.
+    # execution/** is deliberately NOT here. The dashboard never calls Alpaca, and
+    # keeping it out is what keeps the Alpaca keys off this service.
+    #
     # scripts/write_render_secrets.py is listed because the build command runs it,
     # so a change there does change what this service builds. render.yaml itself is
     # deliberately absent: editing it is already a Render-side change.
     buildFilter:
       paths:
         - dashboard/**
+        - signals/**
+        - risk/**
         - pyproject.toml
         - requirements.txt
         - scripts/write_render_secrets.py

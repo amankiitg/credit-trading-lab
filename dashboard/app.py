@@ -83,49 +83,26 @@ if _secrets_configured:
     _is_authenticated: bool = (
         st.user.is_logged_in and _user_email == _ALLOWED_EMAIL
     )
-    # Detect fresh login (logged-out → logged-in transition) and auto-navigate
-    # to the Trade Approval tab where the sign-in button lives.
-    _was_logged_in = st.session_state.get("_was_logged_in", False)
-    if st.user.is_logged_in and not _was_logged_in:
-        st.session_state["_was_logged_in"] = True
-        # st.iframe rather than st.components.v1.html: the v1 HTML component is
-        # flagged for removal, and st.iframe embeds an HTML string as-is with
-        # JavaScript execution and same-origin access, which this needs in order to
-        # reach the tab element in the parent document. height must be a positive
-        # integer (0 is rejected), so one pixel keeps it effectively invisible.
-        st.iframe("""<script>
-        setTimeout(function () {
-            var tabs = window.parent.document.querySelectorAll('[data-baseweb="tab"]');
-            if (tabs.length > 1) tabs[1].click();
-        }, 300);
-        </script>""", height=1)
-    elif not st.user.is_logged_in:
-        st.session_state["_was_logged_in"] = False
+    # The fresh-login handler that switched to the Trade Approval tab is gone.
+    # It existed because the sign-in button lived on that tab, and it worked by
+    # injecting a script that clicked it from the parent document. There is only
+    # one tab left, so a signed-in user is already looking at it and there is
+    # nothing to switch to. Its st.session_state marker went with it.
 else:
     # Local dev: no OIDC, treat as authenticated passthrough.
     _user_email = _ALLOWED_EMAIL or "local"
     _is_authenticated = True
 
 # ----------------------------------------------------------------- tabs
+#
+# Strategy Analytics and Research Archive were removed, leaving the trade approval
+# book as the whole dashboard. st.tabs is kept around the single remaining view so
+# the structure is unchanged if a tab is added back later.
 
-tab_attr, tab_ops, tab_research = st.tabs([
-    "Strategy Analytics",
-    "Trade Approval",
-    "Research Archive",
-])
-
-with tab_attr:
-    from dashboard.views import attribution as attribution_view
-    attribution_view.render()
-
-with tab_ops:
+with st.tabs(["Trade Approval"])[0]:
     from dashboard.views import operational as operational_view
     operational_view.render(
         user_email=_user_email,
         is_authenticated=_is_authenticated,
         secrets_configured=_secrets_configured,
     )
-
-with tab_research:
-    from dashboard.views import research_history as research_history_view
-    research_history_view.render()

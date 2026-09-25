@@ -1,21 +1,30 @@
-"""Peak-memory harness for the dashboard -- one measurement per fresh process.
+"""Peak-memory and render-work harness for the dashboard -- sprint v9.5.
 
-Why a separate process per page: `resource.getrusage(RUSAGE_SELF).ru_maxrss` is a
+One measurement per fresh process: `resource.getrusage(RUSAGE_SELF).ru_maxrss` is a
 high-water mark that never falls, so measuring several pages in one process would
-report the running maximum rather than each page's own peak. This script therefore
-measures exactly one page per invocation and the caller loops over pages.
+report the running maximum rather than each page's own peak. The caller loops.
 
-Why AppTest: a view is a Streamlit script by contract, and `render()` calls st.*
-functions that need a script run context. AppTest is the sanctioned way to execute
-a Streamlit script in-process, so the measurement exercises the real render path
-including the widget/DeltaGenerator allocations, not just the pandas reads.
+**The peak RSS number is not good enough to judge a change with.** Measuring the same
+unchanged code twice moved the median by up to 87 MiB, which is larger than any
+plausible effect of an optimisation. It is still reported, because the shape of the
+baseline is useful (roughly 145 MiB before any view runs) and because a rising trend
+across reruns would indicate a leak. To judge work, read the counters:
+
+    fig_points  -- data points handed to matplotlib's line renderer
+    png_bytes   -- bytes of PNG Streamlit encodes and ships to the browser
+    sb_calls    -- Supabase reads per rerun
+
+Those are deterministic: the same page gives the same numbers every time.
+
+Instrumentation is installed in THIS process rather than inside the page script, so
+the same counters apply to a view driven from a string and to the real app entry point
+read from disk. It must be installed before the page imports its view, because
+operational.py binds the supabase_client functions into its own namespace at import
+time, so patching the library afterwards would not be seen.
 
 Usage:
-    python scripts/measure_dashboard_memory.py --page research_history
-    python scripts/measure_dashboard_memory.py --all     # loops via subprocess
-
-ru_maxrss units differ by platform: bytes on macOS, kilobytes on Linux. Reporting
-the wrong one silently inflates every number by 1024x, so it is handled explicitly.
+    python scripts/measure_dashboard_memory.py --page app --runs 3
+    python scripts/measure_dashboard_memory.py --all
 """
 
 from __future__ import annotations
@@ -32,17 +41,35 @@ os.chdir(ROOT)
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+PAGE_NAMES = ("app", "operational")
+
+# `app` is the real entry point read from disk. `operational` is the one remaining
+# tab's view driven directly, which isolates the view from the app's own overhead.
+PAGE_FILES = {"app": "dashboard/app.py"}
+PAGE_SCRIPTS = {
+    "operational": (
+        "from dashboard.views import operational as v\n"
+        "v.render(user_email='local', is_authenticated=True, secrets_configured=False)\n"
+    ),
+}
+
+_COUNTERS = {"fig_points": 0, "png_bytes": 0, "figures": 0, "sb_calls": 0}
+_INSTALLED = False
+
 
 def load_env() -> None:
     """Same .env convention the other scripts use, so Supabase reads behave as on Render."""
     env = ROOT / ".env"
-    if not env.exists():
-        return
-    for line in env.read_text().splitlines():
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            k, _, v = line.partition("=")
-            os.environ.setdefault(k.strip(), v.strip())
+    if env.exists():
+        for line in env.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, _, v = line.partition("=")
+                os.environ.setdefault(k.strip(), v.strip())
+    # app.py rewrites .streamlit/secrets.toml when GOOGLE_CLIENT_ID is set, which would
+    # clobber a developer's local secrets file during a measurement. Unset, the app
+    # takes its local-dev branch, which is the path worth measuring anyway.
+    os.environ.pop("GOOGLE_CLIENT_ID", None)
 
 
 def peak_mb() -> float:
@@ -51,122 +78,8 @@ def peak_mb() -> float:
     return ru / (1024 * 1024) if sys.platform == "darwin" else ru / 1024
 
 
-def _attribution_script() -> str:
-    return (
-        "from dashboard.views import attribution as v\n"
-        "v.render()\n"
-    )
-
-
-def _operational_script() -> str:
-    return (
-        "from dashboard.views import operational as v\n"
-        "v.render(user_email='local', is_authenticated=True, secrets_configured=False)\n"
-    )
-
-
-def _research_history_script() -> str:
-    return (
-        "from dashboard.views import research_history as v\n"
-        "v.render()\n"
-    )
-
-
-def _everything_script() -> str:
-    """What app.py actually does: every tab renders on every script run."""
-    return (
-        "from dashboard.views import attribution as a, operational as o, research_history as r\n"
-        "a.render()\n"
-        "o.render(user_email='local', is_authenticated=True, secrets_configured=False)\n"
-        "r.render()\n"
-    )
-
-
-PAGES = {
-    "attribution": _attribution_script,
-    "operational": _operational_script,
-    "research_history": _research_history_script,
-    "everything": _everything_script,
-}
-
-# Deterministic companion to the RSS number.
-#
-# Peak RSS turned out to be useless for judging these changes: measuring the SAME
-# code twice, minutes apart, moved the median by up to 87 MiB, which is larger than
-# any plausible effect of the changes. The measurements that are not noisy are the
-# ones that count work actually done, so this preamble also records:
-#
-#   fig_points   -- data points handed to matplotlib's line renderer
-#   png_bytes    -- bytes of PNG Streamlit encodes and ships to the browser
-#   sb_calls     -- Supabase reads per rerun, which is what the caching change is for
-#
-# It must run BEFORE the view module is imported: operational.py binds the
-# supabase_client functions into its own namespace at import time, so patching the
-# library afterwards would not be seen.
-_PROBE = r'''
-import io as _io
-import streamlit as _st
-
-# ONE dict for the whole session, reset in place at the start of each run. Each
-# rerun re-executes this script in a fresh namespace, so a per-run dict would be
-# captured by the previous run's wrappers and their calls would be counted into a
-# dict nobody reads. That bug reported 0 Supabase calls on every rerun after the
-# first. Session state survives reruns, so the wrappers always write to the dict
-# that is actually reported.
-try:
-    _m = _st.session_state["_metrics"]
-except Exception:
-    _m = {}
-    _st.session_state["_metrics"] = _m
-for _k in ("fig_points", "png_bytes", "figures", "sb_calls"):
-    _m[_k] = 0
-
-_real_pyplot = _st.pyplot
-
-def _counting_pyplot(fig=None, **kw):
-    try:
-        buf = _io.BytesIO()
-        fig.savefig(buf, format="png")
-        _m["png_bytes"] += buf.tell()
-    except Exception:
-        pass
-    try:
-        _m["fig_points"] += sum(
-            sum(len(ln.get_xdata()) for ln in ax.get_lines()) for ax in fig.axes
-        )
-    except Exception:
-        pass
-    _m["figures"] += 1
-    return _real_pyplot(fig, **kw)
-
-if not getattr(_st, "_dashmem_wrapped", False):
-    _st.pyplot = _counting_pyplot
-
-    import dashboard.supabase_client as _sb
-
-    def _counting(fn):
-        def _wrap(*a, **k):
-            _m["sb_calls"] += 1
-            return fn(*a, **k)
-        return _wrap
-
-    for _name in ("fetch_pnl_log", "fetch_live_attribution", "fetch_positions",
-                  "fetch_stop_states"):
-        _fn = getattr(_sb, _name, None)
-        if _fn is not None:
-            setattr(_sb, _name, _counting(_fn))
-
-    _st._dashmem_wrapped = True
-'''
-
-
 def current_mb() -> float:
-    """Current resident set size in MiB.
-
-    ru_maxrss is a high-water mark and cannot show growth across reruns, which is
-    the whole question here, so current RSS is read separately. psutil is used when
-    present and `ps` otherwise, so this works without adding a dependency.
-    """
+    """Current RSS in MiB. The peak cannot show growth across reruns, which is the question."""
     try:
         import psutil
 
@@ -179,68 +92,134 @@ def current_mb() -> float:
         return float(out) / 1024 if out else 0.0
 
 
-def measure(page: str, tracemalloc_top: int = 0, runs: int = 1) -> dict:
-    """Run one page through AppTest and report the peak RSS for this process."""
+def reset_counters() -> None:
+    for key in _COUNTERS:
+        _COUNTERS[key] = 0
+
+
+def install_counters() -> None:
+    """Patch st.pyplot and the Supabase readers, once per process.
+
+    Once only: wrapping on every rerun stacks wrappers and counts each event two,
+    three, ... times across reruns. That bug reported three times the real figures.
+    """
+    global _INSTALLED
+    if _INSTALLED:
+        return
+
+    import io
+
+    import streamlit as st
+
+    real_pyplot = st.pyplot
+
+    def counting_pyplot(fig=None, **kw):
+        try:
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png")
+            _COUNTERS["png_bytes"] += buf.tell()
+        except Exception:
+            pass
+        try:
+            _COUNTERS["fig_points"] += sum(
+                sum(len(ln.get_xdata()) for ln in ax.get_lines()) for ax in fig.axes
+            )
+        except Exception:
+            pass
+        _COUNTERS["figures"] += 1
+        return real_pyplot(fig, **kw)
+
+    st.pyplot = counting_pyplot
+
+    import dashboard.supabase_client as sb
+
+    def counting(fn):
+        def _wrap(*a, **k):
+            _COUNTERS["sb_calls"] += 1
+            return fn(*a, **k)
+        return _wrap
+
+    for name in ("fetch_pnl_log", "fetch_live_attribution", "fetch_positions",
+                 "fetch_stop_states"):
+        fn = getattr(sb, name, None)
+        if fn is not None:
+            setattr(sb, name, counting(fn))
+
+    _INSTALLED = True
+
+
+def build_app(page: str):
+    from streamlit.testing.v1 import AppTest
+
+    if page in PAGE_FILES:
+        # Absolute: AppTest.from_file resolves a relative path against the file that
+        # calls it, which here is this script in scripts/, not the repo root.
+        return AppTest.from_file(
+            str((ROOT / PAGE_FILES[page]).resolve()), default_timeout=600
+        )
+    return AppTest.from_string(PAGE_SCRIPTS[page], default_timeout=600)
+
+
+def measure(page: str, runs: int = 1) -> dict:
     load_env()
 
     base = peak_mb()  # interpreter + stdlib only
 
     import streamlit  # noqa: F401
-    from streamlit.testing.v1 import AppTest
+    from streamlit.testing.v1 import AppTest  # noqa: F401
 
     after_streamlit = peak_mb()
 
-    # Warm the heavy third-party imports the way the app does, separately from the
-    # view itself, so the page number is the page's own cost and not pandas+matplotlib
-    # arriving for the first time.
+    # Warm the heavy third-party imports separately from the page, so the page number
+    # is the page's own cost and not pandas+matplotlib arriving for the first time.
     import matplotlib.pyplot as plt
     import pandas as pd  # noqa: F401
 
     after_libs = peak_mb()
 
-    at = AppTest.from_string(_PROBE + PAGES[page](), default_timeout=600)
+    install_counters()
 
-    # Reruns are what a long-lived dashboard session does (every widget change
-    # re-executes the script), so growth across them is the OOM hypothesis.
+    at = build_app(page)
+
+    # Reruns are what a long-lived dashboard session does: every widget change
+    # re-executes the whole script. Growth across them is the OOM hypothesis.
+    # Counters are snapshotted per run, not accumulated, so the first (cold cache)
+    # load and the later (warm cache) loads can be told apart.
     rss_series: list[float] = []
+    counters_per_run: list[dict] = []
     for _ in range(runs):
+        reset_counters()
         at.run()
         rss_series.append(round(current_mb(), 1))
+        counters_per_run.append(dict(_COUNTERS))
 
-    peak = peak_mb()
-    errors = [str(e.value) for e in (at.exception or [])]
-    figures = len(plt.get_fignums())
-
-    # Metrics for the last rerun only, so they describe one page load. SafeSessionState
-    # has no .get(), so the key is read directly.
-    try:
-        metrics = dict(at.session_state["_metrics"])
-    except Exception:
-        metrics = {}
+    last = counters_per_run[-1] if counters_per_run else dict(_COUNTERS)
 
     return {
         "page": page,
         "base_mb": round(base, 1),
         "after_streamlit_mb": round(after_streamlit, 1),
         "after_libs_mb": round(after_libs, 1),
-        "peak_mb": round(peak, 1),
-        "view_cost_mb": round(peak - after_libs, 1),
-        "open_figures": figures,
-        "errors": errors,
+        "peak_mb": round(peak_mb(), 1),
+        "view_cost_mb": round(peak_mb() - after_libs, 1),
+        "open_figures": len(plt.get_fignums()),
+        "errors": [str(e.value) for e in (at.exception or [])],
         "runs": len(rss_series),
         "rss_after_each_run": rss_series,
-        "growth_over_runs_mb": round(rss_series[-1] - rss_series[0], 1) if len(rss_series) > 1 else 0.0,
-        "fig_points": metrics.get("fig_points", 0),
-        "png_bytes": metrics.get("png_bytes", 0),
-        "sb_calls": metrics.get("sb_calls", 0),
-        "figures_rendered": metrics.get("figures", 0),
-        "hotspots": [],
+        "growth_over_runs_mb": (
+            round(rss_series[-1] - rss_series[0], 1) if len(rss_series) > 1 else 0.0
+        ),
+        "counters_per_run": counters_per_run,
+        "fig_points": last["fig_points"],
+        "png_bytes": last["png_bytes"],
+        "figures_rendered": last["figures"],
+        "sb_calls": last["sb_calls"],
     }
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--page", choices=sorted(PAGES))
+    ap.add_argument("--page", choices=sorted(PAGE_NAMES))
     ap.add_argument("--all", action="store_true")
     ap.add_argument(
         "--runs", type=int, default=1,
@@ -250,7 +229,7 @@ def main() -> int:
 
     if args.all:
         # One subprocess per page, so each peak is that page's own high-water mark.
-        for page in ["attribution", "operational", "research_history", "everything"]:
+        for page in PAGE_NAMES:
             subprocess.run(
                 [sys.executable, __file__, "--page", page, "--runs", str(args.runs)],
                 check=False, cwd=ROOT,
@@ -262,9 +241,7 @@ def main() -> int:
 
     import json
 
-    result = measure(args.page, runs=args.runs)
-    result.pop("hotspots", None)
-    print(json.dumps(result))
+    print(json.dumps(measure(args.page, runs=args.runs)))
     return 0
 
 

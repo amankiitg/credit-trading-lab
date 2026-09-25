@@ -10,9 +10,15 @@ cron jobs, the notebooks or the sprint notes restarted the dashboard and dropped
 every open session for no reason.
 
 `render.yaml` now gives the dashboard a `buildFilter.paths` list: `dashboard/**`,
-`pyproject.toml`, `requirements.txt` and `scripts/write_render_secrets.py`. That last
-one is there because the build command runs it, so a change to it does change what
-this service builds. Only a change to one of those paths triggers a dashboard build now.
+`signals/**`, `risk/**`, `pyproject.toml`, `requirements.txt` and
+`scripts/write_render_secrets.py`. That last one is there because the build command
+runs it, so a change to it does change what this service builds. `signals/**` and
+`risk/**` are there because the remaining tab imports them at runtime, which was
+measured rather than guessed: rendering the page and listing the local modules pulled
+in gives `signals.etf_universe` (directly and through
+`dashboard.loader.load_close_matrix`) and `risk.live_risk` for the MCTR panel.
+`execution/**` is deliberately absent, which is what keeps the Alpaca keys off this
+service. Only a change to one of those paths triggers a dashboard build now.
 
 The two cron services were left alone; they were not part of the report.
 
@@ -104,3 +110,90 @@ Two things found while doing it, both verified against streamlit 1.61.1:
 514 tests pass. The 11 failures and 2 errors are pre-existing and all trace to the
 unbuilt `pycredit` C++ extension. No dashboard service was deployed or restarted by
 hand.
+
+## Removing the Strategy and Research tabs
+
+The dashboard is now the Trade Approval book alone.
+
+The tab to view mapping was unambiguous, so nothing needed confirming:
+
+| tab label | view module | outcome |
+|---|---|---|
+| Strategy Analytics | `dashboard/views/attribution.py` | removed |
+| Trade Approval | `dashboard/views/operational.py` | kept, the only tab left |
+| Research Archive | `dashboard/views/research_history.py` | removed |
+
+`app.py` now declares `st.tabs(["Trade Approval"])`. The tab wrapper was kept around
+the single view so the structure is unchanged if a tab is added back, though with one
+tab it is now redundant and could be dropped.
+
+**The injected script is gone, not fixed.** It clicked `tabs[1]` to reach Trade
+Approval after a fresh sign-in, because that is where the sign-in button lived. With
+one tab there is nothing to switch to, so the script has no purpose: there is no
+`tabs[1]` to select and a signed-in user is already looking at the only tab. Its
+`st.iframe` call and its `_was_logged_in` session marker went with it, which also
+removes the last use of the deprecated component namespace from the codebase.
+
+### Deleted
+
+Imports were checked repo-wide before anything was removed.
+
+  - `dashboard/views/attribution.py`, `dashboard/views/research_history.py` - each was
+    imported only by the tab that was removed.
+  - `dashboard/views/directional.py`, `dashboard/views/rv.py` - nothing imported either
+    before this change; they were already unreachable from the app.
+  - `dashboard/components/markers.py` - imported only by those two.
+  - `dashboard/components/downsample.py` - its only consumers were the two removed
+    pages. It is deleted rather than kept as a utility, because nothing uses it now;
+    if a chart-heavy tab comes back, this is the thing to bring back with it.
+
+Kept, deliberately, because something outside the app still needs them:
+
+  - `dashboard/loader.py` - `load_close_matrix` for the remaining tab, and
+    `load_features` for `tests/test_canonical.py`.
+  - `dashboard/components/regime_shade.py` - `tests/test_regime_shade.py` and
+    `scripts/build_notebook_v4.py`.
+  - `dashboard/views/today.py` with `conviction.py` and `signal_specs.py` - not
+    reachable from the app, but referenced by `tests/test_dashboard_smoke.py`,
+    `tests/test_dashboard_sanity.py`, `tests/test_conviction.py`,
+    `scripts/build_notebook_v4.py` and `scripts/today_view_screenshot.py`. They are
+    dead product code kept alive by their tests, which is a separate decision.
+  - `dashboard/supabase_client.py` - the remaining tab and both cron jobs.
+
+### Tests
+
+`tests/test_dashboard_memory.py` was removed with the helper it tested. Its
+replacement, `tests/test_dashboard_shell.py`, renders the real `dashboard/app.py`
+through `AppTest` and asserts it produces no exceptions, asserts the tab bar is
+exactly `["Trade Approval"]`, asserts the removed modules are gone and that the shared
+ones were kept, and keeps the two hygiene checks (no legacy component, every figure
+closed). The tab-label assertion is strict on purpose: before the change the same
+call reported all three labels, so it demonstrably bites.
+
+`GOOGLE_CLIENT_ID` is removed in the test before rendering. `app.py` rewrites
+`.streamlit/secrets.toml` when that variable is set, and a test must never overwrite a
+developer's local secrets file.
+
+### Measurements after the removal
+
+`scripts/measure_dashboard_memory.py` now measures the real `app.py` as well as the
+view, so the app's own overhead is included.
+
+| page | figures | line points | PNG | Supabase reads cold | warm | open figures | errors |
+|---|---|---|---|---|---|---|---|
+| app.py | 4 | 58 | 119 KiB | 6 | 0 | 0 | 0 |
+| operational (view) | 4 | 58 | 119 KiB | 6 | 0 | 0 | 0 |
+
+The app and the view are identical, so nothing in the shell adds render work.
+
+Against the three-tab dashboard measured in the previous commit, the same counters go
+from 13 figures, 93,842 line points and 722 KiB of PNG per load to 4 figures, 58 points
+and 119 KiB: **99.9% fewer plotted points and 84% less PNG**. Removing the two heavy
+pages removed essentially all of the plotting, which is a larger saving than the
+downsampling it now replaces.
+
+Peak RSS is 316 MiB median and 326 MiB max, essentially unchanged, and that is the
+expected result: the peak is dominated by the roughly 145 MiB import baseline, not by
+rendering. RSS across reruns rises once and then plateaus (281, 321, 322 MiB), which is
+the same no-leak shape as before. This is still not a metric to judge a change by; see
+the drift table above.

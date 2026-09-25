@@ -24,7 +24,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -1359,7 +1359,7 @@ def reconcile(
 
     report = {
         "date": str(run_date),
-        "generated_at": datetime.utcnow().isoformat(),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
         "total_legs_intended": len(orders),
         "total_fills_captured": len(fills),
         "flagged_discrepancies": flagged_count,

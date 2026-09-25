@@ -278,23 +278,39 @@ def _run() -> int:
             },
         }))
 
-        from execution.alerts import send_alert_email
-        drift_lines = "\n".join(
-            f"  {t}: cached ${d['cached']:,.2f}  live ${d['live']:,.2f}  diff ${d['diff']:,.2f}"
-            for t, d in drift.items()
-        )
-        send_alert_email(
-            subject=f"[credit-trading-lab] Position drift detected for {today}",
-            body=(
-                f"The cached position snapshot disagreed with live Alpaca "
-                f"positions before today's run_execution computed deltas:\n\n"
-                f"{drift_lines}\n\n"
-                f"This run still executed against the cached (pre-drift) "
-                f"snapshot, per the frozen-snapshot execution design -- see "
-                f"Panel H on the dashboard for the corrected current state "
-                f"and full context."
-            ),
-        )
+        # Best effort, and never blocking. The drift alert is already recorded in
+        # Supabase above, so a failure here is logged and the run continues. The
+        # import sits inside the try on purpose: the failure that actually bit us
+        # was a module which existed in the working tree but had never been
+        # committed, so it was missing on Render and raised ModuleNotFoundError
+        # here, before order submission. JobTimeout derives from BaseException, so
+        # a hard deadline still interrupts this.
+        try:
+            from execution.alerts import send_alert_email
+
+            drift_lines = "\n".join(
+                f"  {t}: cached ${d['cached']:,.2f}  live ${d['live']:,.2f}  diff ${d['diff']:,.2f}"
+                for t, d in drift.items()
+            )
+            send_alert_email(
+                subject=f"[credit-trading-lab] Position drift detected for {today}",
+                body=(
+                    f"The cached position snapshot disagreed with live Alpaca "
+                    f"positions before today's run_execution computed deltas:\n\n"
+                    f"{drift_lines}\n\n"
+                    f"This run still executed against the cached (pre-drift) "
+                    f"snapshot, per the frozen-snapshot execution design -- see "
+                    f"Panel H on the dashboard for the corrected current state "
+                    f"and full context."
+                ),
+            )
+        except Exception as exc:
+            logger.error(
+                "position-drift alert email failed (%s: %s) -- continuing. The "
+                "alert is already recorded in Supabase; an alert must never block "
+                "trading.",
+                type(exc).__name__, exc,
+            )
     else:
         # Only a real run may clear the alert: in dry-run no broker comparison
         # happened, so there is nothing to clear.

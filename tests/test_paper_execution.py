@@ -1480,6 +1480,7 @@ def _run_execution_with_stub(
     submit_failure: dict[str, Exception] | None = None,
     dry_run: bool = False,
     signal_as_of: str | None = None,
+    drift: dict | None = None,
 ) -> dict:
     """Drive scripts.run_execution.main() with Alpaca and Supabase stubbed.
 
@@ -1489,7 +1490,8 @@ def _run_execution_with_stub(
     hardcoded expectation.
 
     `signal_as_of` overrides the stored signal date, which is how the staleness
-    guard is reached; it defaults to today.
+    guard is reached; it defaults to today. `drift` forces the drift check to
+    report a divergence, which is the only way into the alert branch.
     """
     import json as _json
     from datetime import date as _date
@@ -1566,6 +1568,14 @@ def _run_execution_with_stub(
     monkeypatch.setattr(
         cal_mod, "record_run", lambda job, d: recorded.setdefault("run", (job, d))
     )
+
+    if drift is not None:
+        # run_execution imports this at call time, so patching the source module
+        # is what the drift branch actually sees.
+        monkeypatch.setattr(
+            ap_mod, "check_position_drift",
+            lambda client, cached, dry_run=False: drift,
+        )
 
     settings = {
         "signal_as_of_date": signal_as_of or today,
@@ -1743,6 +1753,94 @@ def test_run_trades_a_signal_at_the_staleness_limit(tmp_path, monkeypatch, caplo
     assert result["recorded"]["run"][0] == "run_execution"
     assert "STALE SIGNAL" not in caplog.text
     assert "is 2 NYSE session(s) old" in caplog.text
+
+
+# ------------------------------------------------- v9.4 follow-up: alerts are best effort
+
+_DRIFT = {"SPY": {"cached": 5000.0, "live": 4000.0, "diff": 1000.0}}
+
+
+def test_run_completes_when_the_alerts_module_cannot_be_imported(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    """An alert must never block trading, not even a missing alerts module.
+
+    execution/alerts.py existed in the working tree but had never been committed,
+    so on Render the drift branch raised ModuleNotFoundError at the import, which
+    sits before order submission. The whole run aborted and nothing traded. Simulating
+    the missing module is the point: committing the file fixes today's instance of
+    this, but the call site has to survive the class of failure.
+    """
+    import logging
+    import sys
+
+    # The canonical way to make an import fail, exactly as if the file were absent.
+    monkeypatch.setitem(sys.modules, "execution.alerts", None)
+
+    with caplog.at_level(logging.INFO):
+        result = _run_execution_with_stub(
+            tmp_path, monkeypatch,
+            shortable_map={"SPY": True, "LQD": True, "GLD": True},
+            drift=_DRIFT,
+        )
+
+    assert result["exit_code"] == 0, "a failed alert must not fail the run"
+    assert result["submit_calls"] == 3, "all three legs were still submitted"
+    assert result["recorded"]["run"][0] == "run_execution", "the run completed"
+    assert "position-drift alert email failed" in caplog.text
+    assert "must never block trading" in caplog.text
+    # The drift was still reported to the operator through the channel that
+    # matters, so the failure only lost the email, not the record.
+    assert "POSITION DRIFT" in caplog.text
+
+
+def test_run_completes_when_the_alert_send_raises(tmp_path, monkeypatch, caplog) -> None:
+    """A raising send is caught too, so a Resend outage cannot stop the book trading."""
+    import logging
+
+    import execution.alerts as alerts_mod
+
+    def _boom(subject, body):
+        raise RuntimeError("resend returned 500")
+
+    monkeypatch.setattr(alerts_mod, "send_alert_email", _boom)
+
+    with caplog.at_level(logging.INFO):
+        result = _run_execution_with_stub(
+            tmp_path, monkeypatch,
+            shortable_map={"SPY": True, "LQD": True, "GLD": True},
+            drift=_DRIFT,
+        )
+
+    assert result["exit_code"] == 0
+    assert result["submit_calls"] == 3
+    assert "position-drift alert email failed (RuntimeError: resend returned 500)" in caplog.text
+
+
+def test_a_failed_alert_does_not_hide_the_absence_of_drift_handling(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    """Negative control: with no drift the alert branch is never entered.
+
+    Otherwise the two tests above would pass even if the guard were wrapped around
+    something that always runs, and a successful send could be silently swallowed.
+    """
+    import logging
+    import sys
+
+    monkeypatch.setitem(sys.modules, "execution.alerts", None)
+
+    with caplog.at_level(logging.INFO):
+        result = _run_execution_with_stub(
+            tmp_path, monkeypatch,
+            shortable_map={"SPY": True, "LQD": True, "GLD": True},
+            drift=None,
+        )
+
+    assert result["exit_code"] == 0
+    assert result["submit_calls"] == 3
+    assert "position-drift alert email failed" not in caplog.text
+    assert "POSITION DRIFT" not in caplog.text
 
 
 def test_run_halts_cleanly_and_stays_unrecorded_on_transport_failure(

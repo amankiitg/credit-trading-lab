@@ -74,3 +74,15 @@ services:
       - key: ALPACA_PAPER_SECRET_KEY
         sync: false
       # No Google OIDC secrets here.
+      # Position-drift email alert (execution/alerts.py), via the Resend
+      # HTTP API -- not SMTP, since Render blocks outbound SMTP ports on
+      # free-tier services but HTTPS (the API endpoint) is never blocked.
+      # ALERT_EMAIL_TO falls back to ALLOWED_EMAIL if unset. RESEND_FROM
+      # is optional -- defaults to Resend's shared onboarding@resend.dev
+      # sender, which needs no domain verification.
+      - key: RESEND_API_KEY
+        sync: false
+      - key: ALERT_EMAIL_TO
+        sync: false
+      - key: RESEND_FROM
+        sync: false

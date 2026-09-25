@@ -87,23 +87,41 @@ The update also served as the live proof of item 3: `updated_at` moved from
 
 ## Verification
 
-  - 469 passed. The 11 failures and 2 errors are pre-existing and all trace to the
-    unbuilt `pycredit` C++ extension: `ModuleNotFoundError: No module named
+  - 472 passed, including the three alerts-guard tests described below. The 11
+    failures and 2 errors are pre-existing and all trace to the unbuilt `pycredit`
+    C++ extension: `ModuleNotFoundError: No module named
     'pycredit'`, plus `test_today_view_renders_six_cards` whose missing cards are all
     credit/RV signals from that same module.
   - The user's constraint was honoured: no job run was triggered. The only live write
     was item 4's approved UPDATE.
 
-## Found while staging, not fixed -- flagging only
+## Follow-up -- the `execution.alerts` risk, fixed before Monday's run
 
-`scripts/run_execution.py` imports `execution.alerts` at the position-drift branch,
-and `execution/alerts.py` is untracked, so it is not in the repository. This is
-already true of `origin/main`, so it is not a regression from this work, and it is
-not a failing test here because the module exists in the local working tree.
+`scripts/run_execution.py` imported `execution.alerts` at the position-drift branch
+while `execution/alerts.py` was untracked, so it was absent from the repository. That
+was already true of `origin/main`. The failure was real, not theoretical:
+`ModuleNotFoundError` propagated out of the drift branch, which sits before order
+submission and was not wrapped in a try/except, so a run that detected drift aborted
+with nothing traded and `cron_runs` unwritten.
 
-If it matters at runtime, it fails like this: `ModuleNotFoundError` propagates out
-of the drift branch, which sits before order submission and is not wrapped in a
-try/except, so a run that detects drift would abort with `cron_runs` unwritten. Left
-alone because it is a separate, apparently unfinished feature (`render.yaml` also
-carries uncommitted `RESEND_API_KEY` entries for it) and the user asked for three
-specific things in this deploy.
+Fixed on both sides, because either one alone leaves a hole.
+
+  - `execution/alerts.py` and `tests/test_alerts.py` were finished, so they are now
+    committed together with the `RESEND_API_KEY`, `ALERT_EMAIL_TO` and `RESEND_FROM`
+    entries in `render.yaml`. Finished meant: no TODOs, and five tests covering the
+    unconfigured skip, the `ALLOWED_EMAIL` fallback, the `RESEND_FROM` override, a
+    transport error and a non-2xx response. `send_alert_email` returns a bool and
+    swallows every exception, so a send failure was already non-blocking.
+  - The import and the call are wrapped in try/except as well, logging an ERROR and
+    continuing. The import is inside the try on purpose: a module that exists in the
+    working tree but not in the repository is exactly the failure that happened, and
+    committing the file only fixes today's instance of it. `JobTimeout` derives from
+    `BaseException`, so a hard deadline still interrupts. The Supabase
+    `position_drift_alert` write stays outside the try, so losing the email never
+    loses the record, and the log says so.
+
+Proven rather than assumed. With the guard removed the new test fails with
+`ModuleNotFoundError: import of execution.alerts halted; None in sys.modules` at
+`scripts/run_execution.py:281`, the same line and the same exception as production.
+With the guard it passes. Three tests cover it: the import failing, the send raising,
+and a negative control with no drift so the branch is provably what is exercised.

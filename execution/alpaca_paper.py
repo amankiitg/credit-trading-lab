@@ -23,7 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
@@ -104,6 +104,7 @@ logger = logging.getLogger(__name__)
 
 REASON_QTY_ZERO: str = "QTY_ROUNDS_TO_ZERO"
 GUARD_SKIPPED_NOT_SHORTABLE: str = "SKIPPED_NOT_SHORTABLE"  # blocked before submit
+GUARD_CROSSING_FLAT_NOT_SHORTABLE: str = "CROSSING_FLAT_NOT_SHORTABLE"  # open leg of a crossing
 REASON_NOT_SHORTABLE_AT_SUBMIT: str = "ASSET_NOT_SHORTABLE_AT_SUBMIT"
 REASON_SHORTABLE_CHECK_FAILED: str = "SHORTABLE_CHECK_FAILED"
 REASON_ALPACA_ERROR: str = "ALPACA_API_ERROR"
@@ -640,6 +641,23 @@ def get_shortable_flags(client, tickers: list[str]) -> dict[str, bool]:
     return flags
 
 
+def _is_crossing_open_leg(spec: OrderSpec, orders: list[OrderSpec]) -> bool:
+    """True when this sell_to_open leg is the second half of a long-to-short crossing.
+
+    A crossing closes an existing long (leg 1, sell_to_close) before opening the
+    short (leg 2, sell_to_open). If the open leg is blocked, leg 1 has usually
+    already run or will run, so the name ends up FLAT rather than short.
+    """
+    if spec.position_intent != "sell_to_open":
+        return False
+    return any(
+        o.ticker == spec.ticker
+        and o.position_intent == "sell_to_close"
+        and o.leg == 1
+        for o in orders
+    )
+
+
 def apply_shortable_filter(
     orders: list[OrderSpec],
     shortable: dict[str, bool],
@@ -648,15 +666,20 @@ def apply_shortable_filter(
     not shortable, and leave every other leg untouched.
 
     Pure function, no I/O, so the policy is testable without a broker. A blocked
-    leg becomes SKIPPED_NOT_SHORTABLE and keeps its position in the order list,
-    so it still reaches the fill records, the reconciliation JSON, and the
-    Supabase order_rejections audit trail.
+    leg keeps its position in the order list, so it still reaches the fill
+    records, the reconciliation JSON, and the Supabase order_rejections audit
+    trail.
 
-    Policy consequence, recorded in the sprint notes as a known live
-    constraint: for a long-to-short crossing on a non-shortable name, leg 1
-    (sell_to_close) still runs and leg 2 (sell_to_open) is skipped, so the book
-    ends FLAT in that name rather than short. The wanted short is missing and
-    tracked, never silently approximated.
+    The reason code distinguishes the two outcomes, because they leave the book
+    in different places and attribution has to be able to tell them apart:
+      - SKIPPED_NOT_SHORTABLE: an ordinary short leg. The name simply does not
+        get shorter (or does not get short at all).
+      - CROSSING_FLAT_NOT_SHORTABLE: the open leg of a long-to-short crossing,
+        whose sell_to_close leg still runs. The name ends FLAT, which is closer
+        to a short target than staying long, so it is the smaller deviation.
+
+    Policy consequence, recorded in the sprint notes as a known live constraint:
+    the wanted short is missing and tracked, never silently approximated.
     """
     result: list[OrderSpec] = []
     for spec in orders:
@@ -665,11 +688,19 @@ def apply_shortable_filter(
             and spec.position_intent == "sell_to_open"
             and not shortable.get(spec.ticker, False)
         ):
-            logger.warning(
-                "%s: %s cannot be sold short -- skipping sell_to_open leg=%d (~$%.0f)",
-                GUARD_SKIPPED_NOT_SHORTABLE, spec.ticker, spec.leg, spec.notional,
+            crossing = _is_crossing_open_leg(spec, orders)
+            reason = (
+                GUARD_CROSSING_FLAT_NOT_SHORTABLE if crossing
+                else GUARD_SKIPPED_NOT_SHORTABLE
             )
-            result.append(_replace_status(spec, GUARD_SKIPPED_NOT_SHORTABLE))
+            logger.warning(
+                "%s: %s cannot be sold short -- skipping sell_to_open leg=%d "
+                "(~$%.0f)%s",
+                reason, spec.ticker, spec.leg, spec.notional,
+                "; its sell_to_close leg still runs, so the name ends FLAT not short"
+                if crossing else "",
+            )
+            result.append(_replace_status(spec, reason))
             continue
         result.append(spec)
     return result
@@ -1283,7 +1314,17 @@ def reconcile(
             }
         discrepancy = fill.filled_notional - fill.intended_notional
         abs_tol = max(RECONCILE_ABS_TOL, RECONCILE_REL_TOL * abs(fill.intended_notional))
-        flagged = abs(discrepancy) > abs_tol
+        if fill.position_intent in _SHORT_QTY_INTENTS and fill.fill_price > 0:
+            # Short legs are quantized to whole shares, so floor(notional/price)
+            # can leave up to one share's value unallocated. That is the known
+            # design (see v8.6 notes), not a discrepancy, so one share's value
+            # is admitted rather than flagged.
+            abs_tol = max(abs_tol, fill.fill_price)
+        # A dry-run leg was never meant to reach the broker, so it has no fill
+        # to be compared against. Flagging it would make every dry run look like
+        # a catastrophe and hide the legs that genuinely did not execute.
+        comparable = fill.guard_status != "DRY_RUN"
+        flagged = comparable and abs(discrepancy) > abs_tol
         by_ticker[t]["legs"].append({
             "order_id": fill.order_id,
             "leg": fill.leg,
@@ -1294,6 +1335,7 @@ def reconcile(
             "fill_price": round(fill.fill_price, 4),
             "discrepancy": round(discrepancy, 4),
             "flagged": flagged,
+            "tolerance": round(abs_tol, 4),
             "simulated_cost": round(fill.simulated_cost, 6),
             "status": fill.status,
             "reason_code": fill.reason_code,

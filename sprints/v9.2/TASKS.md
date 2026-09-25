@@ -94,8 +94,53 @@ redeploys the `credit-lab-execution` cron. See `notes.md`.
   causes. Confirm the execution test suite passes.
 
   Acceptance: notes record both events; full execution suite green.
-  Result: `sprints/v9.2/notes.md`, `sprints/v9.2/TASKS.md`. 66 passed in
-  `tests/test_paper_execution.py`. Full suite 398 passed; the 11 failures and 2
-  errors are pre-existing and proven identical at HEAD in a clean worktree
-  (missing `pycredit` extension), unrelated to this work.
+  Result: `sprints/v9.2/notes.md`, `sprints/v9.2/TASKS.md`. Full suite 398 passed;
+  the 11 failures and 2 errors are pre-existing and proven identical at HEAD in a
+  clean worktree (missing `pycredit` extension), unrelated to this work.
   Files: `sprints/v9.2/notes.md`, `sprints/v9.2/TASKS.md`
+
+- [x] **T4: Review changes after approval**
+
+  Four changes requested on review, plus one hazard found while preparing the
+  dry run.
+
+  Acceptance: all four requested changes implemented and tested; the dry run
+  documented.
+  Result:
+  1. `CROSSING_FLAT_NOT_SHORTABLE` as a distinct code for the open leg of a
+     long-to-short crossing; crossing behaviour kept, since ending flat is the
+     smaller deviation from a short target than staying long.
+  2. The `order_rejections` write-failure ERROR line now prints every field of
+     every affected leg, because the disk is temporary and the log is the
+     fallback.
+  3. `reconcile()` admits one share's value as tolerance for whole-share short
+     legs, and records the `tolerance` used per leg. Flagged legs on the
+     2026-09-24 artifact drop from 4 to 2; long legs keep the 0.5% tolerance.
+  4. Pre-commit hooks: none exist in this repository, verified (no config, no
+     `hooksPath`, samples only, no lint tooling installed). The equivalent checks
+     were run by hand: Pylance clean on every changed file, plus an AST
+     unused-import scan that found and removed three unused imports, one of them
+     this sprint's own.
+  5. Found and fixed while preparing the dry run, by rehearsing `main()` locally
+     rather than only reading it: dry-run mode was writing `live_nav` (with the
+     placeholder 100,000), writing a zero `pnl_log` row, clearing the drift
+     alert, recording `cron_runs` (which would have made the real scheduled run
+     skip itself the same day via the idempotency gate), and flagging every
+     dry-run leg as a reconciliation discrepancy. All five are now skipped or
+     excluded in dry-run, each with an explicit log line. A dry run writes
+     nothing to Supabase.
+  Files: `execution/alpaca_paper.py`, `scripts/run_execution.py`,
+  `tests/test_paper_execution.py`, `sprints/v9.2/notes.md`
+
+- [x] **T5: Deploy**
+
+  Push the sprint work so the Render execution cron picks it up. Then the operator
+  runs a manual dry run with `DRY_RUN=true` to validate the Python version Render
+  uses.
+
+  Acceptance: pushed; dry-run confirmation lines documented in `notes.md`.
+  Result: pushed to `main`. The clean-dry-run log sequence and the lines that
+  indicate a problem are recorded in the notes under "What a clean dry run looks
+  like". 71 passed in `tests/test_paper_execution.py`.
+  Files: `sprints/v9.2/notes.md`
+

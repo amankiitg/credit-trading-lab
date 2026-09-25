@@ -22,6 +22,7 @@ import pytest
 from execution.alpaca_paper import (
     DELTA_MIN_NOTIONAL,
     DUST_THRESHOLD_USD,
+    GUARD_CROSSING_FLAT_NOT_SHORTABLE,
     GUARD_SKIPPED_NOT_SHORTABLE,
     MAX_ORDERS_PER_RUN,
     MAX_POSITION_PCT_OF_NAV,
@@ -34,7 +35,6 @@ from execution.alpaca_paper import (
     REASON_SUBMIT_EXCEPTION,
     FillRecord,
     OrderSpec,
-    SubmitOutcome,
     apply_guards,
     apply_shortable_filter,
     build_fill_records,
@@ -755,6 +755,74 @@ def test_qty_zero_skipped() -> None:
     mock_client.submit_order.assert_not_called()
 
 
+# ---------------------------------------------------------------- T1: reconciliation tolerance
+
+def test_reconciliation_tolerates_one_share_of_short_rounding(tmp_path: Path) -> None:
+    """A whole-share short leg filling one share short is not a discrepancy.
+
+    TLT sized at $345.24 floors to 4 shares at $80.26, so it fills $321.04. That
+    $24.20 gap is the documented whole-share design, not an execution error.
+    """
+    import execution.alpaca_paper as ap_module
+    ap_module.LOG_DIR = tmp_path
+    try:
+        spec = _pending_spec("TLT", "sell", 345.24, "sell_to_open", -27_756.78)
+        fills = [
+            FillRecord("TLT", "oid-tlt", "sell", "sell_to_open",
+                       345.24, 321.04, 80.26, 0.0, "FILLED", "PENDING"),
+        ]
+
+        report = reconcile([spec], fills, run_date=date(2026, 9, 24))
+        leg = report["by_ticker"]["TLT"]["legs"][0]
+
+        assert leg["tolerance"] == pytest.approx(80.26), "one share's value is admitted"
+        assert leg["flagged"] is False
+        assert report["flagged_discrepancies"] == 0
+    finally:
+        ap_module.LOG_DIR = tmp_path
+
+
+def test_reconciliation_still_flags_a_short_gap_beyond_one_share(tmp_path: Path) -> None:
+    """Negative control: the tolerance must not swallow a real shortfall."""
+    import execution.alpaca_paper as ap_module
+    ap_module.LOG_DIR = tmp_path
+    try:
+        # Two shares of rounding at $80.26, so $160.52 missing.
+        spec = _pending_spec("TLT", "sell", 500.00, "sell_to_open", -27_756.78)
+        fills = [
+            FillRecord("TLT", "oid-tlt", "sell", "sell_to_open",
+                       500.00, 339.48, 80.26, 0.0, "FILLED", "PENDING"),
+        ]
+
+        report = reconcile([spec], fills, run_date=date(2026, 9, 24))
+        leg = report["by_ticker"]["TLT"]["legs"][0]
+
+        assert leg["flagged"] is True
+        assert report["flagged_discrepancies"] == 1
+    finally:
+        ap_module.LOG_DIR = tmp_path
+
+
+def test_reconciliation_tolerance_not_applied_to_long_legs(tmp_path: Path) -> None:
+    """A long leg is notional-precise, so it gets no whole-share allowance."""
+    import execution.alpaca_paper as ap_module
+    ap_module.LOG_DIR = tmp_path
+    try:
+        spec = _pending_spec("SPY", "buy", 5000.0, "buy_to_open", 27_000.0)
+        fills = [
+            FillRecord("SPY", "oid-spy", "buy", "buy_to_open",
+                       5000.0, 4900.0, 500.0, 0.0, "FILLED", "PENDING"),
+        ]
+
+        report = reconcile([spec], fills, run_date=date(2026, 9, 24))
+        leg = report["by_ticker"]["SPY"]["legs"][0]
+
+        assert leg["tolerance"] == pytest.approx(25.0), "0.5% of 5000, not one share"
+        assert leg["flagged"] is True
+    finally:
+        ap_module.LOG_DIR = tmp_path
+
+
 def test_buy_to_close_uses_qty() -> None:
     """buy_to_close (closing a short) also uses qty to match the shorted share count."""
     from unittest.mock import patch, MagicMock
@@ -1362,6 +1430,28 @@ def test_shorts_requiring_check_only_lists_pending_sell_to_open() -> None:
     assert shorts_requiring_check(orders) == ["LQD"]
 
 
+def test_shortable_filter_distinguishes_the_open_leg_of_a_crossing() -> None:
+    """A blocked crossing open leg gets its own code, because the book ends FLAT.
+
+    Long SPY to short SPY runs sell_to_close then sell_to_open. Blocking only the
+    open leg leaves the name flat, which is closer to a short target than staying
+    long, so the two cases must be separable in attribution.
+    """
+    crossing = compute_delta_orders({"SPY": -0.05}, {"SPY": 5000.0}, paper_nav=100_000.0)
+    assert [o.position_intent for o in crossing] == ["sell_to_close", "sell_to_open"]
+
+    filtered = apply_shortable_filter(crossing, {"SPY": False})
+    by_leg = {o.leg: o.guard_status for o in filtered}
+    assert by_leg[1] == "PENDING", "the closing leg must still run"
+    assert by_leg[2] == GUARD_CROSSING_FLAT_NOT_SHORTABLE
+
+    # An ordinary short leg, with no crossing, keeps the plain code.
+    ordinary = compute_delta_orders({"GLD": -0.02}, {}, paper_nav=100_000.0)
+    assert apply_shortable_filter(ordinary, {"GLD": False})[0].guard_status == (
+        GUARD_SKIPPED_NOT_SHORTABLE
+    )
+
+
 def test_get_shortable_flags_reads_the_asset_endpoint() -> None:
     client = MagicMock()
     client.get_asset.side_effect = lambda t: MagicMock(shortable=(t != "LQD"))
@@ -1388,6 +1478,7 @@ def _run_execution_with_stub(
     *,
     shortable_map: dict[str, bool],
     submit_failure: dict[str, Exception] | None = None,
+    dry_run: bool = False,
 ) -> dict:
     """Drive scripts.run_execution.main() with Alpaca and Supabase stubbed.
 
@@ -1454,7 +1545,7 @@ def _run_execution_with_stub(
     client.get_order_by_id.side_effect = lambda oid: submitted_orders[oid]
 
     monkeypatch.setattr(ap_mod, "connect", lambda dry_run=False: client)
-    monkeypatch.setattr(ap_mod, "DRY_RUN_DEFAULT", False)
+    monkeypatch.setattr(ap_mod, "DRY_RUN_DEFAULT", dry_run)
     monkeypatch.setattr(ap_mod, "LOG_DIR", tmp_path / "logs")
 
     feed_calls: list = []
@@ -1512,6 +1603,7 @@ def _run_execution_with_stub(
         "recorded": recorded,
         "feed_calls": feed_calls,
         "submit_calls": client.submit_order.call_count,
+        "settings": settings,
         "reconcile_log": tmp_path / "logs" / f"reconciliation_{today}.json",
     }
 
@@ -1603,3 +1695,29 @@ def test_run_halts_cleanly_and_stays_unrecorded_on_transport_failure(
     assert codes["SPY"] == REASON_SUBMIT_EXCEPTION
     assert codes["LQD"] == REASON_SKIPPED_AFTER_HALT
     assert codes["GLD"] == REASON_SKIPPED_AFTER_HALT
+
+
+def test_dry_run_writes_no_live_state(tmp_path, monkeypatch) -> None:
+    """A dry run must not mutate live Supabase state.
+
+    It never queries Alpaca, so nav_live is the placeholder 100,000 and there are
+    no fills. Writing either the placeholder NAV or a zero P&L row would corrupt
+    the record the next real run depends on.
+    """
+    result = _run_execution_with_stub(
+        tmp_path, monkeypatch,
+        shortable_map={"SPY": True, "LQD": True, "GLD": True},
+        dry_run=True,
+    )
+
+    assert result["exit_code"] == 0
+    assert result["submit_calls"] == 0, "a dry run must not submit anything"
+    assert result["written"]["pnl"] == [], "no fabricated P&L row"
+    assert result["written"]["positions"] == []
+    assert result["written"]["rejections"] == []
+    assert result["settings"]["live_nav"] == "100000", (
+        "the placeholder NAV must never be written over the account NAV"
+    )
+    assert "run" not in result["recorded"], (
+        "recording cron_runs in a dry run would make the real run skip itself"
+    )

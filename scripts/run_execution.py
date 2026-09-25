@@ -97,7 +97,6 @@ def main() -> int:
         fetch_decision_for_date,
         get_auto_approve,
         set_setting,
-        write_cron_run,
         write_live_attribution,
         write_order_rejections,
         write_pnl_log,
@@ -167,8 +166,8 @@ def main() -> int:
         r["ticker"]: float(r["signed_notional"]) for r in _pos_rows
     }
     if not current_notionals:
-        # First ever run — no Supabase snapshot yet; read live from Alpaca
-        logger.info("no Supabase positions found — reading live from Alpaca (first run)")
+        # First ever run -- no Supabase snapshot yet; read live from Alpaca
+        logger.info("no Supabase positions found -- reading live from Alpaca (first run)")
         current_notionals = get_current_positions(client, dry_run=dry_run)
     logger.info("current positions: %s", current_notionals)
 
@@ -177,7 +176,7 @@ def main() -> int:
     #        snapshot on purpose (P4: execute exactly what Panel H showed at
     #        approval time), so a divergence here would otherwise compute
     #        deltas against a phantom book with no visible signal. Alert
-    #        only — execution below still uses current_notionals as-is.
+    #        only -- execution below still uses current_notionals as-is.
     from execution.alpaca_paper import check_position_drift
     drift = check_position_drift(client, current_notionals, dry_run=dry_run)
     if drift:
@@ -210,7 +209,10 @@ def main() -> int:
             ),
         )
     else:
-        set_setting("position_drift_alert", "")
+        # Only a real run may clear the alert: in dry-run no broker comparison
+        # happened, so there is nothing to clear.
+        if not dry_run:
+            set_setting("position_drift_alert", "")
 
     # -- Run v8.2 signal only if not already loaded from Supabase
     if not target_weights:
@@ -295,10 +297,20 @@ def main() -> int:
                 [(r["ticker"], r["reason_code"]) for r in rejection_rows],
             )
         else:
+            # Render's disk is ephemeral, so if the table write fails these log
+            # lines are the ONLY remaining record of a rejected leg. Print every
+            # field needed to reconstruct the row, not just a count.
+            detail_lines = "\n".join(
+                "    ticker={ticker} intent={position_intent} leg={leg} "
+                "notional=${requested_notional:,.2f} status={status} "
+                "reason_code={reason_code} detail={detail}".format(**row)
+                for row in rejection_rows
+            )
             logger.error(
-                "order_rejections write FAILED for %d leg(s) -- the local "
-                "reconciliation JSON is the only remaining record",
-                len(rejection_rows),
+                "order_rejections write FAILED for %d leg(s). The reconciliation "
+                "JSON is local and the disk is temporary, so these details are "
+                "the only remaining record:\n%s",
+                len(rejection_rows), detail_lines,
             )
     else:
         logger.info("order_rejections: no rejected or skipped legs this run")
@@ -347,7 +359,17 @@ def main() -> int:
             write_live_attribution(live_rows)
 
     # Update live_nav with real post-trade Alpaca NAV so tonight's Panel H is accurate.
-    set_setting("live_nav", str(round(nav_live, 2)))
+    # A dry run must not: Alpaca was never queried there, so nav_live is the
+    # placeholder constant and writing it would silently replace the account NAV
+    # with 100,000 in the settings table that Panel H sizes against.
+    if dry_run:
+        logger.info(
+            "dry run: NOT writing live_nav (nav_live=%.2f is the placeholder, "
+            "Alpaca was not queried)",
+            nav_live,
+        )
+    else:
+        set_setting("live_nav", str(round(nav_live, 2)))
 
     # Write positions snapshot to Supabase -- fetch AFTER fills so the first
     # run (flat account before trades) still records real post-fill positions.
@@ -365,18 +387,22 @@ def main() -> int:
     if position_rows:
         write_positions(position_rows)
 
-    # Write P&L log row
+    # Write P&L log row. Skipped in dry-run: nothing executed, so a zero row
+    # would be a fabricated P&L record for a day that did not trade.
     total_gross = sum(f.filled_notional for f in fills if f.status == "FILLED")
     total_net_pnl = -sum(f.simulated_cost for f in fills if f.status == "FILLED")
     total_cost = sum(f.simulated_cost for f in fills if f.status == "FILLED")
 
-    write_pnl_log({
-        "trade_date": today,
-        "gross_pnl": round(total_gross, 4),
-        "net_pnl": round(total_net_pnl, 4),
-        "turnover_cost": round(total_cost, 4),
-        "borrow_cost": 0.0,
-    })
+    if dry_run:
+        logger.info("dry run: NOT writing pnl_log (no fills executed)")
+    else:
+        write_pnl_log({
+            "trade_date": today,
+            "gross_pnl": round(total_gross, 4),
+            "net_pnl": round(total_net_pnl, 4),
+            "turnover_cost": round(total_cost, 4),
+            "borrow_cost": 0.0,
+        })
 
     # -- 12. Record run. A halted run is deliberately NOT recorded: cron_runs is
     #        the idempotency gate, so leaving it unwritten lets the next tick
@@ -388,6 +414,16 @@ def main() -> int:
             today,
         )
         return 2
+
+    # A dry run must not record either. Writing cron_runs would mark the date as
+    # done and the real scheduled run that day would skip itself.
+    if dry_run:
+        logger.info(
+            "dry run: NOT recording cron_runs (nothing executed; %s stays open "
+            "for the real run)",
+            today,
+        )
+        return 0
 
     record_run("run_execution", today)
     logger.info("run_execution complete for %s", today)

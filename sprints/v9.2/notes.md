@@ -87,7 +87,120 @@ log is therefore the only audit trail for such a leg, which is why T1 persists i
   retry), and the process exits 2.
 - If the `order_rejections` write itself fails, the run logs ERROR and continues.
   The book being recorded matters more than the audit row, and the loss is
-  reported rather than silent. The local reconciliation JSON still holds it.
+  reported rather than silent. Because Render's disk is temporary, that ERROR line
+  prints the full detail of every affected leg (ticker, intent, leg number,
+  notional, status, reason code, broker message), so the log alone is enough to
+  reconstruct the rows. A bare count would not be.
+
+---
+
+## 2026-09-24 -- Review changes after approval
+
+### Crossing reason code (review item 1)
+
+`CROSSING_FLAT_NOT_SHORTABLE` added as a distinct code for the open leg of a
+long-to-short crossing on a non-shortable name. The crossing behaviour is kept:
+ending flat is closer to a short target than staying long, so it is the smaller
+deviation. The code exists so the two outcomes are separable in attribution.
+
+### One-share tolerance in reconciliation (review item 3)
+
+`reconcile()` now admits one share's value as tolerance for legs submitted as
+whole-share qty (`sell_to_open`, `buy_to_close`), because `floor(notional/price)`
+can leave up to one share unallocated. That is the documented v8.6 design, not an
+execution error. The tolerance actually applied is written into each leg record as
+`tolerance`, so the log is self-documenting.
+
+Effect on the 2026-09-24 artifact: flagged legs drop from 4 to 2. TLT (intended
+345.24, filled 321.04) and IEF (intended 257.30, filled 180.36) are no longer
+flagged, while LQD and GLD stay flagged because those legs genuinely never
+filled. Long legs are unaffected: SPY keeps the 0.5% tolerance, so a real long
+shortfall is still caught.
+
+### Audit write failure detail (review item 2)
+
+Covered above: the ERROR line now carries every field of every rejected leg.
+
+### Dry run must not mutate live state (found while preparing the dry run)
+
+The execution cron was asked to be dry-run on Render. Reading the code for that,
+three live-state writes turned out to be reachable in dry-run mode, all computed
+from values that are placeholders when Alpaca is not contacted:
+
+- `live_nav` was overwritten with the `PAPER_NAV_DEFAULT` of 100,000, replacing
+the real account NAV that Panel H sizes against.
+- `pnl_log` got a zero row for a day that did not trade.
+- the position drift alert was cleared, even though no broker comparison had been
+made.
+
+All three are now skipped when `dry_run` is set, each with an explicit log line
+saying so. A dry run writes nothing to Supabase.
+
+Rehearsing the whole run locally, rather than only reading the code, then turned
+up two more, both worse than the first three:
+
+- `record_run` was still called at the end of a dry run, so `cron_runs` got a row
+  for the dry-run date. `cron_runs` is the idempotency gate, so that row would
+  have made the REAL scheduled run that same day skip itself with
+  `already ran for <date> -- exit 0 (idempotent)`. A manual dry run would have
+  silently cancelled the day's rebalance. Now skipped in dry-run.
+- `reconcile()` flagged every dry-run leg as a discrepancy, because a `DRY_RUN`
+  leg has intended notional and zero fill by construction. That made every dry run
+  look like a total failure and buried the legs that genuinely did not execute.
+  `DRY_RUN` legs are now excluded from flagging.
+
+---
+
+## What a clean dry run looks like
+
+After setting `DRY_RUN=true` on the Render execution cron and triggering it
+manually, these are the lines that confirm it ran correctly and touched nothing.
+The sequence below is the verified output of a full local rehearsal of
+`run_execution.main()` in dry-run mode, with every Supabase writer intercepted so
+a real write would have been visible. No writer fired.
+
+```
+executing: decision=proposed auto_approve=True for <as_of_date>
+dry_run=True
+nav=<real frozen nav> (frozen Supabase; live Alpaca=100000.00)
+orders: 6 total, 0 pending, 6 blocked before submit
+order_rejections: no rejected or skipped legs this run
+reconcile: 6 legs, 0 flagged discrepancies
+feed_attribution: 0 rows appended
+dry run: NOT writing live_nav (nav_live=100000.00 is the placeholder, Alpaca was not queried)
+dry run: NOT writing pnl_log (no fills executed)
+dry run: NOT recording cron_runs (nothing executed; <today> stays open for the real run)
+```
+
+Then exit code 0. Two lines need reading carefully:
+
+- `dry_run=True` is the only evidence that the switch took effect. If it reads
+  `dry_run=False`, stop the run, that is a live run.
+- `0 pending` in the `orders:` line is the key indicator that nothing can be
+  submitted. Dry-run demotes every leg to `DRY_RUN` in the guard layer.
+- `live Alpaca=100000.00` is expected, not a bug: Alpaca is deliberately not
+  queried in dry-run, so that figure is the placeholder constant.
+- `nav=` shows the real frozen Supabase NAV, which is correct.
+
+Lines that mean something is wrong and you should stop:
+
+- Any `submitted (qty)` or `submitted (notional)` line. Nothing may be submitted
+  in a dry run.
+- `order_rejections: persisted N leg(s)`, or an `order_rejections write FAILED`
+  block. A dry run has no rejections and must never write.
+- Any `REJECTED_*` or `SKIPPED_*` line at WARNING or ERROR. Dry-run legs are
+  `DRY_RUN`, not rejections.
+- Any `POSITION DRIFT` warning. `check_position_drift` returns empty in dry-run by
+  design, so its appearance means the dry-run flag is not set.
+- A missing `dry run: NOT recording cron_runs` line. That line is the guarantee
+  that the real scheduled run is not suppressed.
+
+Afterwards, two checks in Supabase: `settings.live_nav` must still show the real
+account NAV, and `cron_runs` must have no row for the dry-run date. Before this
+sprint's fix a dry run wrote both, and the `cron_runs` row would have made the
+real scheduled run that day skip itself through the idempotency gate. That is now
+covered by `test_dry_run_writes_no_live_state`.
+
 
 ---
 
@@ -108,16 +221,18 @@ log is therefore the only audit trail for such a leg, which is why T1 persists i
 - The wanted short becomes a skipped leg. It is logged, written to
   `order_rejections`, and shown in the reconciliation JSON with its reason code.
   The book runs with the short missing and tracked, never silently approximated.
+- The reason code distinguishes the two outcomes, because they leave the book in
+  different places:
+  - `SKIPPED_NOT_SHORTABLE`: an ordinary short leg, so the name does not get
+    shorter (or does not get short at all).
+  - `CROSSING_FLAT_NOT_SHORTABLE`: the open leg of a long-to-short crossing,
+    whose `sell_to_close` leg still runs. The name ends FLAT. Ending flat is
+    closer to a short target than staying long, so it is the smaller deviation,
+    and attribution can now separate the two cases.
 - Only opening or increasing a short is blocked. `buy_to_close` (reducing or
   closing a short) and `sell_to_close` (reducing or closing a long) still go
   through, so a broker restriction on opening shorts can never trap an existing
   position.
-- Consequence worth stating plainly: for a long-to-short crossing on a
-  non-shortable name, leg 1 (`sell_to_close`) still runs and leg 2
-  (`sell_to_open`) is skipped, so the book ends FLAT in that name rather than
-  short. That is a bigger deviation than doing nothing, and it is intentional: the
-  leg that shrinks the position is risk-reducing and is not the leg the
-  restriction applies to.
 - This sits alongside the earlier v8.6 finding that fractional shorts are
   rejected, so short legs are quantized to whole shares. Together they mean a
   short leg can be smaller than sized, or absent entirely. Both are recorded, not
@@ -154,9 +269,11 @@ frozen inputs, matches the 5 real fills against Alpaca's order history, marks th
 through the v6.5 cost model, and writes the records a live run would have written,
 each flagged `backfilled=true`:
 
-- `execution/logs/reconciliation_2026-09-24.json`: 7 legs, 4 flagged. Two flags
-  are whole-share quantization on the short legs (TLT intended 345.24, filled
-  321.04; IEF intended 257.30, filled 180.36), two are the unexecuted legs.
+- `execution/logs/reconciliation_2026-09-24.json`: 7 legs, 2 flagged. Both flags
+  are the legs that genuinely never filled (LQD and GLD). The two whole-share
+  quantization gaps (TLT intended 345.24 vs filled 321.04; IEF intended 257.30 vs
+  filled 180.36) were flagged before the one-share tolerance was added and are
+  correctly unflagged now.
 - `pnl_log` for 2026-09-24: gross 1,558.12, turnover cost 1.1777, net -1.1777
   (same convention as a live row, where `gross_pnl` is filled notional).
 - 5 rows to `live_attribution`, 5 rows appended to
@@ -183,12 +300,27 @@ was updated to the new expected column list.
 
 ## Test results
 
-- `tests/test_paper_execution.py`: 66 passed (51 before this sprint, so 15 new).
+- `tests/test_paper_execution.py`: 71 passed (51 before this sprint, so 20 new).
 - Full suite: 398 passed, plus 11 failed and 2 errors. Every one of those 11
   failures and 2 errors reproduces identically at HEAD in a clean `git worktree`
   and is caused by the `pycredit` compiled extension not being importable in this
   interpreter. None of them touch execution, attribution or Supabase paths.
   Verified by running the same test files at HEAD, not assumed.
+
+## Lint and pre-commit hooks
+
+`git commit --no-verify` was used for the first commit and skipped nothing: this
+repository has no `.pre-commit-config.yaml`, no `core.hooksPath`, no custom hooks
+under `.git/hooks` (samples only), no lint tooling in `pyproject.toml` and no
+`Makefile`. `ruff`, `black`, `flake8`, `isort`, `mypy` and `pylint` are all absent
+from the interpreter.
+
+So the equivalent checks were run by hand instead: Pylance diagnostics on every
+changed file (clean), plus an AST unused-import scan. That found `SubmitOutcome`
+unused in the test import list (this sprint's own doing, removed) and two
+pre-existing unused imports, `field` in `execution/alpaca_paper.py` and
+`write_cron_run` in `scripts/run_execution.py`, both also removed. Setting up real
+hooks is worth doing, but it is not in this sprint's scope.
 
 ## Deployment
 

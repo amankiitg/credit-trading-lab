@@ -15,6 +15,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+from dashboard.components.downsample import downsample_xy
+
 VERDICT_CAPTION = (
     "**Verdict: R1 FAIL.** The equity-credit lag is a real statistical effect "
     "but not a tradeable filter. All Tier-1 signal admissions were withdrawn "
@@ -75,10 +77,10 @@ def render() -> None:
     eq_b = _equity_curve(strat_b)
 
     fig, ax = plt.subplots(figsize=(12, 4))
-    ax.plot(eq_a.index, eq_a.values, label="Strategy A — unconditional (94 trades)",
-            color="#1b5e8a", lw=1.5)
-    ax.plot(eq_b.index, eq_b.values, label="Strategy B — equity_first only (14 trades)",
-            color="#cc3300", lw=1.5)
+    downsample_xy(ax, eq_a.index, eq_a.values, label="Strategy A — unconditional (94 trades)",
+                  color="#1b5e8a", lw=1.5)
+    downsample_xy(ax, eq_b.index, eq_b.values, label="Strategy B — equity_first only (14 trades)",
+                  color="#cc3300", lw=1.5)
     ax.axhline(0, color="black", lw=0.5)
     _fmt_dollar(ax)
     ax.set_title("Cumulative net P&L: Strategy A vs B (pre-registered A/B test)")

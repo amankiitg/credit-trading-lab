@@ -88,13 +88,17 @@ if _secrets_configured:
     _was_logged_in = st.session_state.get("_was_logged_in", False)
     if st.user.is_logged_in and not _was_logged_in:
         st.session_state["_was_logged_in"] = True
-        import streamlit.components.v1 as _components
-        _components.html("""<script>
+        # st.iframe rather than st.components.v1.html: the v1 HTML component is
+        # flagged for removal, and st.iframe embeds an HTML string as-is with
+        # JavaScript execution and same-origin access, which this needs in order to
+        # reach the tab element in the parent document. height must be a positive
+        # integer (0 is rejected), so one pixel keeps it effectively invisible.
+        st.iframe("""<script>
         setTimeout(function () {
             var tabs = window.parent.document.querySelectorAll('[data-baseweb="tab"]');
             if (tabs.length > 1) tabs[1].click();
         }, 300);
-        </script>""", height=0)
+        </script>""", height=1)
     elif not st.user.is_logged_in:
         st.session_state["_was_logged_in"] = False
 else:

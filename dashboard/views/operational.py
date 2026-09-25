@@ -42,6 +42,29 @@ def _get_stop_states() -> list[dict]:
     return fetch_stop_states()
 
 
+# The three readers below were called straight from render(), so every rerun did a
+# Supabase round trip: every widget change and tab switch, and every tab renders on
+# each script run. They are display reads, so a 300s TTL matches the caching the
+# proposed-trade panel already uses and removes the repeated network work and the
+# transient frames it allocates.
+@st.cache_data(ttl=300)
+def _get_positions() -> list[dict]:
+    """Live portfolio snapshot for Panel I."""
+    return fetch_positions(latest_only=True)
+
+
+@st.cache_data(ttl=300)
+def _get_pnl_log() -> list[dict]:
+    """Daily P&L rows for the NAV tracker."""
+    return fetch_pnl_log()
+
+
+@st.cache_data(ttl=300)
+def _get_live_attribution(limit: int) -> list[dict]:
+    """Live attribution rows, newest first. `limit` is part of the cache key."""
+    return fetch_live_attribution(limit=limit)
+
+
 @st.cache_data(ttl=300)
 def _get_drift_alert() -> dict | None:
     """Position drift flagged by run_execution.py's check_position_drift.
@@ -116,7 +139,8 @@ def _get_proposed_trade() -> tuple[list[dict], str, float]:
 def _render_mctr_pctr(nav: float, positions_data: list[dict]) -> None:
     """Render MCTR/PCTR bar chart from live weights + 63d covariance (v9.1 T8)."""
     import numpy as np
-    from signals.etf_universe import UNIVERSE, load_universe_close
+    from dashboard.loader import load_close_matrix
+    from signals.etf_universe import UNIVERSE
 
     # Build live weight vector
     w_dict: dict[str, float] = {}
@@ -133,7 +157,7 @@ def _render_mctr_pctr(nav: float, positions_data: list[dict]) -> None:
     weights = pd.Series({t: w_dict[t] for t in live_tickers})
 
     try:
-        close = load_universe_close()
+        close = load_close_matrix()
     except Exception:
         st.info("Close data not available — MCTR/PCTR skipped.")
         return
@@ -373,7 +397,7 @@ def render(
     # ================================================================
     st.markdown("### I - Live Portfolio Snapshot")
 
-    positions_data = fetch_positions(latest_only=True)
+    positions_data = _get_positions()
 
     col_gmv, col_nav, col_unreal = st.columns(3)
     if positions_data:
@@ -457,8 +481,8 @@ def render(
     # Panel K -- NAV Tracker (factor-colored, anchored to live NAV)
     # ================================================================
     st.markdown("### K - NAV Tracker")
-    pnl_rows = fetch_pnl_log()
-    attr_all = fetch_live_attribution(limit=500)  # full history for cumulative
+    pnl_rows = _get_pnl_log()
+    attr_all = _get_live_attribution(500)  # full history for cumulative
     FACTOR_COLORS = {"equity": "#3498db", "rates": "#2ecc71", "credit": "#e74c3c",
                      "commodity": "#f39c12"}
 
@@ -559,7 +583,7 @@ def render(
     # ================================================================
     st.markdown("### M-B — P&L by Factor (latest run)")
 
-    attr_rows = fetch_live_attribution(limit=20)
+    attr_rows = _get_live_attribution(20)
     if attr_rows:
         import matplotlib.pyplot as plt
         import numpy as np

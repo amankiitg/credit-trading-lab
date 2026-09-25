@@ -17,6 +17,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+from dashboard.components.downsample import downsample, downsample_xy
+
 FRAMING_CAPTION = (
     "Historical P&L shown for 2007-2026. "
     "This sample contains one secular rate cycle. "
@@ -116,8 +118,8 @@ def render() -> None:
 
     fig, ax = plt.subplots(figsize=(12, 4))
     for col in sleeve_cum.columns:
-        ax.plot(sleeve_cum.index, sleeve_cum[col], label=col,
-                color=SLEEVE_COLORS.get(col, "#888"))
+        downsample_xy(ax, sleeve_cum.index, sleeve_cum[col], label=col,
+                      color=SLEEVE_COLORS.get(col, "#888"))
     _fmt_dollar(ax)
     ax.set_title("Cumulative gross P&L by asset-class sleeve")
     ax.legend(fontsize=9); ax.grid(alpha=0.25)
@@ -141,10 +143,10 @@ def render() -> None:
     carry_price_cum = carry_price[["carry", "price_change"]].cumsum()
 
     fig, ax = plt.subplots(figsize=(12, 4))
-    ax.plot(carry_price["date"], carry_price_cum["carry"],
-            label="Carry (coupon/distribution accrual)", color="#1b8a3a", lw=1.5)
-    ax.plot(carry_price["date"], carry_price_cum["price_change"],
-            label="Price change", color="#888", lw=1.0)
+    downsample_xy(ax, carry_price["date"], carry_price_cum["carry"],
+                  label="Carry (coupon/distribution accrual)", color="#1b8a3a", lw=1.5)
+    downsample_xy(ax, carry_price["date"], carry_price_cum["price_change"],
+                  label="Price change", color="#888", lw=1.0)
     _fmt_dollar(ax)
     ax.set_title("Cumulative carry vs price change -- carry is ~70% of gross P&L")
     ax.legend(fontsize=9); ax.grid(alpha=0.25)
@@ -176,8 +178,8 @@ def render() -> None:
     ls_cum = ls_daily[["pnl_long", "pnl_short"]].cumsum()
 
     fig, ax = plt.subplots(figsize=(12, 4))
-    ax.plot(ls_daily["date"], ls_cum["pnl_long"], label="Long bucket", color="#1b5e8a")
-    ax.plot(ls_daily["date"], ls_cum["pnl_short"], label="Short bucket", color="#cc3300")
+    downsample_xy(ax, ls_daily["date"], ls_cum["pnl_long"], label="Long bucket", color="#1b5e8a")
+    downsample_xy(ax, ls_daily["date"], ls_cum["pnl_short"], label="Short bucket", color="#cc3300")
     ax.axhline(0, color="black", lw=0.5)
     _fmt_dollar(ax)
     ax.set_title("Cumulative long vs short gross P&L")
@@ -197,8 +199,10 @@ def render() -> None:
     dir_cum = daily.set_index("date")[["directional", "selection"]].cumsum()
 
     fig, ax = plt.subplots(figsize=(12, 4))
-    ax.plot(dir_cum.index, dir_cum["directional"], label="Directional (net x market)", color="#1b5e8a")
-    ax.plot(dir_cum.index, dir_cum["selection"], label="Selection (relative positioning)", color="#cc3300")
+    downsample_xy(ax, dir_cum.index, dir_cum["directional"],
+                  label="Directional (net x market)", color="#1b5e8a")
+    downsample_xy(ax, dir_cum.index, dir_cum["selection"],
+                  label="Selection (relative positioning)", color="#cc3300")
     ax.axhline(0, color="black", lw=0.5)
     _fmt_dollar(ax)
     ax.set_title("Cumulative directional vs selection P&L")
@@ -234,7 +238,7 @@ def render() -> None:
             ("beta_gold", "#d4a017", "gold (GLD)"),
         ]:
             series = fr.betas[col].dropna()
-            ax1.plot(series.index, series.values, label=label, color=color, lw=0.9)
+            downsample_xy(ax1, series.index, series.values, label=label, color=color, lw=0.9)
         ax1.axhline(0, color="black", lw=0.5)
         ax1.set_title("Rolling 252d factor betas (point-in-time, no look-ahead)")
         ax1.legend(fontsize=8); ax1.grid(alpha=0.25)
@@ -242,8 +246,8 @@ def render() -> None:
         ax2 = axes[1]
         be_cum = fr.beta_explained.cumsum().dropna()
         res_cum = fr.residual.cumsum().dropna()
-        ax2.plot(be_cum.index, be_cum.values, label="Beta-explained (aggregate factor exposure)", color="#888")
-        ax2.plot(res_cum.index, res_cum.values, label="Residual (exposure-timing + carry)", color="#cc3300")
+        downsample_xy(ax2, be_cum.index, be_cum.values, label="Beta-explained (aggregate factor exposure)", color="#888")
+        downsample_xy(ax2, res_cum.index, res_cum.values, label="Residual (exposure-timing + carry)", color="#cc3300")
         ax2.axhline(0, color="black", lw=0.5)
         _fmt_dollar(ax2)
         ax2.set_title("Cumulative beta-explained P&L vs residual")
@@ -274,9 +278,14 @@ def render() -> None:
     gross_cum = daily.set_index("date")[["gross_pnl", "net_pnl"]].cumsum()
 
     fig, ax = plt.subplots(figsize=(12, 4))
-    ax.plot(gross_cum.index, gross_cum["gross_pnl"], label="Gross P&L", color="#1b5e8a", lw=1.0)
-    ax.plot(gross_cum.index, gross_cum["net_pnl"], label="Net P&L (after cost)", color="#cc3300", lw=1.5)
-    ax.fill_between(gross_cum.index, gross_cum["net_pnl"], gross_cum["gross_pnl"],
+    # One set of positions for both series, because fill_between needs the two
+    # arguments on the same x. Reducing them independently would give different
+    # lengths and draw the wrong band between them.
+    _x, _net = downsample(gross_cum.index, gross_cum["net_pnl"])
+    _gross = gross_cum["gross_pnl"].reindex(_x)
+    ax.plot(_x, _gross, label="Gross P&L", color="#1b5e8a", lw=1.0)
+    ax.plot(_x, _net, label="Net P&L (after cost)", color="#cc3300", lw=1.5)
+    ax.fill_between(_x, _net, _gross,
                     color="#cc3300", alpha=0.1, label="Cost drag")
     _fmt_dollar(ax)
     ax.set_title("Gross vs net P&L -- cost drag shaded")

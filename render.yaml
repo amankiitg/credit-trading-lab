@@ -23,6 +23,21 @@ services:
     runtime: python
     buildCommand: pip install -e . && python scripts/write_render_secrets.py
     startCommand: streamlit run dashboard/app.py --server.port $PORT --server.address 0.0.0.0
+    # Without this, every push to main redeploys the dashboard, including pushes
+    # that only touch the cron jobs, the research notebooks or the sprint notes.
+    # Each of those redeploys restarts the container and drops every open session
+    # for no reason. With `paths` set, only a change to one of these triggers a
+    # build. Everything else on the branch is ignored by this service.
+    #
+    # scripts/write_render_secrets.py is listed because the build command runs it,
+    # so a change there does change what this service builds. render.yaml itself is
+    # deliberately absent: editing it is already a Render-side change.
+    buildFilter:
+      paths:
+        - dashboard/**
+        - pyproject.toml
+        - requirements.txt
+        - scripts/write_render_secrets.py
     envVars:
       - key: SUPABASE_URL
         sync: false

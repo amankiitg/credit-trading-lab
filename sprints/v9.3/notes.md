@@ -258,8 +258,166 @@ would very likely hang again, and Render would sit on it for the full job budget
 
 ---
 
+## 2026-09-25 -- Follow-up: the signal was built from a gapped close matrix
+
+After the hang fix deployed, the signal run completed and produced a book in which
+EFA, EEM, IEF, HYG and LQD had all moved by the same ~0.76 factor while SPY, TLT
+and GLD were recomputed. This section is the diagnosis and the fix.
+
+### The gap
+
+Those five tickers each had **4895 rows against 4896** for SPY, TLT and GLD, and
+sigma was NaN from 2026-09-23. Sigma at date d covers the trailing 63 rows, so a
+NaN return on 2026-09-23 makes sigma NaN from 2026-09-23 onward. The missing
+session is therefore **2026-09-23**, for EFA, EEM, IEF, HYG and LQD.
+
+Cannot be reproduced from the repo copies: all eight local parquets end
+2026-06-22, have 4830 rows and share one date set, so they contain no holes at
+all. They were all written at 2026-08-11 21:01:25 and are internally consistent.
+
+Alpaca's IEX daily bars cover **every** session in that window for all eight
+tickers including 2026-09-23, so 2026-09-23 was an ordinary Wednesday session with
+data available, and the hole is a Yahoo-side gap in exactly five of the eight
+fetches.
+
+### The 0.76 factor: CONFIRMED, and reproduced exactly
+
+Confirmed, and not approximately. Mimicking the missing session on local data and
+re-running the same pipeline as `run_signal`:
+
+```
+SPY  ratio=+1.36999   (recomputed)
+EFA  ratio=+0.76501   sigma_prev=nan   sigma_last=nan
+EEM  ratio=+0.76501   sigma_prev=nan   sigma_last=nan
+TLT  ratio=+1.36999   (recomputed)
+IEF  ratio=+0.76501   sigma_prev=nan   sigma_last=nan
+HYG  ratio=+0.76501   sigma_prev=nan   sigma_last=nan
+LQD  ratio=+0.76501   sigma_prev=nan   sigma_last=nan
+GLD  ratio=+1.56787   (recomputed)
+
+five ratios identical? True   value: 0.765007
+```
+
+The chain, with the code that does it:
+
+1. `load_universe_close` outer-joins the per-ticker parquets, so a session one
+   ticker lacks becomes NaN for that ticker on a date the others have.
+2. `compute_trend`: `defined = trail_ret.notna() & sigma.notna()`. The NaN row
+   makes the log return NaN, which makes the 63 day rolling `sigma` NaN, so
+   `defined` is False for that name from 2026-09-23. `weight` is then NaN there.
+3. `apply_rebalance_control` treats a NaN desired weight as a data gap rather than
+   an exit, and deliberately carries the previous held weight forward (its own
+   comment says so).
+4. Its final joint gross re-cap, `scale = (g_max / gross).clip(upper=1.0)` over
+   the whole row, then multiplies **every** name, including the carried-forward
+   ones. That single factor is why five names move identically.
+
+So it is not "carried forward and scaled" as a suspicion, it is exactly that, and
+the five moving together is the signature of the re-cap rather than of five
+coincidentally similar signals.
+
+### Item 2 -- repair tool
+
+`scripts/backfill_raw_gap.py`, report-only by default, `--apply` to write. It
+detects holes with the same first-observation rule the gate uses, fetches real
+daily bars from Alpaca IEX, and inserts them.
+
+Deliberately not a forward fill: repeating the previous close invents a zero
+return, which would flatten realised vol and leave the row looking healthy. A real
+bar goes in or the gap is reported and left alone.
+
+`adj_close` is derived rather than copied, because Alpaca returns raw OHLC and this
+pipeline reads `adj_close`. The inserted row is scaled by that ticker's own
+cumulative adjustment factor (adj_close/close from its most recent existing row),
+so the ticker's existing convention is preserved.
+
+Demonstrated end to end on a throwaway copy with an injected hole at 2026-06-18
+for the same five tickers: detected all five, fetched real bars (EFA close 104.39,
+volume 995,588, adj ratio 1.0), inserted, verified coverage across 4830 dates, and
+a re-run reported no gaps. The repo's own parquets were not touched (their mtimes
+are still 2026-08-11).
+
+Two honest caveats about the source:
+
+- IEX close is **not** the consolidated close. On the injected test the IEX close
+  was 104.39 against the 104.41 the Yahoo-sourced row held, about 0.02% apart.
+  Fine for a repair, not byte-identical to a Yahoo row.
+- IEX `volume` is an IEX-only fraction of consolidated volume. Nothing downstream
+  reads volume (`load_universe_close` returns `adj_close` only), so this is inert
+  here, but it would matter if volume were ever used.
+
+### Item 3 -- data-quality gate
+
+`signals/data_quality.py` (pure, no I/O) and a gate in `run_signal` step 4c, before
+any write:
+
+- `find_row_gaps(close)`: dates where a ticker has no observation but the universe
+  does. Leading NaN is **not** a gap, because staggered inception (GLD from 2004,
+  EFA/EEM/TLT later) is legitimate. Only NaN after a ticker's first observation is
+  a hole.
+- `check_signal_ready(close, sigma, as_of_date)`: the two conditions from the live
+  failure, the row gap and NaN sigma on the as-of date.
+
+On failure it logs every offending ticker and date at ERROR, logs
+`REFUSING to write a signal for <date>`, says nothing was written so the stored
+signal is unchanged, and returns 1. Nothing reaches Supabase.
+
+Note the gate blocks on a gap anywhere in history, not only a recent one. That is
+the safe default for a book that trades every session; if an ancient hole ever
+blocks a run, the log names it and the repair tool exists.
+
+### Item 4 -- the "nan" stop states
+
+`stop_states.state` held the literal string `'nan'` for exactly EFA, EEM, IEF, HYG
+and LQD, the five gapped tickers. Fixed with `canonical_state()` in
+`risk/stop_loss.py`, which maps None, float nan, `np.nan`, the strings "nan" and
+"None", empty strings and any unknown text to the explicit string **UNKNOWN**, and
+passes through only NORMAL, REDUCED and STOPPED.
+
+Two things worth recording precisely:
+
+- The old code was `str(latest_state.get(t)) if ... is not None else "NORMAL"`. So
+  a None cell became the string "NORMAL", which asserts a state that was never
+  computed. That is its own bug, quieter than "nan" but the same category.
+- I could not pin how the float nan arose. `np.full(n, None, dtype=object)` yields
+  None locally and `str(None)` is "None", never "nan", so a genuine float nan had
+  to be in that column. The current `compute_episodes` does not put one there, and
+  its state seeding is unchanged since the v9.1 commit (93adae7, 2026-08-11), which
+  is the day before the existing rows were written. Most likely a pandas version
+  difference on Render turning an all-None object column numeric. The fix covers
+  every candidate, so the exact provenance does not change the remedy.
+- `updated_at` does **not** refresh on an upsert (the `now()` default applies on
+  insert only), so those rows still read 2026-08-12 even if they were rewritten
+  since. `updated_at` is not a reliable "last written" indicator here.
+
+The five existing bad rows still say 'nan' in Supabase. Correcting them is an
+UPDATE, which is a live write I have not done.
+
+### Open questions for the operator
+
+1. **The repair does not run on Render.** The parquets there are re-fetched by
+   `ingest()` every run and the disk is ephemeral, so repairing the repo copies
+   helps local work and backtests but cannot fix the live path. Either wire the
+   Alpaca gap repair into `ingest` (self-healing, mixes two price sources) or rely
+   on the gate to refuse the signal and repair by hand (safe, but blocks the
+   signal until Yahoo self-heals or someone acts).
+2. The five stale `stop_states` rows want a one-off UPDATE to 'UNKNOWN'.
+3. Yahoo may already have backfilled 2026-09-23; the next run will show it, because
+   the gate will either pass or name the gap.
+
+### Tests
+
+23 new: `tests/test_data_quality.py` (10, including a miniature of the live shape
+asserting 5 row gaps and 5 NaN sigmas, and a job-level test that the gate refuses
+to write) and the `canonical_state` cases in `tests/test_stop_loss.py`. Full suite
+438 passed with the same 11 pre-existing `pycredit` failures.
+
+---
+
 ## House rules
 
-- No look-ahead: nothing here feeds a signal. The fix bounds run time only.
+- No look-ahead: nothing here feeds a signal. The hang fix bounds run time and the
+  gate refuses to write from incomplete data.
 - Costs untouched.
-- No edge claims.
+- No edge claims. The 0.765 factor is a reproduction of a bug, not a result.
+

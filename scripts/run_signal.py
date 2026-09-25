@@ -161,9 +161,33 @@ def _run() -> int:
     # -- 4b. v9.1: Stop-ladder overlay (ADVISORY MODE ONLY -- gate REJECTED).
     #        Compute stop states for display in Panel H but NEVER modify weights.
     #        Per T6 gate decision: F2/F3/F4/F5 all fail → advisory mode.
-    from risk.stop_loss import compute_episodes
+    from risk.stop_loss import canonical_state, compute_episodes
     sigma_matrix = tidy.pivot(index="date", columns="ticker", values="sigma").sort_index()
     close_matrix = close[list(held.columns)]  # align columns
+
+    # -- 4c. Data-quality gate. Refuse to write a signal built from an incomplete
+    #        close matrix. A ticker missing a session the others have gets a NaN
+    #        return, so its sigma is NaN, its position is undefined, its weight is
+    #        carried forward and then re-scaled by the gross cap. That is exactly
+    #        what shipped on 2026-09-24: five names all moved by 0.765 while the
+    #        other three were recomputed, and nothing flagged it.
+    from signals.data_quality import check_signal_ready
+
+    with step("4c data-quality gate", logger):
+        problems = check_signal_ready(close, sigma_matrix, as_of_date)
+    if problems:
+        logger.error(
+            "REFUSING to write a signal for %s: %d data-quality problem(s):",
+            as_of_date, len(problems),
+        )
+        for problem in problems:
+            logger.error("  %s", problem)
+        logger.error(
+            "Repair the raw closes (scripts/backfill_raw_gap.py) and re-run. "
+            "Nothing was written, so the stored signal is unchanged."
+        )
+        return 1
+    logger.info("data-quality gate passed for %s", as_of_date)
 
     try:
         with step("4b v9.1 stop overlay compute (advisory)", logger):
@@ -184,7 +208,7 @@ def _run() -> int:
         for t in UNIVERSE:
             if t in latest_mult.index:
                 m = float(latest_mult.get(t)) if pd.notna(latest_mult.get(t)) else 1.0
-                s = str(latest_state.get(t)) if latest_state.get(t) is not None else "NORMAL"
+                s = canonical_state(latest_state.get(t))
                 z_val = float(latest_z.get(t)) if pd.notna(latest_z.get(t)) else None
                 stop_rows.append({
                     "ticker": t,

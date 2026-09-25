@@ -23,8 +23,10 @@ from risk.stop_loss import (
     H_DEFAULT,
     M_REDUCED_DEFAULT,
     STATE_NAMES,
+    UNKNOWN_STATE,
     _run_single_episode,
     apply_stop_overlay,
+    canonical_state,
     compute_episodes,
 )
 
@@ -789,3 +791,51 @@ def test_compute_episodes_does_not_hang_on_nan_sigma_with_non_zero_weight() -> N
     # Day 2 onward is an ordinary episode and must still be computed.
     assert pd.notna(mults["AAA"].iloc[2]), "the episode after the gap must still run"
     assert pd.notna(z["AAA"].iloc[2])
+
+
+# ---------------------------------------------------------------- v9.4: state canonicalisation
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("NORMAL", "NORMAL"),
+        ("REDUCED", "REDUCED"),
+        ("STOPPED", "STOPPED"),
+        (None, UNKNOWN_STATE),
+        (float("nan"), UNKNOWN_STATE),
+        (np.nan, UNKNOWN_STATE),
+        (np.float64("nan"), UNKNOWN_STATE),
+        ("nan", UNKNOWN_STATE),
+        ("None", UNKNOWN_STATE),
+        ("", UNKNOWN_STATE),
+        ("  REDUCED  ", "REDUCED"),
+        ("moonshot", UNKNOWN_STATE),
+    ],
+)
+def test_canonical_state_never_emits_a_non_state(raw, expected) -> None:
+    """Supabase held the literal string "nan" for five tickers on 2026-09-24.
+
+    None, float nan and the strings "nan"/"None" all mean the same thing, that no
+    state was computed. None of them is a state, and none of them may be written.
+    """
+    assert canonical_state(raw) == expected
+
+
+def test_canonical_state_is_what_gets_written() -> None:
+    """End to end: an unset cell for a gapped ticker becomes UNKNOWN, not "nan"."""
+    import numpy as np
+    import pandas as pd
+
+    from risk.stop_loss import compute_episodes
+
+    idx = pd.date_range("2026-01-01", periods=6, freq="D")
+    held = pd.DataFrame({"AAA": [0.1] * 6}, index=idx)
+    close = pd.DataFrame({"AAA": [100.0, 101.0, 102.0, 103.0, np.nan, 104.0]}, index=idx)
+    # The gap makes sigma unusable on two of the days.
+    sigma = pd.DataFrame({"AAA": [0.2, 0.2, np.nan, np.nan, 0.2, 0.2]}, index=idx)
+    sigma.loc[idx[2], "AAA"] = 0.2  # only the day matching the price hole is unusable
+
+    _, states, _ = compute_episodes(held, close, sigma)
+    written = [canonical_state(v) for v in states.iloc[-1]]
+    assert all(w in ("NORMAL", "REDUCED", "STOPPED", UNKNOWN_STATE) for w in written)
+    assert "nan" not in written and "None" not in written

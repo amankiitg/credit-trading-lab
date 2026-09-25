@@ -37,6 +37,36 @@ M_REDUCED_DEFAULT: float = 0.5
 TRADING_DAYS: int = 252
 STATE_NAMES: dict[int, str] = {0: "NORMAL", 1: "REDUCED", 2: "STOPPED"}
 
+# The only state strings allowed to reach Supabase.
+VALID_STATES: frozenset[str] = frozenset(STATE_NAMES.values())
+UNKNOWN_STATE: str = "UNKNOWN"
+
+
+def canonical_state(value) -> str:
+    """Map a raw state cell to NORMAL/REDUCED/STOPPED, or UNKNOWN.
+
+    A cell can arrive as None (no state was computed for that date), as a float
+    nan (pandas turning an all-None object column numeric), or as the strings
+    "nan"/"None" if such a value was ever round-tripped through the database. All
+    of those mean the same thing, that no state was computed, and none of them is
+    a state.
+
+    Supabase held the literal string "nan" in `stop_states.state` for exactly the
+    five tickers that were missing a session on 2026-09-24, which Panel H then
+    displayed. UNKNOWN says it explicitly. It is a string rather than NULL so it
+    cannot trip a NOT NULL constraint and so the dashboard has something
+    meaningful to render.
+    """
+    if value is None:
+        return UNKNOWN_STATE
+    try:
+        if pd.isna(value):
+            return UNKNOWN_STATE
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip()
+    return text if text in VALID_STATES else UNKNOWN_STATE
+
 
 def _compute_monthly_vol(sigma_annual: pd.DataFrame) -> pd.DataFrame:
     """Scale annualized 63d vol to 1-month horizon (sqrt(21/252))."""

@@ -744,3 +744,48 @@ class TestLeakageLookahead:
                 rtol=1e-12,
                 err_msg=f"Sigma mismatch for {ticker}: compute_trend vs independent calc",
             )
+
+
+# ---------------------------------------------------------------- v9.3: hang regression
+
+def test_compute_episodes_does_not_hang_on_nan_sigma_with_non_zero_weight() -> None:
+    """Regression test for the 2026-09-24 signal hang.
+
+    A non-zero held weight on a day with no usable sigma (an upstream data gap:
+    a missing row makes the return NaN, which makes the 63d rolling vol NaN while
+    the rebalance control carries the weight forward) used to leave the episode
+    loop's index un-advanced. The loop then span on the same day forever, with no
+    I/O and no logging, which is why the run sat silent for over four hours and no
+    network or job timeout could have caught it.
+
+    The test arms its own alarm so that a regression FAILS rather than hanging the
+    suite.
+    """
+    import signal as _signal
+
+    class _Hung(BaseException):
+        pass
+
+    def _raise(signum, frame):
+        raise _Hung("compute_episodes did not advance: the infinite loop is back")
+
+    idx = pd.date_range("2026-01-01", periods=6, freq="D")
+    held = pd.DataFrame({"AAA": [np.nan, 0.1, 0.1, 0.1, 0.1, 0.1]}, index=idx)
+    close = pd.DataFrame({"AAA": [100.0, 100.0, 101.0, 102.0, 103.0, 104.0]}, index=idx)
+    # Non-zero weight on day 1, but sigma is missing there.
+    sigma = pd.DataFrame({"AAA": [np.nan, np.nan, 0.2, 0.2, 0.2, 0.2]}, index=idx)
+
+    previous = _signal.signal(_signal.SIGALRM, _raise)
+    _signal.alarm(5)
+    try:
+        mults, states, z = compute_episodes(held, close, sigma)
+    finally:
+        _signal.alarm(0)
+        _signal.signal(_signal.SIGALRM, previous)
+
+    # Day 1 cannot be evaluated, so it is left missing and the scan moves on.
+    assert pd.isna(z["AAA"].iloc[1]), "the unusable day must be left NaN, not fabricated"
+    assert pd.isna(mults["AAA"].iloc[1])
+    # Day 2 onward is an ordinary episode and must still be computed.
+    assert pd.notna(mults["AAA"].iloc[2]), "the episode after the gap must still run"
+    assert pd.notna(z["AAA"].iloc[2])

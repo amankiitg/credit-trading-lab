@@ -21,8 +21,12 @@ via the existing shift_to_next_day convention.
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 # Pre-registered defaults (sprint v9.1 PRD)
 K1_DEFAULT: float = 1.5
@@ -179,6 +183,7 @@ def compute_episodes(
         mult_col = np.full(n, np.nan)
         state_col = np.full(n, None, dtype=object)
         z_col = np.full(n, np.nan)
+        unusable_days: list[str] = []
 
         i = 0
         while i < n:
@@ -218,6 +223,21 @@ def compute_episodes(
                 i += 1
 
             if len(ep_indices) == 0:
+                # The inner loop can break on its FIRST pass, when the entry day
+                # has a usable price but no sigma. That happens on an upstream
+                # data gap: a missing row makes the return NaN, which makes the
+                # 63d rolling vol NaN, while the held weight is still carried
+                # forward non-zero by the rebalance control.
+                #
+                # No z can be formed for such a day, so it is left NaN and the
+                # index MUST advance. Without the advance the outer loop
+                # re-enters the same index forever: a silent pure-CPU spin with
+                # no I/O and no logging, which is what hung the 2026-09-24
+                # signal run for over four hours with no further output. No
+                # socket or job timeout could have caught it either, since the
+                # process was busy the whole time.
+                unusable_days.append(str(common_idx[i].date()))
+                i += 1
                 continue
 
             ep_r_arr = np.array(ep_r, dtype="float64")
@@ -235,6 +255,13 @@ def compute_episodes(
         multipliers[ticker] = mult_col
         states_df[ticker] = state_col
         z_scores[ticker] = z_col
+
+        if unusable_days:
+            logger.warning(
+                "stop ladder: %s has %d non-zero-weight day(s) with no usable "
+                "sigma (data gap upstream); those days are left NaN and skipped: %s",
+                ticker, len(unusable_days), unusable_days[:5],
+            )
 
     return multipliers, states_df, z_scores
 

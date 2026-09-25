@@ -46,6 +46,7 @@ except ImportError:
     APIError = None  # type: ignore
 
 from execution.costs import CostParams
+from execution.job_guard import DEFAULT_NETWORK_TIMEOUT_SECS
 from signals.etf_universe import UNIVERSE
 
 LOG_DIR = Path("execution/logs")
@@ -176,6 +177,44 @@ class SubmitOutcome:
 
 # ---------------------------------------------------------------- connection
 
+def apply_request_timeout(
+    client,
+    seconds: float = DEFAULT_NETWORK_TIMEOUT_SECS,
+) -> bool:
+    """Give every Alpaca request a real timeout, returning True when applied.
+
+    alpaca-py's RESTClient takes no timeout argument and its session request is
+    issued with none, so a stalled connection blocks indefinitely: there are zero
+    occurrences of 'timeout' anywhere in alpaca.common.rest. The session is a
+    plain requests.Session and every call funnels through
+    `self._session.request(method, url, **opts)`, so defaulting a timeout into
+    those kwargs fixes it at the single choke point without patching the library.
+
+    Returns False, and says so, when the client has no usable session, so a
+    missing timeout is visible rather than assumed.
+    """
+    session = getattr(client, "_session", None)
+    if session is None or not hasattr(session, "request"):
+        logger.warning(
+            "apply_request_timeout: client has no session -- Alpaca calls keep "
+            "the library default, which is no timeout at all",
+        )
+        return False
+    if getattr(session, "_ctlab_timeout_secs", None) == seconds:
+        return True
+
+    original_request = session.request
+
+    def request_with_timeout(method, url, **kwargs):
+        kwargs.setdefault("timeout", seconds)
+        return original_request(method, url, **kwargs)
+
+    session.request = request_with_timeout
+    session._ctlab_timeout_secs = seconds
+    logger.info("Alpaca request timeout set to %.0fs", seconds)
+    return True
+
+
 def connect(dry_run: bool = DRY_RUN_DEFAULT) -> Optional[object]:
     """Build and return a TradingClient pointed at the paper endpoint.
 
@@ -201,12 +240,14 @@ def connect(dry_run: bool = DRY_RUN_DEFAULT) -> Optional[object]:
             "as environment variables -- never hardcoded or read from a file"
         )
 
-    return TradingClient(
+    client = TradingClient(
         api_key=key,
         secret_key=secret,
         paper=True,
         url_override=PAPER_ENDPOINT,
     )
+    apply_request_timeout(client)
+    return client
 
 
 # ---------------------------------------------------------------- live NAV

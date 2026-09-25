@@ -6,10 +6,18 @@ layer. Downstream modules must never talk to yfinance directly.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pandas as pd
 import yfinance as yf
+
+# Per-call network timeout for this boundary. yfinance already defaults to 10s,
+# but 10s is short for a full-history fetch and was never a deliberate choice
+# here, so it is set explicitly. Uses the same env var as
+# execution/job_guard.DEFAULT_NETWORK_TIMEOUT_SECS, read directly to keep this
+# module free of any dependency on the execution package.
+YF_TIMEOUT_SECS: float = float(os.environ.get("NETWORK_TIMEOUT_SECS", "30"))
 
 DEFAULT_TICKERS: list[str] = ["HYG", "LQD", "SPY", "IEF"]
 DEFAULT_START: str = "2007-04-11"
@@ -34,7 +42,8 @@ def fetch(
     out: dict[str, pd.DataFrame] = {}
     for t in tickers:
         hist = yf.Ticker(t).history(
-            start=start, end=end, auto_adjust=False, actions=False
+            start=start, end=end, auto_adjust=False, actions=False,
+            timeout=YF_TIMEOUT_SECS,
         )
         if hist.empty:
             raise RuntimeError(f"yfinance returned empty frame for {t}")

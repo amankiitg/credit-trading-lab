@@ -38,6 +38,7 @@ only path to the paper account.
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from datetime import date
 
@@ -48,20 +49,54 @@ logging.basicConfig(
 logger = logging.getLogger("run_execution")
 
 
-def main() -> int:
+# Hard deadline for the whole job. A healthy run is minutes of work, since fill
+# polling is bounded at 30s, so anything past this is a stalled call rather than
+# a slow book. Override with EXECUTION_JOB_MAX_SECS.
+EXECUTION_JOB_MAX_SECS: float = float(
+    os.environ.get("EXECUTION_JOB_MAX_SECS", str(30 * 60))
+)
+
+
+def main(max_secs: float | None = None) -> int:
+    """Entry point: arm the guards, then hand off to _run().
+
+    Nothing in this job may block forever. The deadline cuts off any step,
+    including a pure-CPU spin that no network timeout could catch, and it names
+    the step in flight. Alpaca calls additionally get a real per-request timeout
+    via execution.alpaca_paper.apply_request_timeout.
+    """
+    from execution.job_guard import JobTimeout, current_step, job_guards
+
+    budget = EXECUTION_JOB_MAX_SECS if max_secs is None else max_secs
+    try:
+        with job_guards(budget, logger):
+            return _run()
+    except JobTimeout as exc:
+        logger.error(
+            "run_execution TIMED OUT: %s. Last step started: %s",
+            exc, current_step() or "(none)",
+        )
+        return 3
+
+
+def _run() -> int:
+    from execution.job_guard import step
+
     today = date.today().isoformat()
 
     # -- 1. NYSE calendar check
     from execution.calendar_utils import is_trading_day
-    if not is_trading_day(today):
-        logger.info("skipping: NYSE closed on %s", today)
-        return 0
+    with step("1 NYSE calendar check", logger):
+        if not is_trading_day(today):
+            logger.info("skipping: NYSE closed on %s", today)
+            return 0
 
     # -- 2. Idempotency
     from execution.calendar_utils import check_already_ran, record_run
-    if check_already_ran("run_execution", today):
-        logger.info("already ran for %s -- exit 0 (idempotent)", today)
-        return 0
+    with step("2 idempotency check", logger):
+        if check_already_ran("run_execution", today):
+            logger.info("already ran for %s -- exit 0 (idempotent)", today)
+            return 0
 
     # -- 3. Load signal output written by run_signal.py (no yfinance call needed).
     #        Falls back to ingest() only if Supabase data is missing/stale.
@@ -69,9 +104,10 @@ def main() -> int:
     from signals.etf_universe import UNIVERSE
     from dashboard.supabase_client import get_setting
 
-    _stored_date    = get_setting("signal_as_of_date")
-    _stored_weights = get_setting("signal_target_weights")
-    _stored_prices  = get_setting("signal_close_prices")
+    with step("3 load stored signal from Supabase", logger):
+        _stored_date    = get_setting("signal_as_of_date")
+        _stored_weights = get_setting("signal_target_weights")
+        _stored_prices  = get_setting("signal_close_prices")
 
     if _stored_date and _stored_weights and _stored_prices:
         as_of_date   = _stored_date
@@ -81,8 +117,9 @@ def main() -> int:
     else:
         logger.warning("signal not in Supabase -- falling back to yfinance ingest")
         from signals.etf_universe import ingest, load_universe_close
-        ingest(UNIVERSE)
-        close = load_universe_close()
+        with step("3b fallback yfinance ingest", logger):
+            ingest(UNIVERSE)
+            close = load_universe_close()
         as_of_date = str(close.index[-1].date())
         close_prices = {
             t: float(close[t].iloc[-1])
@@ -104,8 +141,9 @@ def main() -> int:
     )
     from execution.alpaca_paper import DRY_RUN_DEFAULT
 
-    decision = fetch_decision_for_date(as_of_date)
-    auto_approve = get_auto_approve()
+    with step("4 decision gate (Supabase)", logger):
+        decision = fetch_decision_for_date(as_of_date)
+        auto_approve = get_auto_approve()
 
     if decision == "reject":
         logger.info("decision=reject for %s -- skipping execution", as_of_date)
@@ -146,30 +184,32 @@ def main() -> int:
         submit_orders,
     )
 
-    dry_run = DRY_RUN_DEFAULT
-    client = connect(dry_run=dry_run)
+    with step("5 connect to Alpaca", logger):
+        dry_run = DRY_RUN_DEFAULT
+        client = connect(dry_run=dry_run)
     logger.info("dry_run=%s", dry_run)
 
     # -- 6. NAV and current positions
     # Use the frozen Supabase NAV and positions for delta computation so that
     # execution matches exactly what Panel H showed when the user approved.
     # Live Alpaca NAV is read separately to update Supabase after the run.
-    nav_live = get_live_nav(client) if not dry_run else 100_000.0
+    with step("6 read NAV and current positions", logger):
+        nav_live = get_live_nav(client) if not dry_run else 100_000.0
 
-    _nav_str = get_setting("live_nav")
-    nav = float(_nav_str) if _nav_str else nav_live
-    logger.info("nav=%.2f (frozen Supabase; live Alpaca=%.2f)", nav, nav_live)
+        _nav_str = get_setting("live_nav")
+        nav = float(_nav_str) if _nav_str else nav_live
+        logger.info("nav=%.2f (frozen Supabase; live Alpaca=%.2f)", nav, nav_live)
 
-    from dashboard.supabase_client import fetch_positions as _fetch_positions
-    _pos_rows = _fetch_positions(latest_only=True)
-    current_notionals: dict[str, float] = {
-        r["ticker"]: float(r["signed_notional"]) for r in _pos_rows
-    }
-    if not current_notionals:
-        # First ever run -- no Supabase snapshot yet; read live from Alpaca
-        logger.info("no Supabase positions found -- reading live from Alpaca (first run)")
-        current_notionals = get_current_positions(client, dry_run=dry_run)
-    logger.info("current positions: %s", current_notionals)
+        from dashboard.supabase_client import fetch_positions as _fetch_positions
+        _pos_rows = _fetch_positions(latest_only=True)
+        current_notionals: dict[str, float] = {
+            r["ticker"]: float(r["signed_notional"]) for r in _pos_rows
+        }
+        if not current_notionals:
+            # First ever run -- no Supabase snapshot yet; read live from Alpaca
+            logger.info("no Supabase positions found -- reading live from Alpaca (first run)")
+            current_notionals = get_current_positions(client, dry_run=dry_run)
+        logger.info("current positions: %s", current_notionals)
 
     # -- 6b. Drift check: does the frozen Supabase snapshot above still match
     #        the real Alpaca account? Delta orders are computed from the
@@ -178,7 +218,8 @@ def main() -> int:
     #        deltas against a phantom book with no visible signal. Alert
     #        only -- execution below still uses current_notionals as-is.
     from execution.alpaca_paper import check_position_drift
-    drift = check_position_drift(client, current_notionals, dry_run=dry_run)
+    with step("6b position drift check", logger):
+        drift = check_position_drift(client, current_notionals, dry_run=dry_run)
     if drift:
         logger.warning(
             "POSITION DRIFT: cached (Supabase) vs live (Alpaca) disagree for %d ticker(s): %s",
@@ -223,21 +264,23 @@ def main() -> int:
             shift_to_next_day,
             to_position_matrix,
         )
-        close = load_universe_close()
-        desired = to_position_matrix(
-            compute_trend(close, L=120, long_short=True, k_dead_zone=0.5)
-        )
-        held = apply_rebalance_control(desired, rebal_freq=1, band_pct=0.20)
-        target = shift_to_next_day(held)
-        target_weights = {
-            t: float(target.iloc[-1].get(t) or 0.0)
-            for t in UNIVERSE
-        }
+        with step("6c fallback: recompute v8.2 signal locally", logger):
+            close = load_universe_close()
+            desired = to_position_matrix(
+                compute_trend(close, L=120, long_short=True, k_dead_zone=0.5)
+            )
+            held = apply_rebalance_control(desired, rebal_freq=1, band_pct=0.20)
+            target = shift_to_next_day(held)
+            target_weights = {
+                t: float(target.iloc[-1].get(t) or 0.0)
+                for t in UNIVERSE
+            }
     logger.info("target weights: %s", {k: round(v, 4) for k, v in target_weights.items()})
 
     # -- 7. Compute orders, apply guards
-    orders = compute_delta_orders(target_weights, current_notionals, paper_nav=nav)
-    guarded = apply_guards(orders, dry_run=dry_run, _nav=nav)
+    with step("7 compute delta orders and apply guards", logger):
+        orders = compute_delta_orders(target_weights, current_notionals, paper_nav=nav)
+        guarded = apply_guards(orders, dry_run=dry_run, _nav=nav)
 
     # -- 7b. Shortability pre-check, live, before anything is submitted.
     #        Only sell_to_open legs can be affected: buy_to_close (reduce a
@@ -247,7 +290,8 @@ def main() -> int:
     if not dry_run:
         check_tickers = shorts_requiring_check(guarded)
         if check_tickers:
-            shortable = get_shortable_flags(client, check_tickers)
+            with step("7b shortability pre-check (Alpaca assets)", logger):
+                shortable = get_shortable_flags(client, check_tickers)
             logger.info("shortable flags: %s", shortable)
             guarded = apply_shortable_filter(guarded, shortable)
 
@@ -262,7 +306,8 @@ def main() -> int:
     #       continues through the remaining legs so one bad order cannot strand a
     #       partial book. A transport failure halts submission and is turned into
     #       a clean halt below, never an unhandled traceback.
-    outcomes = submit_orders(client, guarded, close_prices=close_prices)
+    with step("8 submit orders", logger):
+        outcomes = submit_orders(client, guarded, close_prices=close_prices)
     run_halted = any(o.halts_run for o in outcomes)
     halted_legs = sum(1 for o in outcomes if o.halts_run)
     if run_halted:
@@ -274,23 +319,26 @@ def main() -> int:
         )
 
     # -- 9. Poll fills
-    real_ids = [o.order_id for o in outcomes if o.submitted and o.order_id]
-    fill_data = poll_fills(client, real_ids) if real_ids else {}
+    with step("9 poll fills and build fill records", logger):
+        real_ids = [o.order_id for o in outcomes if o.submitted and o.order_id]
+        fill_data = poll_fills(client, real_ids) if real_ids else {}
 
-    fills = build_fill_records(guarded, outcomes, fill_data)
+        fills = build_fill_records(guarded, outcomes, fill_data)
 
-    # Mark costs using post-execution short notionals
-    short_notionals = {
-        t: abs(n) for t, n in current_notionals.items() if n < 0
-    }
-    fills = mark_costs(fills, current_short_notionals=short_notionals)
+        # Mark costs using post-execution short notionals
+        short_notionals = {
+            t: abs(n) for t, n in current_notionals.items() if n < 0
+        }
+        fills = mark_costs(fills, current_short_notionals=short_notionals)
 
     # -- 9b. Persist the rejection audit trail. This is the ONLY durable record
     #        of a leg that never became an order: Alpaca keeps nothing for a
     #        submit-time rejection, and this box's filesystem is ephemeral.
     rejection_rows = build_rejection_rows(fills, run_date=date.fromisoformat(today))
     if rejection_rows:
-        if write_order_rejections(rejection_rows):
+        with step("9b persist rejection audit to Supabase", logger):
+            wrote = write_order_rejections(rejection_rows)
+        if wrote:
             logger.info(
                 "order_rejections: persisted %d leg(s): %s",
                 len(rejection_rows),
@@ -316,21 +364,23 @@ def main() -> int:
         logger.info("order_rejections: no rejected or skipped legs this run")
 
     # -- 10. Dust cleanup
-    dust_closed = close_dust_positions(client, dry_run=dry_run)
+    with step("10 dust cleanup", logger):
+        dust_closed = close_dust_positions(client, dry_run=dry_run)
     if dust_closed:
         logger.info("dust cleanup: closed %s", dust_closed)
 
     # -- 11. Reconcile
     run_date_obj = date.fromisoformat(today)
-    report = reconcile(guarded, fills, run_date=run_date_obj)
-    logger.info(
-        "reconcile: %d legs, %d flagged discrepancies",
-        report["total_fills_captured"], report["flagged_discrepancies"],
-    )
+    with step("11 reconcile and feed attribution", logger):
+        report = reconcile(guarded, fills, run_date=run_date_obj)
+        logger.info(
+            "reconcile: %d legs, %d flagged discrepancies",
+            report["total_fills_captured"], report["flagged_discrepancies"],
+        )
 
-    # feed_attribution: append filled rows to attribution.parquet + Supabase
-    n_appended = feed_attribution(fills, close_prices, run_date=run_date_obj, nav=nav)
-    logger.info("feed_attribution: %d rows appended", n_appended)
+        # feed_attribution: append filled rows to attribution.parquet + Supabase
+        n_appended = feed_attribution(fills, close_prices, run_date=run_date_obj, nav=nav)
+        logger.info("feed_attribution: %d rows appended", n_appended)
 
     # Write live attribution rows to Supabase as well
     if n_appended > 0:
@@ -356,53 +406,55 @@ def main() -> int:
                 }
                 for _, r in today_rows.iterrows()
             ]
-            write_live_attribution(live_rows)
+            with step("11a write live attribution to Supabase", logger):
+                write_live_attribution(live_rows)
 
     # Update live_nav with real post-trade Alpaca NAV so tonight's Panel H is accurate.
     # A dry run must not: Alpaca was never queried there, so nav_live is the
     # placeholder constant and writing it would silently replace the account NAV
     # with 100,000 in the settings table that Panel H sizes against.
-    if dry_run:
-        logger.info(
-            "dry run: NOT writing live_nav (nav_live=%.2f is the placeholder, "
-            "Alpaca was not queried)",
-            nav_live,
-        )
-    else:
-        set_setting("live_nav", str(round(nav_live, 2)))
+    with step("11b write live_nav, positions and pnl_log to Supabase", logger):
+        if dry_run:
+            logger.info(
+                "dry run: NOT writing live_nav (nav_live=%.2f is the placeholder, "
+                "Alpaca was not queried)",
+                nav_live,
+            )
+        else:
+            set_setting("live_nav", str(round(nav_live, 2)))
 
-    # Write positions snapshot to Supabase -- fetch AFTER fills so the first
-    # run (flat account before trades) still records real post-fill positions.
-    post_notionals = get_current_positions(client, dry_run=dry_run)
-    logger.info("post-trade positions: %s", post_notionals)
-    position_rows = []
-    for ticker, signed_n in post_notionals.items():
-        position_rows.append({
-            "trade_date": today,
-            "ticker": ticker,
-            "signed_notional": signed_n,
-            "weight": signed_n / nav if nav > 0 else 0.0,
-            "side": "long" if signed_n > 0 else "short",
-        })
-    if position_rows:
-        write_positions(position_rows)
+        # Write positions snapshot to Supabase -- fetch AFTER fills so the first
+        # run (flat account before trades) still records real post-fill positions.
+        post_notionals = get_current_positions(client, dry_run=dry_run)
+        logger.info("post-trade positions: %s", post_notionals)
+        position_rows = []
+        for ticker, signed_n in post_notionals.items():
+            position_rows.append({
+                "trade_date": today,
+                "ticker": ticker,
+                "signed_notional": signed_n,
+                "weight": signed_n / nav if nav > 0 else 0.0,
+                "side": "long" if signed_n > 0 else "short",
+            })
+        if position_rows:
+            write_positions(position_rows)
 
-    # Write P&L log row. Skipped in dry-run: nothing executed, so a zero row
-    # would be a fabricated P&L record for a day that did not trade.
-    total_gross = sum(f.filled_notional for f in fills if f.status == "FILLED")
-    total_net_pnl = -sum(f.simulated_cost for f in fills if f.status == "FILLED")
-    total_cost = sum(f.simulated_cost for f in fills if f.status == "FILLED")
+        # Write P&L log row. Skipped in dry-run: nothing executed, so a zero row
+        # would be a fabricated P&L record for a day that did not trade.
+        total_gross = sum(f.filled_notional for f in fills if f.status == "FILLED")
+        total_net_pnl = -sum(f.simulated_cost for f in fills if f.status == "FILLED")
+        total_cost = sum(f.simulated_cost for f in fills if f.status == "FILLED")
 
-    if dry_run:
-        logger.info("dry run: NOT writing pnl_log (no fills executed)")
-    else:
-        write_pnl_log({
-            "trade_date": today,
-            "gross_pnl": round(total_gross, 4),
-            "net_pnl": round(total_net_pnl, 4),
-            "turnover_cost": round(total_cost, 4),
-            "borrow_cost": 0.0,
-        })
+        if dry_run:
+            logger.info("dry run: NOT writing pnl_log (no fills executed)")
+        else:
+            write_pnl_log({
+                "trade_date": today,
+                "gross_pnl": round(total_gross, 4),
+                "net_pnl": round(total_net_pnl, 4),
+                "turnover_cost": round(total_cost, 4),
+                "borrow_cost": 0.0,
+            })
 
     # -- 12. Record run. A halted run is deliberately NOT recorded: cron_runs is
     #        the idempotency gate, so leaving it unwritten lets the next tick
@@ -425,7 +477,8 @@ def main() -> int:
         )
         return 0
 
-    record_run("run_execution", today)
+    with step("12 record run", logger):
+        record_run("run_execution", today)
     logger.info("run_execution complete for %s", today)
     return 0
 

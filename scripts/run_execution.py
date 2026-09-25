@@ -43,6 +43,8 @@ import os
 import sys
 from datetime import date
 
+from execution.daily_summary import RunSummary
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -65,28 +67,30 @@ MAX_STALE_SESSIONS: int = int(os.environ.get("MAX_STALE_SESSIONS", "2"))
 
 
 def main(max_secs: float | None = None) -> int:
-    """Entry point: arm the guards, then hand off to _run().
+    """Entry point: run under the guards and send exactly one summary email.
 
     Nothing in this job may block forever. The deadline cuts off any step,
     including a pure-CPU spin that no network timeout could catch, and it names
     the step in flight. Alpaca calls additionally get a real per-request timeout
     via execution.alpaca_paper.apply_request_timeout.
+
+    All of the exit handling lives in execution.daily_summary.execute_job, so
+    every outcome (success, skip, halt, timeout, crash) produces one email.
     """
-    from execution.job_guard import JobTimeout, current_step, job_guards
+    from execution.alpaca_paper import DRY_RUN_DEFAULT
+    from execution.daily_summary import execute_job
 
     budget = EXECUTION_JOB_MAX_SECS if max_secs is None else max_secs
-    try:
-        with job_guards(budget, logger):
-            return _run()
-    except JobTimeout as exc:
-        logger.error(
-            "run_execution TIMED OUT: %s. Last step started: %s",
-            exc, current_step() or "(none)",
-        )
-        return 3
+    return execute_job(
+        job="run_execution",
+        budget_secs=budget,
+        body=_run,
+        dry_run=DRY_RUN_DEFAULT,
+        log=logger,
+    )
 
 
-def _run() -> int:
+def _run(summary: RunSummary) -> int:
     from execution.job_guard import step
 
     today = date.today().isoformat()
@@ -96,6 +100,7 @@ def _run() -> int:
     with step("1 NYSE calendar check", logger):
         if not is_trading_day(today):
             logger.info("skipping: NYSE closed on %s", today)
+            summary.mark_skip(f"NYSE closed on {today}")
             return 0
 
     # -- 2. Idempotency
@@ -103,6 +108,7 @@ def _run() -> int:
     with step("2 idempotency check", logger):
         if check_already_ran("run_execution", today):
             logger.info("already ran for %s -- exit 0 (idempotent)", today)
+            summary.mark_skip(f"already ran for {today} (idempotent)")
             return 0
 
     # -- 3. Load signal output written by run_signal.py (no yfinance call needed).
@@ -135,6 +141,7 @@ def _run() -> int:
         }
         target_weights = {}  # computed below in step 6
     logger.info("as_of_date: %s", as_of_date)
+    summary.signal_as_of = as_of_date
 
     # -- 3c. Staleness guard. Counted in NYSE sessions, not calendar days, so a
     #        Friday signal used on Monday is one session old rather than three.
@@ -173,6 +180,10 @@ def _run() -> int:
                 "exists.",
                 as_of_date, signal_age_sessions, today, MAX_STALE_SESSIONS,
             )
+            summary.mark_skip(
+                f"signal {as_of_date} is {signal_age_sessions} NYSE sessions old, "
+                f"over the {MAX_STALE_SESSIONS} session limit"
+            )
             return 4
 
     # -- 4. Decision gate
@@ -193,6 +204,7 @@ def _run() -> int:
 
     if decision == "reject":
         logger.info("decision=reject for %s -- skipping execution", as_of_date)
+        summary.mark_skip(f"decision=reject for {as_of_date}")
         record_run("run_execution", today)
         return 0
 
@@ -201,6 +213,7 @@ def _run() -> int:
             "auto_approve=False and no explicit approve for %s -- skipping",
             as_of_date,
         )
+        summary.mark_skip(f"no approval for {as_of_date} (decision={decision})")
         record_run("run_execution", today)
         return 0
 
@@ -393,6 +406,23 @@ def _run() -> int:
         }
         fills = mark_costs(fills, current_short_notionals=short_notionals)
 
+    # Record every leg on the summary, so the daily email lists what actually
+    # happened rather than only a count. Buckets come from the fill records, which
+    # cover guard-rejected legs too (those never became SubmitOutcomes):
+    #   filled   -- executed
+    #   rejected -- carries a reason code, or the broker poll timed out
+    #   skipped  -- blocked by a guard before submission (notional cap, dry run)
+    for _f in fills:
+        _label = f"{_f.ticker} {_f.position_intent}"
+        if _f.status == "FILLED":
+            summary.filled.append(f"{_label} ${_f.filled_notional:,.2f}")
+        elif _f.reason_code:
+            summary.rejected.append(f"{_label} {_f.reason_code}")
+        elif _f.status == "TIMEOUT":
+            summary.rejected.append(f"{_label} TIMEOUT")
+        else:
+            summary.skipped.append(f"{_label} {_f.guard_status or _f.status}")
+
     # -- 9b. Persist the rejection audit trail. This is the ONLY durable record
     #        of a leg that never became an order: Alpaca keeps nothing for a
     #        submit-time rejection, and this box's filesystem is ephemeral.
@@ -517,6 +547,14 @@ def _run() -> int:
                 "turnover_cost": round(total_cost, 4),
                 "borrow_cost": 0.0,
             })
+
+    # NAV and the day's P&L, as reported in the daily summary email. `nav` is the
+    # frozen snapshot the deltas were sized against; nav_live is the real Alpaca
+    # figure read after the trades.
+    summary.nav_frozen = nav
+    summary.nav_live = nav_live
+    summary.pnl_net = total_net_pnl
+    summary.turnover_cost = total_cost
 
     # -- 12. Record run. A halted run is deliberately NOT recorded: cron_runs is
     #        the idempotency gate, so leaving it unwritten lets the next tick

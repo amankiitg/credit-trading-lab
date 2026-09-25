@@ -33,6 +33,8 @@ from datetime import date
 
 import pandas as pd
 
+from execution.daily_summary import RunSummary
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -60,28 +62,28 @@ OVERLAY_MAX_SECS: float = float(os.environ.get("OVERLAY_MAX_SECS", "120"))
 
 
 def main(max_secs: float | None = None) -> int:
-    """Entry point: arm the guards, then hand off to _run().
+    """Entry point: run under the guards and send exactly one summary email.
 
     Nothing in this job is allowed to block forever. The deadline cuts off any
     step, including a pure-CPU spin that no network timeout could catch, and it
     reports which step was in flight. The exit code is always non-zero on a
     timeout so the scheduler records a failure instead of a silent success.
+
+    All of the exit handling lives in execution.daily_summary.execute_job, so
+    every outcome (success, skip, gate block, timeout, crash) produces one email.
     """
-    from execution.job_guard import JobTimeout, current_step, job_guards
+    from execution.daily_summary import execute_job
 
     budget = SIGNAL_JOB_MAX_SECS if max_secs is None else max_secs
-    try:
-        with job_guards(budget, logger):
-            return _run()
-    except JobTimeout as exc:
-        logger.error(
-            "run_signal TIMED OUT: %s. Last step started: %s",
-            exc, current_step() or "(none)",
-        )
-        return 3
+    return execute_job(
+        job="run_signal",
+        budget_secs=budget,
+        body=_run,
+        log=logger,
+    )
 
 
-def _run() -> int:
+def _run(summary: RunSummary) -> int:
     from execution.job_guard import JobTimeout, step, step_budget
 
     today = date.today().isoformat()
@@ -91,6 +93,7 @@ def _run() -> int:
     with step("1 NYSE calendar check", logger):
         if not is_trading_day(today):
             logger.info("skipping: NYSE closed on %s", today)
+            summary.mark_skip(f"NYSE closed on {today}")
             return 0
 
     # -- 2. Idempotency
@@ -98,6 +101,7 @@ def _run() -> int:
     with step("2 idempotency check", logger):
         if check_already_ran("run_signal", today):
             logger.info("already ran for %s -- exit 0 (idempotent)", today)
+            summary.mark_skip(f"already ran for {today} (idempotent)")
             return 0
 
     # -- 3. Refresh closes from yfinance with retry (up to the ingest budget).
@@ -137,6 +141,18 @@ def _run() -> int:
         close = load_universe_close()
         as_of_date = str(close.index[-1].date())
         logger.info("as_of_date: %s (latest close available)", as_of_date)
+    summary.signal_as_of = as_of_date
+
+    # What the hole repair filled during ingest, if anything. surfacing it here is
+    # the point of the daily email: a fill is a silent data change otherwise.
+    from signals.raw_repair import last_report
+    _repair = last_report() or {}
+    for _f in _repair.get("filled", []):
+        summary.gap_fills.append(
+            f"{_f['ticker']} {_f['date'].date()} (source=alpaca_iex)"
+        )
+    for _t, _why in sorted((_repair.get("refused") or {}).items()):
+        summary.extra.append(f"Gap repair refused: {_t} ({_why})")
 
     # -- 4. Run v8.2 signal
     from signals.trend_signal import (
@@ -186,8 +202,14 @@ def _run() -> int:
             "Repair the raw closes (scripts/backfill_raw_gap.py) and re-run. "
             "Nothing was written, so the stored signal is unchanged."
         )
+        shown = "; ".join(problems[:5])
+        if len(problems) > 5:
+            shown += f"; ... and {len(problems) - 5} more"
+        summary.data_check = f"BLOCKED ({len(problems)} problem(s)): {shown}"
+        summary.mark_skip(f"data-quality gate blocked the signal for {as_of_date}")
         return 1
     logger.info("data-quality gate passed for %s", as_of_date)
+    summary.data_check = "passed"
 
     try:
         with step("4b v9.1 stop overlay compute (advisory)", logger):

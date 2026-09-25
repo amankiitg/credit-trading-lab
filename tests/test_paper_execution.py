@@ -15,6 +15,7 @@ import json
 from dataclasses import replace
 from datetime import date
 from pathlib import Path
+from typing import Callable
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1481,6 +1482,7 @@ def _run_execution_with_stub(
     dry_run: bool = False,
     signal_as_of: str | None = None,
     drift: dict | None = None,
+    alert_sender: Callable | None = None,
 ) -> dict:
     """Drive scripts.run_execution.main() with Alpaca and Supabase stubbed.
 
@@ -1491,7 +1493,9 @@ def _run_execution_with_stub(
 
     `signal_as_of` overrides the stored signal date, which is how the staleness
     guard is reached; it defaults to today. `drift` forces the drift check to
-    report a divergence, which is the only way into the alert branch.
+    report a divergence, which is the only way into the alert branch. `alert_sender`
+    replaces the email sender for the whole run, covering both the drift alert and
+    the daily summary.
     """
     import json as _json
     from datetime import date as _date
@@ -1608,6 +1612,24 @@ def _run_execution_with_stub(
     )
     monkeypatch.setattr(sb_mod, "write_cron_run", lambda job, d: True)
 
+    # Capture the daily summary email rather than sending it. daily_summary and
+    # the drift branch both resolve execution.alerts at call time, so patching the
+    # attribute covers both. Looked up in sys.modules rather than imported, because
+    # one test simulates the module being absent by setting it to None.
+    import sys
+
+    emails: list[dict] = []
+
+    if alert_sender is not None:
+        _sender = alert_sender
+    else:
+        def _sender(subject, body):
+            return emails.append({"subject": subject, "body": body}) or True
+
+    _alerts_mod = sys.modules.get("execution.alerts")
+    if _alerts_mod is not None:
+        monkeypatch.setattr(_alerts_mod, "send_alert_email", _sender)
+
     exit_code = run_mod.main()
 
     return {
@@ -1619,6 +1641,7 @@ def _run_execution_with_stub(
         "submit_calls": client.submit_order.call_count,
         "settings": settings,
         "reconcile_log": tmp_path / "logs" / f"reconciliation_{today}.json",
+        "emails": emails,
     }
 
 
@@ -1755,6 +1778,97 @@ def test_run_trades_a_signal_at_the_staleness_limit(tmp_path, monkeypatch, caplo
     assert "is 2 NYSE session(s) old" in caplog.text
 
 
+# ------------------------------------------------- v9.5: the daily summary email
+
+def test_ok_run_sends_exactly_one_ok_summary(tmp_path, monkeypatch) -> None:
+    """Requirement 5: a normal run sends one [OK] email with the run's numbers."""
+    today = date.today().isoformat()
+    result = _run_execution_with_stub(
+        tmp_path, monkeypatch,
+        shortable_map={"SPY": True, "LQD": True, "GLD": True},
+    )
+
+    assert result["exit_code"] == 0
+    assert len(result["emails"]) == 1, "exactly one email per run"
+
+    email = result["emails"][0]
+    assert email["subject"] == f"[OK] run_execution {today}"
+
+    body = email["body"]
+    assert "exit code 0" in body
+    assert f"Signal as_of_date: {today}" in body
+    assert "NAV frozen for sizing: $100,000.00" in body
+    assert "Orders: 3 filled, 0 skipped, 0 rejected" in body
+    assert "filled: SPY buy_to_open" in body
+    assert "Day P&L:" in body, "the day's P&L belongs in the email"
+
+
+def test_stale_skip_sends_exactly_one_skip_summary(tmp_path, monkeypatch) -> None:
+    """Requirement 5: a stale skip is [SKIP], not [FAIL] and not [OK].
+
+    The run deliberately did nothing, and the email has to say which, because a
+    silent skip is indistinguishable from a missed run in an inbox full of them.
+    """
+    today = date.today().isoformat()
+    result = _run_execution_with_stub(
+        tmp_path, monkeypatch,
+        shortable_map={"SPY": True, "LQD": True, "GLD": True},
+        signal_as_of=_signal_date_sessions_ago(3),
+    )
+
+    assert result["exit_code"] == 4
+    assert len(result["emails"]) == 1
+
+    email = result["emails"][0]
+    assert email["subject"] == f"[SKIP] run_execution {today}"
+    assert "exit code 4" in email["body"]
+    assert "over the 2 session limit" in email["body"]
+    assert "Last step started" in email["body"], "a skip says where it stopped"
+    assert "Orders: 0 filled" in email["body"]
+
+
+def test_dry_run_sends_no_summary(tmp_path, monkeypatch, caplog) -> None:
+    """Requirement 4: a rehearsal must not email, and must log the skip."""
+    import logging
+
+    with caplog.at_level(logging.INFO):
+        result = _run_execution_with_stub(
+            tmp_path, monkeypatch,
+            shortable_map={"SPY": True, "LQD": True, "GLD": True},
+            dry_run=True,
+        )
+
+    assert result["exit_code"] == 0
+    assert result["emails"] == [], "a dry run must not send a summary"
+    assert "summary email skipped: dry run" in caplog.text
+
+
+def test_a_failed_summary_email_leaves_the_exit_code_alone(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    """Requirement 5: a send failure must not change the exit code.
+
+    The run traded, so it exits 0 whatever happened to the email. The failure is
+    still visible in the log at WARNING.
+    """
+    import logging
+
+    def _boom(subject, body):
+        raise RuntimeError("resend unreachable")
+
+    with caplog.at_level(logging.WARNING):
+        result = _run_execution_with_stub(
+            tmp_path, monkeypatch,
+            shortable_map={"SPY": True, "LQD": True, "GLD": True},
+            alert_sender=_boom,
+        )
+
+    assert result["exit_code"] == 0, "a failed email must not fail the run"
+    assert result["submit_calls"] == 3, "the trading still happened"
+    assert result["recorded"]["run"][0] == "run_execution"
+    assert "summary email failed (RuntimeError: resend unreachable)" in caplog.text
+
+
 # ------------------------------------------------- v9.4 follow-up: alerts are best effort
 
 _DRIFT = {"SPY": {"cached": 5000.0, "live": 4000.0, "diff": 1000.0}}
@@ -1795,26 +1909,29 @@ def test_run_completes_when_the_alerts_module_cannot_be_imported(
 
 
 def test_run_completes_when_the_alert_send_raises(tmp_path, monkeypatch, caplog) -> None:
-    """A raising send is caught too, so a Resend outage cannot stop the book trading."""
-    import logging
+    """A raising send is caught too, so a Resend outage cannot stop the book trading.
 
-    import execution.alerts as alerts_mod
+    Covers both senders in one run: the drift alert and the daily summary. Neither
+    may change what the run did.
+    """
+    import logging
 
     def _boom(subject, body):
         raise RuntimeError("resend returned 500")
-
-    monkeypatch.setattr(alerts_mod, "send_alert_email", _boom)
 
     with caplog.at_level(logging.INFO):
         result = _run_execution_with_stub(
             tmp_path, monkeypatch,
             shortable_map={"SPY": True, "LQD": True, "GLD": True},
             drift=_DRIFT,
+            alert_sender=_boom,
         )
 
     assert result["exit_code"] == 0
     assert result["submit_calls"] == 3
+    assert result["recorded"]["run"][0] == "run_execution"
     assert "position-drift alert email failed (RuntimeError: resend returned 500)" in caplog.text
+    assert "summary email failed (RuntimeError: resend returned 500)" in caplog.text
 
 
 def test_a_failed_alert_does_not_hide_the_absence_of_drift_handling(

@@ -125,3 +125,55 @@ Proven rather than assumed. With the guard removed the new test fails with
 `scripts/run_execution.py:281`, the same line and the same exception as production.
 With the guard it passes. Three tests cover it: the import failing, the send raising,
 and a negative control with no drift so the branch is provably what is exercised.
+
+The Resend setup was then confirmed live: one test email, `send_alert_email` returned
+True, HTTP 200, message id `01a0d684-d603-7bfe-a9a6-5793cf23074d`. The
+`onboarding@resend.dev` sender restriction did not apply because the recipient is the
+Resend account's own address, which is the one case that sender permits; sending to
+any other address would 403 and silently return False. The key in `.env` is send-only
+restricted, so it cannot list verified domains.
+
+## Follow-up -- one summary email per cron run
+
+Both jobs now send exactly one plain-text email at the end of every run, whatever
+the outcome. `execution/daily_summary.py` holds it, and both `main()` functions are
+now a three-line call into `execute_job`, which owns the `try/finally`. There is
+one place a job can end, so there is one place the email is sent, and a run cannot
+pass silently because a `return` happened to be taken before the send. The
+2026-09-24 incidents are the reason: a hung run and a wrong book were both visible
+only in the logs of a job nobody watched.
+
+Subject is `[OK]`, `[SKIP]` or `[FAIL]`, then the job, then the date.
+
+Status comes from the exit code, with one deliberate exception. Exit 4 (stale
+signal) is a skip, and any other non-zero is a failure, but `run_signal` exits 1
+both for a data-quality block, which is a deliberate refusal, and for a failed
+Supabase write, which is a real failure, so `RunSummary.mark_skip` lets the job say
+which it was. The same mark covers the other deliberate no-ops: market closed,
+already ran, decision=reject, no approval, and the gate block.
+
+Four rules, each with a test:
+
+  - **Exactly one email per run**, including a deadline and an unexpected
+    exception. A crash is recorded and then re-raised unchanged, so its traceback
+    and exit code still reach the scheduler.
+  - **Sending cannot affect the run.** `send_summary` catches everything, including
+    a failing import, logs at WARNING and returns. The import is inside the try for
+    the reason learned above.
+  - **No email in a dry run**, and the skip is logged. `run_signal` has no dry-run
+    mode, so this applies to `run_execution`.
+  - **The body reports what happened**: for execution, the signal as_of_date, the
+    frozen and live NAV, the day's P&L with turnover cost, and the leg buckets;
+    for signal, the as_of_date, any gap fills, and whether the data check passed or
+    blocked and why. A non-OK email also carries the exit code and the last step
+    that started, which comes from the job-guard step trail.
+
+`tests/conftest.py` (new) patches the sender for every test, so no test in the suite
+can send a real email. Without it, a developer with RESEND_API_KEY exported would
+mail themselves on every run of the tests that drive `main()`.
+
+Verified by removing the send: 11 tests fail, across all three outcomes plus the
+dry run, so the suite is a real guard rather than a set of vacuous assertions.
+
+504 tests pass. The 11 failures and 2 errors are the pre-existing `pycredit`
+extension imports. No job run was triggered.

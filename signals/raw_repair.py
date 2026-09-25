@@ -32,6 +32,18 @@ logger = logging.getLogger(__name__)
 MAX_HOLE_REPAIR_SESSIONS: int = 2
 SOURCE_TAG: str = "alpaca_iex"
 
+# The most recent repair report. A repair is a silent change to the close matrix,
+# so run_signal reports it in the daily summary. This is how that gets out
+# without changing ingest()'s signature, which several callers use. None until a
+# repair has run; the dict is the same object repair_frames returns, so it is
+# complete by the time the caller reads it.
+LAST_REPORT: dict | None = None
+
+
+def last_report() -> dict | None:
+    """The most recent repair report, or None if no repair has run yet."""
+    return LAST_REPORT
+
 
 def close_matrix(frames: dict[str, pd.DataFrame]) -> pd.DataFrame:
     """adj_close per ticker, outer-joined, exactly as load_universe_close sees it."""
@@ -157,6 +169,8 @@ def repair_frames(
     that actually gained a row, and are returned untouched otherwise.
     """
     report: dict = {"filled": [], "refused": {}, "unresolved": [], "holes": 0}
+    global LAST_REPORT
+    LAST_REPORT = report
     if not frames:
         return frames, report
 

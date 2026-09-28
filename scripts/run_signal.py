@@ -306,14 +306,12 @@ def _run(summary: RunSummary) -> int:
         from execution.snapshot import refresh_snapshot
 
         refresh = refresh_snapshot(run_date=today, log=logger)
-    if refresh["skipped"]:
-        logger.warning("snapshot refresh did not complete: %s", refresh["skipped"])
-        summary.extra.append(f"Snapshot refresh skipped: {refresh['skipped']}")
-    else:
-        summary.extra.append(
-            f"Snapshot refreshed from Alpaca: live_nav=${refresh['nav']:,.2f}, "
-            f"{refresh['tickers']} position row(s)"
-        )
+
+    # Recorded on the summary rather than logged only, so the email carries the
+    # outcome and a failure lifts the subject to [SKIP]. Never changes the exit code.
+    summary.record_basis_refresh(refresh)
+    if refresh.get("failed"):
+        logger.warning("snapshot refresh failed: %s", refresh.get("skipped"))
 
     logger.info("run_signal complete for %s", today)
     return 0

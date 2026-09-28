@@ -44,11 +44,19 @@ def refresh_snapshot(
     """Read live positions and NAV from Alpaca and write the cached snapshot.
 
     Returns a report: {"written": bool, "nav": float | None, "tickers": int,
-    "skipped": str | None}. `skipped` names the reason nothing was written, and is
-    None when the refresh completed.
+    "skipped": str | None, "failed": bool}. `skipped` names the reason nothing was
+    written, and is None when the refresh completed. `failed` separates a real
+    failure from a deliberate skip: a dry run is skipped but is not a failure, and
+    the summary email shows those two cases very differently.
     """
     log = log or logger
-    report: dict = {"written": False, "nav": None, "tickers": 0, "skipped": None}
+    report: dict = {
+        "written": False,
+        "nav": None,
+        "tickers": 0,
+        "skipped": None,
+        "failed": False,
+    }
 
     if dry_run:
         report["skipped"] = "dry run"
@@ -65,6 +73,7 @@ def refresh_snapshot(
         client = connect(dry_run=False)
         if client is None:
             report["skipped"] = "no Alpaca client"
+            report["failed"] = True
             log.warning("snapshot refresh skipped: connect() returned no client")
             return report
 
@@ -111,6 +120,7 @@ def refresh_snapshot(
         # Deliberately broad, including the import above: this is bookkeeping and a
         # failure must not propagate into a run whose real work already finished.
         report["skipped"] = f"{type(exc).__name__}: {exc}"
+        report["failed"] = True
         log.warning(
             "snapshot refresh failed (%s: %s) -- the cached snapshot is unchanged; "
             "the run is unaffected",

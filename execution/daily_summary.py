@@ -69,6 +69,14 @@ class RunSummary:
     rejected: list[str] = field(default_factory=list)
     gap_fills: list[str] = field(default_factory=list)
     data_check: str | None = None
+    # The basis refresh: how many position rows were rewritten and at what NAV, or
+    # why it failed. A failed refresh is reported in the body and lifts the subject to
+    # at least [SKIP], because a stale sizing basis is a real operational problem that
+    # should not be readable only by opening the email.
+    basis_positions: int | None = None
+    basis_nav: float | None = None
+    basis_skipped: str | None = None
+    basis_failed: str | None = None
     extra: list[str] = field(default_factory=list)
 
     def mark_skip(self, reason: str) -> None:
@@ -76,14 +84,34 @@ class RunSummary:
         self.status = SKIP
         self.reason = reason
 
+    def record_basis_refresh(self, report: dict) -> None:
+        """Record the outcome of execution.snapshot.refresh_snapshot.
 
-def status_for(summary: RunSummary) -> str:
-    """[OK], [SKIP] or [FAIL]. An explicit mark wins over the exit code.
+        A dry run reports `skipped` but is not a failure, and the two look completely
+        different in the email, so the report's own `failed` flag decides which.
+        """
+        if report.get("failed"):
+            self.basis_failed = str(report.get("skipped") or "unknown reason")
+            return
+        if report.get("skipped"):
+            self.basis_skipped = str(report["skipped"])
+            return
+        self.basis_positions = report.get("tickers")
+        self.basis_nav = report.get("nav")
 
-    The exit code alone cannot say enough: run_signal exits 1 both for a
+
+# Severity order for the subject line. A failed basis refresh lifts a clean run to
+# [SKIP], but must never soften a real failure, so the code only ever moves up.
+_SEVERITY: dict[str, int] = {OK: 0, SKIP: 1, FAIL: 2}
+
+
+def _base_status(summary: RunSummary) -> str:
+    """The status the run's own outcome earns, before any escalation.
+
+    An explicit mark wins over the exit code: run_signal exits 1 both for a
     data-quality block, which is a deliberate refusal to write, and for a failed
-    Supabase write, which is a real failure. The job knows which one it was and
-    marks it. Everything else falls back to the code.
+    Supabase write, which is a real failure. The job knows which one it was and marks
+    it. Everything else falls back to the code.
     """
     if summary.status:
         return summary.status
@@ -92,6 +120,19 @@ def status_for(summary: RunSummary) -> str:
     if summary.exit_code in SKIP_EXIT_CODES:
         return SKIP
     return FAIL
+
+
+def status_for(summary: RunSummary) -> str:
+    """[OK], [SKIP] or [FAIL], with a failed basis refresh escalated to at least [SKIP].
+
+    The refresh is what stops the sizing basis going stale, so failing to refresh it
+    is a problem the subject line should carry rather than leaving it in a log line
+    nobody reads. Escalation is one-way: a [FAIL] run stays [FAIL].
+    """
+    status = _base_status(summary)
+    if summary.basis_failed and _SEVERITY[status] < _SEVERITY[SKIP]:
+        return SKIP
+    return status
 
 
 def subject_for(summary: RunSummary) -> str:
@@ -112,6 +153,19 @@ def body_for(summary: RunSummary, last_step: str | None = None) -> str:
         lines.append(f"Data check: {summary.data_check}")
     if summary.gap_fills:
         lines.append("Gap fills: " + "; ".join(summary.gap_fills))
+
+    if summary.basis_failed:
+        lines.append(f"basis refresh FAILED: {summary.basis_failed}")
+    elif summary.basis_nav is not None:
+        lines.append(
+            f"basis refreshed: {summary.basis_positions} positions, "
+            f"NAV ${summary.basis_nav:,.2f}"
+        )
+    elif summary.basis_skipped:
+        # Reached on a dry run, where no email is sent anyway, but stated rather than
+        # omitted so a missing line is never ambiguous.
+        lines.append(f"basis refresh: not attempted ({summary.basis_skipped})")
+
     if summary.nav_frozen is not None:
         nav = f"NAV frozen for sizing: ${summary.nav_frozen:,.2f}"
         if summary.nav_live is not None:
@@ -144,7 +198,10 @@ def body_for(summary: RunSummary, last_step: str | None = None) -> str:
     lines += [f"  rejected: {x}" for x in summary.rejected]
     lines += summary.extra
 
-    if status_for(summary) != OK:
+    # Deliberately the base status, not the escalated one: a clean run whose basis
+    # refresh failed should report the refresh problem in its own line rather than
+    # implying the run itself stopped partway through a step.
+    if _base_status(summary) != OK:
         lines.append(f"Last step started: {last_step or '(none)'}")
     return "\n".join(lines)
 

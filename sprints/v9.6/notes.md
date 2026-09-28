@@ -84,3 +84,39 @@ keeps its own line and is never added into the headline.
 2 errors are pre-existing and all trace to the unbuilt `pycredit` C++ extension.
 
 No job run was triggered. The only live change was the additive `shares` column.
+
+## The basis refresh is reported in both emails, and a failure is visible from the subject
+
+Both jobs now put the refresh outcome in the summary body:
+
+    basis refreshed: 8 positions, NAV $101,234.56
+    basis refresh FAILED: ConnectionError: alpaca unreachable
+
+and a buttoned-up detail worth stating: **a failed refresh lifts the subject to
+[SKIP]**, so a stale sizing basis cannot be noticed only by opening the email. The
+escalation is one-way, [OK] to [SKIP]; a [FAIL] run stays [FAIL], because a small
+problem should never soften a real one.
+
+Three things that needed care:
+
+  - **`refresh_snapshot` now reports `failed` separately from `skipped`.** A dry run
+    skips the refresh deliberately, so treating any skip as a failure would have
+    labelled an ordinary dry run "FAILED" and pushed its subject to [SKIP]. The report
+    distinguishes them and the email shows them differently: a dry run reads
+    "basis refresh: not attempted (dry run)".
+  - **`_base_status` was split out of `status_for`.** The escalation is about the
+    basis, not about the run, so the "Last step started" line in the body still keys off
+    the run's own outcome. A clean run whose refresh failed reports the refresh problem
+    rather than implying it stopped partway through a step.
+  - **The trading path needed its own reporting.** `run_execution` writes the snapshot
+    inline at step 11b on a day that trades, rather than through
+    `execution.snapshot.refresh_snapshot`, so the result is now recorded from those
+    writes. If Supabase rejects the `live_nav` and `positions` writes, the cached basis
+    is stale and that is reported as a failure, which it previously was not: the return
+    values were discarded.
+
+Nothing here changes an exit code. The refresh report is only ever recorded on the
+summary, tested by asserting the exit code is unchanged while the subject escalates.
+
+541 tests pass, 9 new. The 11 failures and 2 errors are the pre-existing `pycredit`
+extension imports.

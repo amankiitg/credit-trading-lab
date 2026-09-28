@@ -82,16 +82,9 @@ def _refresh_basis(summary: RunSummary, *, dry_run: bool) -> None:
             run_date=date.today().isoformat(), dry_run=dry_run, log=logger
         )
 
-    if report["skipped"]:
-        summary.extra.append(f"Snapshot refresh skipped: {report['skipped']}")
-        return
-
-    nav = report.get("nav")
-    shown = f"${nav:,.2f}" if isinstance(nav, (int, float)) else "unavailable"
-    summary.extra.append(
-        f"Snapshot refreshed from Alpaca: live_nav={shown}, "
-        f"{report['tickers']} position row(s)"
-    )
+    # Recorded on the summary rather than logged only, so the email carries the
+    # outcome and a failure lifts the subject to [SKIP]. Never changes the exit code.
+    summary.record_basis_refresh(report)
 
 
 def main(max_secs: float | None = None) -> int:
@@ -573,8 +566,9 @@ def _run(summary: RunSummary) -> int:
                 "Alpaca was not queried)",
                 nav_live,
             )
+            nav_written = False
         else:
-            set_setting("live_nav", str(round(nav_live, 2)))
+            nav_written = set_setting("live_nav", str(round(nav_live, 2)))
 
         # Write positions snapshot to Supabase -- fetch AFTER fills so the first
         # run (flat account before trades) still records real post-fill positions.
@@ -596,8 +590,27 @@ def _run(summary: RunSummary) -> int:
                 "weight": signed_n / nav if nav > 0 else 0.0,
                 "side": "long" if signed_n > 0 else "short",
             })
-        if position_rows:
-            write_positions(position_rows)
+        positions_written = write_positions(position_rows) if position_rows else False
+
+        # The basis refresh as the summary email reports it. On a trading day the
+        # snapshot is written here rather than through execution.snapshot, so the
+        # result comes from these two writes. A write that Supabase rejected leaves
+        # the cached basis stale, which is a failure worth saying out loud.
+        if dry_run:
+            basis_report = {"skipped": "dry run", "failed": False}
+        elif not (nav_written or positions_written):
+            basis_report = {
+                "skipped": "Supabase rejected the live_nav and positions writes",
+                "failed": True,
+            }
+        else:
+            basis_report = {
+                "written": True,
+                "nav": nav_live,
+                "tickers": len(position_rows),
+                "skipped": None,
+                "failed": False,
+            }
 
         # Write P&L log row. Skipped in dry-run: nothing executed, so a zero row
         # would be a fabricated P&L record for a day that did not trade.
@@ -627,6 +640,7 @@ def _run(summary: RunSummary) -> int:
         nav_live - previous_live_nav if previous_live_nav is not None else None
     )
     summary.turnover_cost = total_cost
+    summary.record_basis_refresh(basis_report)
 
     # -- 12. Record run. A halted run is deliberately NOT recorded: cron_runs is
     #        the idempotency gate, so leaving it unwritten lets the next tick

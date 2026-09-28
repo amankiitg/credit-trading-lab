@@ -18,7 +18,13 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from execution.daily_summary import RunSummary, body_for
+from execution.daily_summary import (
+    SKIP,
+    RunSummary,
+    body_for,
+    status_for,
+    subject_for,
+)
 from execution.snapshot import refresh_snapshot
 from tests.test_paper_execution import _run_execution_with_stub
 
@@ -34,7 +40,10 @@ def _capture():
     def _spy(**kw):
         _LAST_REFRESH["calls"] += 1
         _LAST_REFRESH["kwargs"] = kw
-        return {"written": True, "nav": 101_000.0, "tickers": 8, "skipped": None}
+        return {
+            "written": True, "nav": 101_000.0, "tickers": 8,
+            "skipped": None, "failed": False,
+        }
 
     _LAST_REFRESH["calls"] = 0
     return _spy
@@ -163,11 +172,14 @@ def test_an_empty_book_still_writes_live_nav(monkeypatch) -> None:
 
 # ------------------------------------------------------------------ fix 2: the wiring
 
-def test_run_signal_refreshes_the_basis_after_writing_the_signal(monkeypatch) -> None:
+def test_run_signal_refreshes_the_basis_after_writing_the_signal(
+    monkeypatch, no_real_email
+) -> None:
     """The post-close refresh is what keeps the proposal's basis at most a day old.
 
     Drives a clean, unblocked signal run all the way to the end. The gate passes, so
-    the run reaches step 7, which is the refresh.
+    the run reaches step 7, which is the refresh. `no_real_email` is the conftest spy
+    that captures what the run would have sent.
     """
     import numpy as np
     import pandas as pd
@@ -198,7 +210,8 @@ def test_run_signal_refreshes_the_basis_after_writing_the_signal(monkeypatch) ->
     monkeypatch.setattr(
         snap, "refresh_snapshot",
         lambda **kw: called.append(kw) or {
-            "written": True, "nav": 101_000.0, "tickers": 8, "skipped": None
+            "written": True, "nav": 101_000.0, "tickers": 8,
+            "skipped": None, "failed": False,
         },
     )
 
@@ -207,6 +220,55 @@ def test_run_signal_refreshes_the_basis_after_writing_the_signal(monkeypatch) ->
     assert code == 0, "a clean signal run completes"
     assert len(called) == 1, "the run must refresh the basis exactly once"
     assert called[0]["run_date"] == TODAY
+
+    # The run's own summary email must carry the result, not just the log.
+    assert len(no_real_email) == 1
+    assert no_real_email[0]["subject"] == f"[OK] run_signal {TODAY}"
+    assert "basis refreshed: 8 positions, NAV $101,000.00" in no_real_email[0]["body"]
+
+
+def test_run_signal_escalates_the_subject_when_the_refresh_fails(
+    monkeypatch, no_real_email
+) -> None:
+    """Both jobs must show a failed basis refresh in the subject, not only the body."""
+    import numpy as np
+    import pandas as pd
+
+    import dashboard.supabase_client as sb
+    import execution.calendar_utils as cal
+    import execution.snapshot as snap
+    import signals.etf_universe as etf
+    import scripts.run_signal as run_signal
+
+    idx = pd.date_range("2026-01-01", periods=200, freq="B")
+    rng = np.random.default_rng(9)
+    close = pd.DataFrame(
+        {t: 100 + np.cumsum(rng.normal(0, 0.5, len(idx))) for t in etf.UNIVERSE},
+        index=idx,
+    )
+
+    monkeypatch.setattr(cal, "is_trading_day", lambda d: True)
+    monkeypatch.setattr(cal, "check_already_ran", lambda job, d: False)
+    monkeypatch.setattr(cal, "record_run", lambda job, d: None)
+    monkeypatch.setattr(etf, "ingest", lambda *a, **k: None)
+    monkeypatch.setattr(etf, "load_universe_close", lambda *a, **k: close)
+    monkeypatch.setattr(sb, "get_setting", lambda k: None)
+    monkeypatch.setattr(sb, "set_setting", lambda k, v: True)
+    monkeypatch.setattr(sb, "write_decision", lambda d, dec: True)
+    monkeypatch.setattr(
+        snap, "refresh_snapshot",
+        lambda **kw: {"written": False, "nav": None, "tickers": 0,
+                      "skipped": "ConnectionError: alpaca unreachable", "failed": True},
+    )
+
+    code = run_signal.main(max_secs=120)
+
+    assert code == 0, "the signal was written, so the run itself still succeeded"
+    assert no_real_email[0]["subject"] == f"[SKIP] run_signal {TODAY}"
+    assert (
+        "basis refresh FAILED: ConnectionError: alpaca unreachable"
+        in no_real_email[0]["body"]
+    )
 
 
 def test_run_execution_refreshes_the_basis_when_the_day_is_rejected(monkeypatch) -> None:
@@ -224,7 +286,7 @@ def test_run_execution_refreshes_the_basis_when_the_day_is_rejected(monkeypatch)
     assert result["exit_code"] == 0, "a reject is still a clean exit"
     assert _LAST_REFRESH["calls"] == 1, "the rejected path must refresh the basis once"
     assert result["emails"][0]["subject"] == f"[SKIP] run_execution {TODAY}"
-    assert "Snapshot refreshed from Alpaca" in result["emails"][0]["body"]
+    assert "basis refreshed: 8 positions, NAV $101,000.00" in result["emails"][0]["body"]
     assert result["submit_calls"] == 0, "a rejected day must not trade"
 
 
@@ -311,3 +373,104 @@ def test_run_execution_bases_the_nav_move_on_the_stored_nav(monkeypatch) -> None
     assert "NAV frozen for sizing: $100,000.00" in body
     assert "Book P&L (live NAV move since previous run): $+0.00" in body
     assert "Turnover cost today: $" in body
+
+
+# ------------------------------------------------- the refresh line in the email
+
+def test_the_email_reports_a_successful_refresh() -> None:
+    s = RunSummary(job="run_signal", run_date=TODAY)
+    s.record_basis_refresh(
+        {"written": True, "nav": 101_234.56, "tickers": 8,
+         "skipped": None, "failed": False}
+    )
+
+    assert "basis refreshed: 8 positions, NAV $101,234.56" in body_for(s)
+
+
+def test_the_email_reports_a_failed_refresh_with_its_reason() -> None:
+    s = RunSummary(job="run_signal", run_date=TODAY)
+    s.record_basis_refresh(
+        {"written": False, "nav": None, "tickers": 0,
+         "skipped": "ConnectionError: alpaca unreachable", "failed": True}
+    )
+
+    assert "basis refresh FAILED: ConnectionError: alpaca unreachable" in body_for(s)
+    assert "basis refreshed" not in body_for(s)
+
+
+def test_a_failed_refresh_lifts_the_subject_to_skip() -> None:
+    """A stale sizing basis must be visible from the subject line, not only in the body."""
+    s = RunSummary(job="run_signal", run_date=TODAY, exit_code=0)
+    assert subject_for(s) == f"[OK] run_signal {TODAY}", "clean run starts as [OK]"
+
+    s.record_basis_refresh({"skipped": "RuntimeError: boom", "failed": True})
+
+    assert subject_for(s) == f"[SKIP] run_signal {TODAY}"
+    assert status_for(s) == SKIP
+
+
+def test_a_failed_refresh_does_not_soften_a_failure() -> None:
+    """Escalation is one way: a [FAIL] run stays [FAIL]."""
+    s = RunSummary(job="run_execution", run_date=TODAY, exit_code=3)
+    s.record_basis_refresh({"skipped": "RuntimeError: boom", "failed": True})
+
+    assert subject_for(s) == f"[FAIL] run_execution {TODAY}"
+
+
+def test_a_dry_run_refresh_is_not_treated_as_a_failure() -> None:
+    """A dry run skips the refresh deliberately; that is not a failure and must not
+    push the subject to [SKIP]."""
+    s = RunSummary(job="run_execution", run_date=TODAY, exit_code=0)
+    s.record_basis_refresh({"skipped": "dry run", "failed": False})
+
+    assert subject_for(s) == f"[OK] run_execution {TODAY}"
+    assert "basis refresh: not attempted (dry run)" in body_for(s)
+    assert "FAILED" not in body_for(s)
+
+
+def test_a_clean_run_with_a_failed_refresh_does_not_claim_a_partial_step() -> None:
+    """The escalation is about the basis, so the body must not imply the run itself
+    stopped partway through a step."""
+    s = RunSummary(job="run_execution", run_date=TODAY, exit_code=0)
+    s.record_basis_refresh({"skipped": "boom", "failed": True})
+
+    body = body_for(s, last_step="12 record run")
+
+    assert "basis refresh FAILED: boom" in body
+    assert "Last step started" not in body, "the run itself completed fine"
+
+
+def test_a_failed_refresh_does_not_change_the_exit_code(monkeypatch) -> None:
+    """Visibility in the email, no change to the run's outcome."""
+    import execution.snapshot as snap
+
+    def _boom(**kw):
+        return {"written": False, "nav": None, "tickers": 0,
+                "skipped": "RuntimeError: boom", "failed": True}
+
+    monkeypatch.setattr(snap, "refresh_snapshot", _boom)
+
+    result = _run_execution_with_stub(
+        Path(tempfile.mkdtemp()), monkeypatch,
+        shortable_map={"SPY": True, "LQD": True, "GLD": True},
+        decision="reject",
+    )
+
+    assert result["exit_code"] == 0, "a failed refresh must not change the exit code"
+    assert result["emails"][0]["subject"] == f"[SKIP] run_execution {TODAY}"
+    assert "basis refresh FAILED: RuntimeError: boom" in result["emails"][0]["body"]
+
+
+def test_the_trading_path_reports_the_snapshot_it_wrote(monkeypatch) -> None:
+    """On a trading day the snapshot is written at step 11b rather than through the
+    helper, so the email has to report that write instead."""
+    result = _run_execution_with_stub(
+        Path(tempfile.mkdtemp()), monkeypatch,
+        shortable_map={"SPY": True, "LQD": True, "GLD": True},
+    )
+
+    body = result["emails"][0]["body"]
+    assert result["exit_code"] == 0
+    assert "basis refreshed:" in body, f"expected a basis line, got:\n{body}"
+    assert "NAV $100,000.00" in body
+    assert "basis refresh FAILED" not in body

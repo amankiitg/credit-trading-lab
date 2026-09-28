@@ -78,7 +78,8 @@ def test_body_reports_the_execution_fields() -> None:
         signal_as_of="2026-09-23",
         nav_frozen=101013.45,
         nav_live=101089.45,
-        pnl_net=-12.34,
+        previous_live_nav=100_000.0,
+        nav_change=1089.45,
         turnover_cost=4.56,
         filled=["SPY buy_to_open $5,000.00"],
         skipped=["LQD sell_to_open GUARD_SKIPPED_NOT_SHORTABLE"],
@@ -90,7 +91,8 @@ def test_body_reports_the_execution_fields() -> None:
     assert "Signal as_of_date: 2026-09-23" in body
     assert "NAV frozen for sizing: $101,013.45" in body
     assert "live Alpaca: $101,089.45" in body
-    assert "Day P&L: net $-12.34" in body
+    assert "Book P&L (live NAV move since previous run): $+1,089.45" in body
+    assert "Turnover cost today: $4.56" in body
     assert "Orders: 1 filled, 1 skipped, 1 rejected" in body
     assert "filled: SPY buy_to_open $5,000.00" in body
     assert "skipped: LQD sell_to_open GUARD_SKIPPED_NOT_SHORTABLE" in body

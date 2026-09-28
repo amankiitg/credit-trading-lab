@@ -296,6 +296,25 @@ def _run(summary: RunSummary) -> int:
     # -- 6. Record run
     with step("6 record run", logger):
         record_run("run_signal", today)
+
+    # -- 7. Refresh the cached position snapshot and live_nav from Alpaca.
+    #        The proposal in Panel H and the next morning's execution are both sized
+    #        from that snapshot, on purpose, so it has to be refreshed after the
+    #        close or the basis ages for as long as nobody trades. Bookkeeping only:
+    #        it must never fail a run whose signal is already written.
+    with step("7 refresh position snapshot and live_nav from Alpaca", logger):
+        from execution.snapshot import refresh_snapshot
+
+        refresh = refresh_snapshot(run_date=today, log=logger)
+    if refresh["skipped"]:
+        logger.warning("snapshot refresh did not complete: %s", refresh["skipped"])
+        summary.extra.append(f"Snapshot refresh skipped: {refresh['skipped']}")
+    else:
+        summary.extra.append(
+            f"Snapshot refreshed from Alpaca: live_nav=${refresh['nav']:,.2f}, "
+            f"{refresh['tickers']} position row(s)"
+        )
+
     logger.info("run_signal complete for %s", today)
     return 0
 

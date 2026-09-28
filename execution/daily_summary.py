@@ -57,7 +57,12 @@ class RunSummary:
     signal_as_of: str | None = None
     nav_frozen: float | None = None
     nav_live: float | None = None
-    pnl_net: float | None = None
+    # The book's result: live Alpaca NAV now minus the live NAV recorded by the
+    # previous run. None when there is no previous reading to compare against.
+    previous_live_nav: float | None = None
+    nav_change: float | None = None
+    # Today's trading frictions, reported on their own line because they are a drag
+    # on the book's result rather than the result itself.
     turnover_cost: float | None = None
     filled: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
@@ -112,11 +117,23 @@ def body_for(summary: RunSummary, last_step: str | None = None) -> str:
         if summary.nav_live is not None:
             nav += f"; live Alpaca: ${summary.nav_live:,.2f}"
         lines.append(nav)
-    if summary.pnl_net is not None:
-        pnl = f"Day P&L: net ${summary.pnl_net:,.2f}"
-        if summary.turnover_cost is not None:
-            pnl += f" (turnover cost ${summary.turnover_cost:,.2f})"
-        lines.append(pnl)
+
+    # The book's P&L, as the move in live Alpaca NAV since the previous run. Reported
+    # as the headline number rather than the day's simulated costs, because the costs
+    # are a drag on the result, not the result. Both are shown, on separate lines.
+    if summary.nav_change is None:
+        if summary.nav_live is not None and summary.previous_live_nav is None:
+            lines.append(
+                "Book P&L: unavailable (no previous live NAV on record to compare "
+                "against)"
+            )
+    else:
+        lines.append(
+            f"Book P&L (live NAV move since previous run): "
+            f"${summary.nav_change:+,.2f}"
+        )
+    if summary.turnover_cost is not None:
+        lines.append(f"Turnover cost today: ${summary.turnover_cost:,.2f}")
 
     lines.append(
         f"Orders: {len(summary.filled)} filled, {len(summary.skipped)} skipped, "

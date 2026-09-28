@@ -66,6 +66,34 @@ EXECUTION_JOB_MAX_SECS: float = float(
 MAX_STALE_SESSIONS: int = int(os.environ.get("MAX_STALE_SESSIONS", "2"))
 
 
+def _refresh_basis(summary: RunSummary, *, dry_run: bool) -> None:
+    """Refresh the cached position snapshot and live_nav on a path that does not trade.
+
+    The proposal and the execution both size from the cached snapshot, so a day that
+    is rejected, skipped or refused must still advance it, otherwise the basis ages
+    for as long as nobody trades. Shared by all three skip paths so they behave
+    identically. refresh_snapshot never raises, so this cannot change an exit code.
+    """
+    from execution.job_guard import step
+    from execution.snapshot import refresh_snapshot
+
+    with step("no-trade path: refresh position snapshot and live_nav", logger):
+        report = refresh_snapshot(
+            run_date=date.today().isoformat(), dry_run=dry_run, log=logger
+        )
+
+    if report["skipped"]:
+        summary.extra.append(f"Snapshot refresh skipped: {report['skipped']}")
+        return
+
+    nav = report.get("nav")
+    shown = f"${nav:,.2f}" if isinstance(nav, (int, float)) else "unavailable"
+    summary.extra.append(
+        f"Snapshot refreshed from Alpaca: live_nav={shown}, "
+        f"{report['tickers']} position row(s)"
+    )
+
+
 def main(max_secs: float | None = None) -> int:
     """Entry point: run under the guards and send exactly one summary email.
 
@@ -160,6 +188,7 @@ def _run(summary: RunSummary) -> int:
                 "(%s: %s) -- refusing to trade on an unverifiable signal",
                 as_of_date, today, type(exc).__name__, exc,
             )
+            _refresh_basis(summary, dry_run=DRY_RUN_DEFAULT)
             return 4
     logger.info(
         "signal %s is %d NYSE session(s) old (run date %s, limit %d)",
@@ -184,6 +213,7 @@ def _run(summary: RunSummary) -> int:
                 f"signal {as_of_date} is {signal_age_sessions} NYSE sessions old, "
                 f"over the {MAX_STALE_SESSIONS} session limit"
             )
+            _refresh_basis(summary, dry_run=DRY_RUN_DEFAULT)
             return 4
 
     # -- 4. Decision gate
@@ -206,6 +236,9 @@ def _run(summary: RunSummary) -> int:
         logger.info("decision=reject for %s -- skipping execution", as_of_date)
         summary.mark_skip(f"decision=reject for {as_of_date}")
         record_run("run_execution", today)
+        # Still refresh the basis. A day that does not trade must not leave the
+        # snapshot to age, or tomorrow's proposal is built from a stale book.
+        _refresh_basis(summary, dry_run=DRY_RUN_DEFAULT)
         return 0
 
     if not auto_approve and decision != "approve":
@@ -215,6 +248,7 @@ def _run(summary: RunSummary) -> int:
         )
         summary.mark_skip(f"no approval for {as_of_date} (decision={decision})")
         record_run("run_execution", today)
+        _refresh_basis(summary, dry_run=DRY_RUN_DEFAULT)
         return 0
 
     logger.info(
@@ -234,6 +268,7 @@ def _run(summary: RunSummary) -> int:
         connect,
         feed_attribution,
         get_current_positions,
+        get_live_book,
         get_live_nav,
         get_shortable_flags,
         mark_costs,
@@ -256,7 +291,11 @@ def _run(summary: RunSummary) -> int:
         nav_live = get_live_nav(client) if not dry_run else 100_000.0
 
         _nav_str = get_setting("live_nav")
-        nav = float(_nav_str) if _nav_str else nav_live
+        # Kept separate from `nav` so the summary can tell "no stored NAV yet" apart
+        # from "stored NAV equals the live one". The change against this is the book's
+        # P&L for the summary email.
+        previous_live_nav: float | None = float(_nav_str) if _nav_str else None
+        nav = previous_live_nav if previous_live_nav is not None else nav_live
         logger.info("nav=%.2f (frozen Supabase; live Alpaca=%.2f)", nav, nav_live)
 
         from dashboard.supabase_client import fetch_positions as _fetch_positions
@@ -264,6 +303,22 @@ def _run(summary: RunSummary) -> int:
         current_notionals: dict[str, float] = {
             r["ticker"]: float(r["signed_notional"]) for r in _pos_rows
         }
+        # Share counts, for the drift check. Rows written before the shares column
+        # existed have None and are reported as uncomparable rather than as flat.
+        cached_shares: dict[str, float] = {
+            r["ticker"]: float(r["shares"])
+            for r in _pos_rows
+            if r.get("shares") is not None
+        }
+        _uncomparable = [
+            r["ticker"] for r in _pos_rows if r.get("shares") is None
+        ]
+        if _uncomparable:
+            logger.warning(
+                "drift check: %d snapshot row(s) predate the shares column and "
+                "cannot be compared: %s",
+                len(_uncomparable), _uncomparable,
+            )
         if not current_notionals:
             # First ever run -- no Supabase snapshot yet; read live from Alpaca
             logger.info("no Supabase positions found -- reading live from Alpaca (first run)")
@@ -276,18 +331,24 @@ def _run(summary: RunSummary) -> int:
     #        approval time), so a divergence here would otherwise compute
     #        deltas against a phantom book with no visible signal. Alert
     #        only -- execution below still uses current_notionals as-is.
+    #
+    #        Compared on SHARE COUNTS, not dollars. Dollars move with price, so the
+    #        old dollar comparison alerted on every ordinary market day for no reason.
+    #        Share counts only change when something trades.
     from execution.alpaca_paper import check_position_drift
     with step("6b position drift check", logger):
-        drift = check_position_drift(client, current_notionals, dry_run=dry_run)
+        drift = check_position_drift(client, cached_shares, dry_run=dry_run)
     if drift:
         logger.warning(
-            "POSITION DRIFT: cached (Supabase) vs live (Alpaca) disagree for %d ticker(s): %s",
-            len(drift), {t: round(d["diff"], 2) for t, d in drift.items()},
+            "POSITION DRIFT: cached (Supabase) vs live (Alpaca) share counts "
+            "disagree for %d ticker(s): %s",
+            len(drift), {t: round(d["diff"], 4) for t, d in drift.items()},
         )
         set_setting("position_drift_alert", json.dumps({
             "detected_at": today,
+            "basis": "shares",
             "detail": {
-                t: {k: round(v, 2) for k, v in d.items()} for t, d in drift.items()
+                t: {k: round(v, 4) for k, v in d.items()} for t, d in drift.items()
             },
         }))
 
@@ -517,14 +578,21 @@ def _run(summary: RunSummary) -> int:
 
         # Write positions snapshot to Supabase -- fetch AFTER fills so the first
         # run (flat account before trades) still records real post-fill positions.
-        post_notionals = get_current_positions(client, dry_run=dry_run)
-        logger.info("post-trade positions: %s", post_notionals)
+        # Share counts go in too: the drift check compares shares, because dollars
+        # move with price and would alert on any ordinary trading day.
+        post_book = get_live_book(client, dry_run=dry_run)
+        logger.info(
+            "post-trade book: %s",
+            {t: round(b["notional"], 2) for t, b in post_book.items()},
+        )
         position_rows = []
-        for ticker, signed_n in post_notionals.items():
+        for ticker, entry in post_book.items():
+            signed_n = entry["notional"]
             position_rows.append({
                 "trade_date": today,
                 "ticker": ticker,
                 "signed_notional": signed_n,
+                "shares": entry["shares"],
                 "weight": signed_n / nav if nav > 0 else 0.0,
                 "side": "long" if signed_n > 0 else "short",
             })
@@ -548,12 +616,16 @@ def _run(summary: RunSummary) -> int:
                 "borrow_cost": 0.0,
             })
 
-    # NAV and the day's P&L, as reported in the daily summary email. `nav` is the
-    # frozen snapshot the deltas were sized against; nav_live is the real Alpaca
-    # figure read after the trades.
+    # What the summary email reports. The book's P&L is the change in live Alpaca NAV
+    # since the previous run, because that is the book's actual result. Today's
+    # turnover cost is a drag on it, not the result, so it is reported separately
+    # rather than folded in as the headline number.
     summary.nav_frozen = nav
     summary.nav_live = nav_live
-    summary.pnl_net = total_net_pnl
+    summary.previous_live_nav = previous_live_nav
+    summary.nav_change = (
+        nav_live - previous_live_nav if previous_live_nav is not None else None
+    )
     summary.turnover_cost = total_cost
 
     # -- 12. Record run. A halted run is deliberately NOT recorded: cron_runs is

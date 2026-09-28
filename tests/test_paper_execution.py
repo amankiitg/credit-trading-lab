@@ -901,9 +901,12 @@ def test_non_universe_dust_ignored() -> None:
 
 # ---------------------------------------------------------------- position drift check
 
-def test_drift_detected_when_live_disagrees_with_cache() -> None:
-    """Live Alpaca positions differing from the cached snapshot by more than
-    DELTA_MIN_NOTIONAL are flagged, with cached/live/diff for each ticker."""
+def test_drift_detected_when_share_counts_disagree() -> None:
+    """Live Alpaca share counts differing from the cached snapshot are flagged.
+
+    Compared on shares, not dollars: the broker shows 0 shares while the cache says
+    53, which is a real divergence (a manual reset, a dropped write), not price.
+    """
     from alpaca.trading.enums import PositionSide
 
     from execution.alpaca_paper import check_position_drift
@@ -911,23 +914,71 @@ def test_drift_detected_when_live_disagrees_with_cache() -> None:
     spy_pos = MagicMock()
     spy_pos.symbol = "SPY"
     spy_pos.side = PositionSide.LONG
+    spy_pos.qty = "0"
     spy_pos.market_value = "0.00"  # broker actually flat
 
     mock_client = MagicMock()
     mock_client.get_all_positions.return_value = [spy_pos]
 
-    cached = {"SPY": 26_643.0}  # stale Supabase snapshot still shows a big position
+    cached = {"SPY": 53.0}  # stale Supabase snapshot still shows a position
 
     drift = check_position_drift(mock_client, cached, dry_run=False)
 
     assert "SPY" in drift
-    assert drift["SPY"]["cached"] == 26_643.0
+    assert drift["SPY"]["cached"] == 53.0
     assert drift["SPY"]["live"] == 0.0
-    assert drift["SPY"]["diff"] == pytest.approx(-26_643.0)
+    assert drift["SPY"]["diff"] == pytest.approx(-53.0)
 
 
-def test_no_drift_when_live_matches_cache() -> None:
-    """No ticker is flagged when live positions agree with the cache."""
+def test_a_price_move_alone_does_not_raise_drift() -> None:
+    """The bug this fixes: same shares, different price, must stay silent.
+
+    The old dollar comparison flagged this, because market_value moves with price
+    even when nothing traded. Share counts only change when something trades.
+    """
+    from alpaca.trading.enums import PositionSide
+
+    from execution.alpaca_paper import check_position_drift
+
+    spy_pos = MagicMock()
+    spy_pos.symbol = "SPY"
+    spy_pos.side = PositionSide.LONG
+    spy_pos.qty = "10"
+    spy_pos.market_value = "6600.00"  # up 10% on yesterday's 6000
+
+    mock_client = MagicMock()
+    mock_client.get_all_positions.return_value = [spy_pos]
+
+    # The cache still holds the old dollar value, and the same share count.
+    drift = check_position_drift(mock_client, {"SPY": 10.0}, dry_run=False)
+
+    assert drift == {}, "a plain price move must not look like drift"
+
+
+def test_a_short_position_compares_as_a_negative_share_count() -> None:
+    """Direction matters, so a flip from long to short is drift, not a coincidence."""
+    from alpaca.trading.enums import PositionSide
+
+    from execution.alpaca_paper import check_position_drift
+
+    pos = MagicMock()
+    pos.symbol = "LQD"
+    pos.side = PositionSide.SHORT
+    pos.qty = "20"
+    pos.market_value = "2200.00"
+
+    mock_client = MagicMock()
+    mock_client.get_all_positions.return_value = [pos]
+
+    drift = check_position_drift(mock_client, {"LQD": 20.0}, dry_run=False)
+
+    # 20 long vs -20 live is a 40 share swing.
+    assert drift["LQD"]["live"] == -20.0
+    assert drift["LQD"]["diff"] == pytest.approx(-40.0)
+
+
+def test_no_drift_when_live_share_counts_match_cache() -> None:
+    """No ticker is flagged when live share counts agree with the cache."""
     from alpaca.trading.enums import PositionSide
 
     from execution.alpaca_paper import check_position_drift
@@ -935,14 +986,13 @@ def test_no_drift_when_live_matches_cache() -> None:
     hyg_pos = MagicMock()
     hyg_pos.symbol = "HYG"
     hyg_pos.side = PositionSide.LONG
+    hyg_pos.qty = "3.5625"  # fractional, from a notional long order
     hyg_pos.market_value = "293.90"
 
     mock_client = MagicMock()
     mock_client.get_all_positions.return_value = [hyg_pos]
 
-    cached = {"HYG": 293.90}
-
-    drift = check_position_drift(mock_client, cached, dry_run=False)
+    drift = check_position_drift(mock_client, {"HYG": 3.5625}, dry_run=False)
     assert drift == {}
 
 
@@ -951,29 +1001,53 @@ def test_drift_check_skipped_in_dry_run() -> None:
     from execution.alpaca_paper import check_position_drift
 
     mock_client = MagicMock()
-    drift = check_position_drift(mock_client, {"SPY": 26_643.0}, dry_run=True)
+    drift = check_position_drift(mock_client, {"SPY": 53.0}, dry_run=True)
 
     assert drift == {}
     mock_client.get_all_positions.assert_not_called()
 
 
-def test_drift_below_threshold_not_flagged() -> None:
-    """A gap smaller than DELTA_MIN_NOTIONAL is normal day-to-day noise, not drift."""
+def test_a_snapshot_row_without_shares_is_not_reported_as_flat() -> None:
+    """Rows written before the shares column existed cannot be compared.
+
+    Reporting them as a zero share count would flag every ticker on the first run
+    after the migration, which is exactly the false alarm this change removes.
+    """
     from alpaca.trading.enums import PositionSide
 
-    from execution.alpaca_paper import DELTA_MIN_NOTIONAL, check_position_drift
+    from execution.alpaca_paper import check_position_drift
 
-    lqd_pos = MagicMock()
-    lqd_pos.symbol = "LQD"
-    lqd_pos.side = PositionSide.LONG
-    lqd_pos.market_value = "27000.00"
+    pos = MagicMock()
+    pos.symbol = "LQD"
+    pos.side = PositionSide.SHORT
+    pos.qty = "20"
+    pos.market_value = "2200.00"
 
     mock_client = MagicMock()
-    mock_client.get_all_positions.return_value = [lqd_pos]
+    mock_client.get_all_positions.return_value = [pos]
 
-    cached = {"LQD": 27_000.0 + (DELTA_MIN_NOTIONAL - 1)}
+    # No entry at all for LQD: uncomparable, so it must not be flagged.
+    drift = check_position_drift(mock_client, {}, dry_run=False)
 
-    drift = check_position_drift(mock_client, cached, dry_run=False)
+    assert drift == {}, "an uncomparable ticker must not raise a false drift alert"
+
+
+def test_a_tiny_float_difference_is_not_drift() -> None:
+    """Share counts are floats; representation noise must not alert."""
+    from alpaca.trading.enums import PositionSide
+
+    from execution.alpaca_paper import check_position_drift
+
+    pos = MagicMock()
+    pos.symbol = "SPY"
+    pos.side = PositionSide.LONG
+    pos.qty = "10.0000000001"
+    pos.market_value = "6000.00"
+
+    mock_client = MagicMock()
+    mock_client.get_all_positions.return_value = [pos]
+
+    drift = check_position_drift(mock_client, {"SPY": 10.0}, dry_run=False)
     assert drift == {}
 
 
@@ -1483,6 +1557,7 @@ def _run_execution_with_stub(
     signal_as_of: str | None = None,
     drift: dict | None = None,
     alert_sender: Callable | None = None,
+    decision: str = "approve",
 ) -> dict:
     """Drive scripts.run_execution.main() with Alpaca and Supabase stubbed.
 
@@ -1495,7 +1570,8 @@ def _run_execution_with_stub(
     guard is reached; it defaults to today. `drift` forces the drift check to
     report a divergence, which is the only way into the alert branch. `alert_sender`
     replaces the email sender for the whole run, covering both the drift alert and
-    the daily summary.
+    the daily summary. `decision` is what the Supabase decision gate returns, so
+    "reject" drives the skip path.
     """
     import json as _json
     from datetime import date as _date
@@ -1592,7 +1668,7 @@ def _run_execution_with_stub(
         sb_mod, "set_setting", lambda k, v: settings.__setitem__(k, v) or True
     )
     monkeypatch.setattr(sb_mod, "get_auto_approve", lambda: True)
-    monkeypatch.setattr(sb_mod, "fetch_decision_for_date", lambda d: "approve")
+    monkeypatch.setattr(sb_mod, "fetch_decision_for_date", lambda d: decision)
     monkeypatch.setattr(sb_mod, "fetch_positions", lambda latest_only=True: [])
 
     written: dict[str, list] = {"positions": [], "pnl": [], "rejections": [], "attribution": []}
@@ -1800,7 +1876,10 @@ def test_ok_run_sends_exactly_one_ok_summary(tmp_path, monkeypatch) -> None:
     assert "NAV frozen for sizing: $100,000.00" in body
     assert "Orders: 3 filled, 0 skipped, 0 rejected" in body
     assert "filled: SPY buy_to_open" in body
-    assert "Day P&L:" in body, "the day's P&L belongs in the email"
+    assert "Book P&L (live NAV move since previous run):" in body, (
+        "the book's P&L belongs in the email"
+    )
+    assert "Turnover cost today:" in body, "cost is reported separately, not as the P&L"
 
 
 def test_stale_skip_sends_exactly_one_skip_summary(tmp_path, monkeypatch) -> None:

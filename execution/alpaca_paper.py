@@ -84,6 +84,12 @@ FILL_POLL_INTERVAL_SECS: float = 1.0
 RECONCILE_ABS_TOL: float = 10.0
 RECONCILE_REL_TOL: float = 0.005
 
+# Tolerance for comparing share counts. They are floats, and a value that has been
+# through JSON and a NUMERIC column can come back with representation noise. One
+# millionth of a share is far below any real position difference, so anything larger
+# means the book genuinely changed.
+SHARE_EPSILON: float = 1e-6
+
 # Short-side position intents: Alpaca paper rejects fractional notional sell_to_open
 # ("fractional orders cannot be sold short"). These intents MUST use integer qty.
 # Long-side intents (buy_to_open, sell_to_close closing a long) continue to use
@@ -275,29 +281,47 @@ def get_live_nav(client) -> float:
 
 # ---------------------------------------------------------------- positions
 
-def get_current_positions(
+def get_live_book(
     client, dry_run: bool = DRY_RUN_DEFAULT
-) -> dict[str, float]:
-    """Return {ticker: signed_notional} for the 8-name universe.
+) -> dict[str, dict[str, float]]:
+    """Return {ticker: {"notional": signed_notional, "shares": signed_shares}}.
 
-    Positive = long, negative = short, absent tickers = 0.
-    In dry-run mode returns an empty dict without calling Alpaca.
+    Positive = long, negative = short, absent tickers = 0. In dry-run mode returns
+    an empty dict without calling Alpaca.
+
+    Both views are read from the same position objects because they are used for
+    different things and must describe the same book: notionals size the delta
+    orders, and share counts are what the drift check compares. A price move changes
+    market_value without any trade, so dollars cannot distinguish a booked position
+    from the same position marked higher.
     """
     if dry_run:
         return {}
 
     positions = client.get_all_positions()
-    result: dict[str, float] = {}
+    result: dict[str, dict[str, float]] = {}
     for pos in positions:
         sym = pos.symbol
         if sym not in UNIVERSE:
             continue
         mv = abs(float(pos.market_value))
+        shares = abs(float(pos.qty))
         if pos.side == PositionSide.LONG or str(pos.side) == "long":
-            result[sym] = mv
+            result[sym] = {"notional": mv, "shares": shares}
         else:
-            result[sym] = -mv
+            result[sym] = {"notional": -mv, "shares": -shares}
     return result
+
+
+def get_current_positions(
+    client, dry_run: bool = DRY_RUN_DEFAULT
+) -> dict[str, float]:
+    """Return {ticker: signed_notional} for the 8-name universe.
+
+    The dollar view, used to size delta orders. Drift detection uses share counts
+    instead; see check_position_drift.
+    """
+    return {t: b["notional"] for t, b in get_live_book(client, dry_run).items()}
 
 
 def diff_positions(
@@ -330,38 +354,82 @@ def diff_positions(
     return rows
 
 
+def diff_share_counts(
+    live_shares: dict[str, float],
+    cached_shares: dict[str, float],
+) -> list[dict]:
+    """Per-ticker share-count diff over the whole UNIVERSE, in UNIVERSE order.
+
+    The same shape as diff_positions, but on shares rather than dollars, because
+    dollars cannot tell a booked position from the same position marked higher. A
+    ticker whose cached count is None was snapshot before shares were stored and
+    cannot be compared; it comes back with cached/diff None and material False rather
+    than being reported as flat, which would flag every ticker on the first run.
+    """
+    rows: list[dict] = []
+    for ticker in UNIVERSE:
+        cached_raw = cached_shares.get(ticker)
+        live = float(live_shares.get(ticker, 0.0))
+        if cached_raw is None:
+            rows.append({
+                "ticker": ticker,
+                "cached": None,
+                "live": live,
+                "diff": None,
+                "material": False,
+            })
+            continue
+        cached = float(cached_raw)
+        diff = live - cached
+        rows.append({
+            "ticker": ticker,
+            "cached": cached,
+            "live": live,
+            "diff": diff,
+            "material": abs(diff) > SHARE_EPSILON,
+        })
+    return rows
+
+
 def check_position_drift(
     client,
-    cached_notionals: dict[str, float],
+    cached_shares: dict[str, float],
     dry_run: bool = DRY_RUN_DEFAULT,
 ) -> dict[str, dict[str, float]]:
-    """Diff the frozen Supabase position snapshot against live Alpaca positions.
+    """Diff the frozen Supabase share counts against live Alpaca share counts.
 
-    compute_delta_orders() intentionally uses the frozen Supabase snapshot,
-    not a fresh Alpaca read, so that what a user approved in Panel H is
-    exactly what executes (see run_execution.py step 6). That means if the
-    broker account ever diverges from that cache outside of normal order
-    flow -- a manual paper-account reset, a dropped write, anything -- the
-    delta math silently computes against a phantom book with no signal that
-    anything was wrong. This surfaces that drift *before* delta computation
-    so it can be alerted on, without changing execution behaviour itself.
+    compute_delta_orders() intentionally uses the frozen Supabase snapshot, not a
+    fresh Alpaca read, so that what a user approved in Panel H is exactly what
+    executes (see run_execution.py step 6). That means if the broker account ever
+    diverges from that cache outside of normal order flow -- a manual paper-account
+    reset, a dropped write, anything -- the delta math silently computes against a
+    phantom book with no signal that anything was wrong. This surfaces that drift
+    *before* delta computation so it can be alerted on, without changing execution
+    behaviour itself.
 
-    Returns {ticker: {"cached": ..., "live": ..., "diff": live - cached}}
-    for every UNIVERSE ticker where the two disagree by at least
-    DELTA_MIN_NOTIONAL. Empty when nothing has drifted, including when
-    dry_run=True (no live account to compare against).
+    Compares SHARE COUNTS, not dollar values. Share counts only change when something
+    trades, so an ordinary market day cannot raise an alert. The dollar comparison
+    this replaced fired whenever a position moved by more than DELTA_MIN_NOTIONAL,
+    which is most days, for no reason other than price.
+
+    Returns {ticker: {"cached": shares, "live": shares, "diff": live - cached}} for
+    every UNIVERSE ticker whose counts differ by more than SHARE_EPSILON. Empty when
+    nothing has drifted, including when dry_run=True (no live account to compare).
     """
     if dry_run:
         return {}
 
-    live_notionals = get_current_positions(client, dry_run=False)
+    live_shares = {
+        ticker: book["shares"]
+        for ticker, book in get_live_book(client, dry_run=False).items()
+    }
     return {
         row["ticker"]: {
             "cached": row["cached"],
             "live": row["live"],
             "diff": row["diff"],
         }
-        for row in diff_positions(live_notionals, cached_notionals)
+        for row in diff_share_counts(live_shares, cached_shares)
         if row["material"]
     }
 

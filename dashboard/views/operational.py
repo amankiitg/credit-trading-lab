@@ -216,13 +216,20 @@ def render(
 
     drift = _get_drift_alert()
     if drift:
+        # Values are share counts, not dollars: the check compares share counts so a
+        # price move cannot raise an alert. Alerts written before that change have no
+        # "basis" key and were dollar-based, so they are labelled as such.
+        shares_basis = drift.get("basis") == "shares"
+        unit = "sh" if shares_basis else "$"
+        fmt = (lambda v: f"{v:,.4f}") if shares_basis else (lambda v: f"{v:,.0f}")
         drifted_tickers = ", ".join(
-            f"{t} (cached ${d['cached']:,.0f} vs live ${d['live']:,.0f})"
+            f"{t} (cached {unit}{fmt(d['cached'])} vs live {unit}{fmt(d['live'])})"
             for t, d in drift["detail"].items()
         )
         st.error(
             f"⚠️ Position drift detected at {drift['detected_at']}: the cached "
-            f"position snapshot disagreed with live Alpaca before that run "
+            f"position snapshot disagreed with live Alpaca on "
+            f"{'share counts' if shares_basis else 'dollar values'} before that run "
             f"computed deltas — {drifted_tickers}. That run still executed "
             f"against the cached (pre-drift) snapshot as usual; the deltas "
             f"below now reflect the corrected, real positions."

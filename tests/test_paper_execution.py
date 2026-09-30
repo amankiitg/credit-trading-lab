@@ -1558,6 +1558,8 @@ def _run_execution_with_stub(
     drift: dict | None = None,
     alert_sender: Callable | None = None,
     decision: str = "approve",
+    live_equity: str = "100000",
+    stored_live_nav: str | None = "100000",
 ) -> dict:
     """Drive scripts.run_execution.main() with Alpaca and Supabase stubbed.
 
@@ -1571,7 +1573,10 @@ def _run_execution_with_stub(
     report a divergence, which is the only way into the alert branch. `alert_sender`
     replaces the email sender for the whole run, covering both the drift alert and
     the daily summary. `decision` is what the Supabase decision gate returns, so
-    "reject" drives the skip path.
+    "reject" drives the skip path. `live_equity` is the account equity the stub
+    reports, and `stored_live_nav` is the previous run's reading in settings; the
+    two together are what the book's P&L is measured from, and `stored_live_nav=None`
+    is the first-ever-run case where there is nothing to compare against.
     """
     import json as _json
     from datetime import date as _date
@@ -1624,7 +1629,7 @@ def _run_execution_with_stub(
         return order
 
     client = MagicMock()
-    client.get_account.return_value.equity = "100000"
+    client.get_account.return_value.equity = live_equity
     client.get_all_positions.side_effect = _get_all_positions
     client.get_asset.side_effect = lambda t: MagicMock(shortable=shortable_map.get(t, True))
     client.submit_order.side_effect = _submit
@@ -1661,8 +1666,9 @@ def _run_execution_with_stub(
         "signal_as_of_date": signal_as_of or today,
         "signal_target_weights": _json.dumps({"SPY": 0.05, "LQD": -0.06, "GLD": -0.02}),
         "signal_close_prices": _json.dumps({"SPY": 500.0, "LQD": 100.0, "GLD": 400.0}),
-        "live_nav": "100000",
     }
+    if stored_live_nav is not None:
+        settings["live_nav"] = stored_live_nav
     monkeypatch.setattr(sb_mod, "get_setting", lambda k: settings.get(k))
     monkeypatch.setattr(
         sb_mod, "set_setting", lambda k, v: settings.__setitem__(k, v) or True
@@ -1880,6 +1886,53 @@ def test_ok_run_sends_exactly_one_ok_summary(tmp_path, monkeypatch) -> None:
         "the book's P&L belongs in the email"
     )
     assert "Turnover cost today:" in body, "cost is reported separately, not as the P&L"
+
+
+# ------------------------------------------------- v9.7: the pnl_log row carries the book
+
+def test_pnl_log_row_records_live_nav_and_book_pnl(tmp_path, monkeypatch) -> None:
+    """The row the dashboard plots from must carry the real equity and the real book P&L.
+
+    Both numbers already exist for the summary email. Storing them is what turns the
+    dashboard's NAV panel from a line reconstructed out of turnover costs into the
+    account's actual equity, so this test pins the row rather than the email.
+    """
+    today = date.today().isoformat()
+    result = _run_execution_with_stub(
+        tmp_path, monkeypatch,
+        shortable_map={"SPY": True, "LQD": True, "GLD": True},
+        live_equity="101234.56",
+    )
+
+    assert result["exit_code"] == 0
+    assert len(result["written"]["pnl"]) == 1, "one pnl_log row per run"
+
+    row = result["written"]["pnl"][0]
+    assert row["trade_date"] == today
+    assert row["live_nav"] == 101234.56, "the live Alpaca equity is stored as read"
+    assert row["book_pnl"] == 1234.56, (
+        "book P&L is the live NAV move since the previous run, and the harness "
+        "carries 100000 as that previous reading"
+    )
+    assert row["turnover_cost"] > 0, "the run traded, so the day has a cost"
+
+    # The same number reaches the email, from the same computation, so the two
+    # surfaces cannot drift apart.
+    assert "Book P&L (live NAV move since previous run): $+1,234.56" in result["emails"][0]["body"]
+
+
+def test_the_first_run_records_a_null_book_pnl(tmp_path, monkeypatch) -> None:
+    """No previous live NAV means no book P&L, and null says that. Zero would be a lie."""
+    result = _run_execution_with_stub(
+        tmp_path, monkeypatch,
+        shortable_map={"SPY": True, "LQD": True, "GLD": True},
+        stored_live_nav=None,
+    )
+
+    assert result["exit_code"] == 0
+    row = result["written"]["pnl"][0]
+    assert row["live_nav"] == 100_000.0
+    assert row["book_pnl"] is None, "unavailable must read as null, not as a flat day"
 
 
 def test_stale_skip_sends_exactly_one_skip_summary(tmp_path, monkeypatch) -> None:

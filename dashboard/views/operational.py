@@ -1,11 +1,26 @@
-"""Operational panels for sprint v8.5: proposed trades, positions, P&L.
+"""Operational panels for the trade-approval dashboard -- sprint v9.7.
 
-Panel H (proposed next trade): ONE approve/reject decision per day for the
-whole book. The cron job in v8.6 reads the decisions table each morning and
-executes only when decision = 'approve'.
+One page, five panels. Every panel opens with the sentence that says what it tells
+you and what the number should look like when nothing is wrong, because a bare
+number with no reference point cannot be read.
 
-Panels I-L are stubbed with TODO v8.6 markers -- the live Alpaca fill and
-position feed is not connected in v8.5.
+  H      Proposed next trade, stop-state advisory, and the approve/reject control.
+         The only interactive panel; the cron reads the same decisions row.
+  Exposure  Net and gross/leverage for the live book against the stored target.
+  K      Account value over time, and turnover cost per run on its own chart.
+  M-A    Share of the book's total volatility, by sleeve.
+  M-B    The run's three dollars: book P&L, turnover cost, fill-day mark by sleeve.
+
+Visual system, applied the same way in every panel:
+
+  - Four fixed sleeve colours (SLEEVE_COLORS). A sleeve is always the same colour,
+    and the colours are deliberately not green or red so a category cannot read as
+    good or bad.
+  - Green means good or on target; red means a flag or a breach, and nothing else.
+    Neither ever encodes position sign: a short is not a problem and a long is not
+    good news.
+  - Long vs short is one treatment everywhere: solid fill for long, hatched for
+    short, with the word in the label (SHORT_HATCH / LONG_SHORT_NOTE).
 
 No live Alpaca calls are made from this module (U6 gate from the v8.5 PRD).
 """
@@ -29,11 +44,82 @@ from dashboard.supabase_client import (
     write_decision,
 )
 
-FRAMING_CAPTION = (
-    "Historical P&L shown for 2007-2026. "
-    "This sample contains one secular rate cycle. "
-    "Results are not forward-looking."
-)
+# ---------------------------------------------------------------- visual system
+#
+# Sleeve colours: fixed, one per sleeve, identical in every panel that shows a
+# sleeve. Not green and not red, because those two carry meaning here (see below).
+SLEEVE_COLORS: dict[str, str] = {
+    "equity":    "#4c78a8",  # blue
+    "rates":     "#f2a93b",  # amber
+    "credit":    "#8e6cae",  # purple
+    "commodity": "#5fa8a0",  # teal
+}
+SLEEVE_ORDER: tuple[str, ...] = ("equity", "rates", "credit", "commodity")
+
+# Meaning is carried by st.success (green: good or on target) and st.error (red: a
+# flag or a breach). Those two are the only green and red on the page, they never
+# encode long vs short, and nothing else may use them. NEUTRAL_COLOR is for lines and
+# bars that carry no judgement at all.
+NEUTRAL_COLOR = "#8a8a8a"
+
+# One long/short treatment everywhere a signed position is drawn.
+SHORT_HATCH = "//"
+LONG_SHORT_NOTE = "solid = long, hatched = short"
+
+# Reference points, from the spec. Display thresholds only, not enforced limits:
+# the execution layer's own limits are G_MAX_DEFAULT (gross) and the delta band.
+NET_BAND_PCT = 5.0        # |net| above 5% of NAV is off target
+GROSS_FLAG_X = 2.05       # above this is a mark-to-market overshoot between runs
+GROSS_FLOOR_X = 1.80      # the floor observed across the recorded snapshots
+RISK_TICKER_FLAG_PCT = 40.0   # one position above 40% of book risk is concentration
+RISK_SLEEVE_FLAG_PCT = 60.0   # one sleeve above 60% of book risk is concentration
+
+
+def _sleeve_of(ticker: str) -> str:
+    """The sleeve a ticker belongs to, per the universe's own asset classes."""
+    from signals.etf_universe import ASSET_CLASS
+
+    return ASSET_CLASS.get(ticker, "unknown")
+
+
+def _fill_for(signed: float | None) -> str | None:
+    """Hatch a short, leave a long solid. The one long/short treatment."""
+    if signed is None:
+        return None
+    return SHORT_HATCH if float(signed) < 0 else None
+
+
+def _fmt_dollars(value: float | None) -> str:
+    """A dollar amount, or an explicit dash when the value is not available."""
+    if value is None:
+        return "—"
+    return f"${float(value):+,.2f}"
+
+
+def _sleeve_exposure(
+    positions_data: list[dict],
+    proposed_rows: list[dict],
+    nav: float,
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Current and target net exposure per sleeve, in dollars.
+
+    Current comes from the position snapshot; target from the weights the signal
+    stored for the current as-of date, which are the same weights the execution cron
+    sizes from. So the target is what the book is aiming at, not a convention.
+    """
+    current: dict[str, float] = {s: 0.0 for s in SLEEVE_ORDER}
+    for p in positions_data:
+        sleeve = _sleeve_of(str(p.get("ticker", "")))
+        if sleeve in current:
+            current[sleeve] += float(p.get("signed_notional") or 0.0)
+
+    target: dict[str, float] = {s: 0.0 for s in SLEEVE_ORDER}
+    for row in proposed_rows:
+        sleeve = _sleeve_of(str(row.get("ticker", "")))
+        if sleeve in target:
+            target[sleeve] += float(row.get("target wt") or 0.0) * nav
+
+    return current, target
 
 
 @st.cache_data(ttl=300)
@@ -49,14 +135,19 @@ def _get_stop_states() -> list[dict]:
 # transient frames it allocates.
 @st.cache_data(ttl=300)
 def _get_positions() -> list[dict]:
-    """Live portfolio snapshot for Panel I."""
+    """Position snapshot for the exposure block and the risk panels."""
     return fetch_positions(latest_only=True)
 
 
 @st.cache_data(ttl=300)
 def _get_pnl_log() -> list[dict]:
-    """Daily P&L rows for the NAV tracker."""
-    return fetch_pnl_log()
+    """The run rows the account-value and turnover-cost charts draw.
+
+    The reader's default limit of 60 silently dropped the earliest runs, so a chart
+    captioned as history was not the history. 500 covers what is recorded with room
+    to grow, and the panel's caption states how many runs it actually drew.
+    """
+    return fetch_pnl_log(limit=500)
 
 
 @st.cache_data(ttl=300)
@@ -137,8 +228,14 @@ def _get_proposed_trade() -> tuple[list[dict], str, float]:
 
 
 def _render_mctr_pctr(nav: float, positions_data: list[dict]) -> None:
-    """Render MCTR/PCTR bar chart from live weights + 63d covariance (v9.1 T8)."""
-    import numpy as np
+    """Emit the plain-English header and the sleeve-coloured risk contribution view.
+
+    Weights are the live book. The covariance is the last 63 sessions of the committed
+    price cache, which ends well before the live book's date, so the panel states its
+    window and says indicative only: a risk share measured against a window that does
+    not cover the book is a shape, not a current number. The dashboard deliberately has
+    no Alpaca keys (render.yaml), so it cannot refresh the prices itself.
+    """
     from dashboard.loader import load_close_matrix
     from signals.etf_universe import UNIVERSE
 
@@ -151,7 +248,7 @@ def _render_mctr_pctr(nav: float, positions_data: list[dict]) -> None:
 
     live_tickers = [t for t in UNIVERSE if t in w_dict]
     if not live_tickers:
-        st.info("No positions in universe.")
+        st.info("No positions in universe -- risk contribution needs an open book.")
         return
 
     weights = pd.Series({t: w_dict[t] for t in live_tickers})
@@ -159,12 +256,12 @@ def _render_mctr_pctr(nav: float, positions_data: list[dict]) -> None:
     try:
         close = load_close_matrix()
     except Exception:
-        st.info("Close data not available — MCTR/PCTR skipped.")
+        st.info("Close data not available -- risk contribution skipped.")
         return
 
     rets = close[live_tickers].pct_change().dropna(how="all").tail(63)
     if len(rets) < 20:
-        st.info(f"Only {len(rets)} days of returns — need ≥20 for covariance.")
+        st.info(f"Only {len(rets)} days of returns -- need >=20 for a covariance.")
         return
 
     from risk.live_risk import mctr_pctr
@@ -174,34 +271,118 @@ def _render_mctr_pctr(nav: float, positions_data: list[dict]) -> None:
         st.warning(f"MCTR/PCTR failed: {exc}")
         return
 
+    # Euler additivity holds for CTR (it sums to portfolio sigma), so a sleeve's share
+    # of total risk is its summed CTR over that sigma. Summing MCTR would be wrong.
+    port_vol = float(risk_df["ctr"].sum())
+    if port_vol <= 0:
+        st.info("Portfolio volatility is zero at these weights -- nothing to attribute.")
+        return
+
+    risk_df = risk_df.copy()
+    risk_df["sleeve"] = [_sleeve_of(t) for t in risk_df.index]
+
+    sleeve_tbl = risk_df.groupby("sleeve")[["weight", "ctr"]].sum()
+    sleeve_tbl["pctr"] = sleeve_tbl["ctr"] / port_vol
+    sleeve_tbl = sleeve_tbl.reindex([s for s in SLEEVE_ORDER if s in sleeve_tbl.index])
+    if sleeve_tbl.empty:
+        st.info("No sleeve could be attributed -- risk view skipped.")
+        return
+
+    window = f"{rets.index[0].date()} to {rets.index[-1].date()}"
+    book_date = str(positions_data[0].get("trade_date", "—")) if positions_data else "—"
+
+    ranked = sleeve_tbl["pctr"].sort_values(ascending=False)
+    driver = str(ranked.index[0])
+    offsets = [s for s in sleeve_tbl.index if float(sleeve_tbl.loc[s, "pctr"]) < 0]
+    line = (
+        f"**Share of the book's total volatility (annualized {port_vol * 100:.1f}%).** "
+        f"{driver.capitalize()} carries {float(ranked.iloc[0]) * 100:.0f}% of the book's "
+        f"risk"
+    )
+    if offsets:
+        parts = " and ".join(
+            f"{s} ({float(sleeve_tbl.loc[s, 'pctr']) * 100:.0f}%)" for s in offsets
+        )
+        line += f", with the {parts} sleeves offsetting it (they are the short side)"
+    st.markdown(line + ".")
+    st.caption(
+        f"63-session covariance, {window}. **Indicative only**: the window ends "
+        f"{rets.index[-1].date()} and the book is {book_date}, so this is the risk shape "
+        f"of today's weights measured against a window that does not cover them. "
+        f"Weights are the live book; the covariance is not."
+    )
+
+    ticker_flag = float(risk_df["pctr"].max())
+    sleeve_flag = float(sleeve_tbl["pctr"].max())
+    flags: list[str] = []
+    if ticker_flag > RISK_TICKER_FLAG_PCT / 100:
+        flags.append(
+            f"{risk_df['pctr'].idxmax()} is {ticker_flag * 100:.0f}% of the book's risk "
+            f"(over {RISK_TICKER_FLAG_PCT:.0f}%)"
+        )
+    if sleeve_flag > RISK_SLEEVE_FLAG_PCT / 100:
+        flags.append(
+            f"the {sleeve_tbl['pctr'].idxmax()} sleeve is {sleeve_flag * 100:.0f}% of it "
+            f"(over {RISK_SLEEVE_FLAG_PCT:.0f}%)"
+        )
+    if flags:
+        st.error("Concentration: " + "; ".join(flags) + ".")
+    else:
+        st.success(
+            f"No single position above {RISK_TICKER_FLAG_PCT:.0f}% of book risk and no "
+            f"sleeve above {RISK_SLEEVE_FLAG_PCT:.0f}%."
+        )
+
     import matplotlib.pyplot as plt
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 3.5))
 
-    colors = ["#2ecc71" if w > 0 else "#e74c3c" for w in risk_df["weight"]]
-    ax1.bar(risk_df.index, risk_df["pctr"] * 100, color=colors, alpha=0.8)
-    ax1.axhline(0, color="black", lw=0.5)
-    ax1.set_title("PCTR (% of Total Risk)")
-    ax1.set_ylabel("%")
-    ax1.tick_params(axis="x", rotation=45)
-
-    ax2.bar(risk_df.index, risk_df["mctr"], color=colors, alpha=0.8)
-    ax2.axhline(0, color="black", lw=0.5)
-    ax2.set_title("MCTR (Marginal Contribution, Annualized)")
-    ax2.tick_params(axis="x", rotation=45)
-
+    fig, ax = plt.subplots(figsize=(9, 3.2))
+    for i, sleeve in enumerate(sleeve_tbl.index):
+        val = float(sleeve_tbl.loc[sleeve, "pctr"]) * 100
+        net_w = float(sleeve_tbl.loc[sleeve, "weight"])
+        ax.bar(i, val, 0.6, color=SLEEVE_COLORS.get(sleeve, NEUTRAL_COLOR),
+               hatch=_fill_for(net_w), edgecolor="white", linewidth=0.8)
+        ax.text(i, val, f"{val:.0f}%", ha="center",
+                va="bottom" if val >= 0 else "top", fontsize=9)
+    ax.axhline(0, color="black", lw=0.6)
+    ax.set_xticks(range(len(sleeve_tbl)))
+    ax.set_xticklabels([s.capitalize() for s in sleeve_tbl.index])
+    ax.set_ylabel("% of total risk")
+    ax.set_title("Share of book risk by sleeve")
+    ax.grid(axis="y", alpha=0.2)
     fig.tight_layout()
     st.pyplot(fig, width="stretch")
     plt.close(fig)
+    st.caption(
+        "Sleeve shares sum to 100%; a negative bar is a sleeve that reduces the book's "
+        f"risk. Bar colour is the sleeve, {LONG_SHORT_NOTE}."
+    )
 
-    with st.expander("MCTR/PCTR detail table"):
+    with st.expander("Per-ticker detail (weight, MCTR, CTR, PCTR)"):
+        by_ticker = risk_df.sort_values("pctr", ascending=False)
+        fig, ax = plt.subplots(figsize=(10, 3.2))
+        for i, (ticker, row) in enumerate(by_ticker.iterrows()):
+            val = float(row["pctr"]) * 100
+            ax.bar(i, val, 0.6,
+                   color=SLEEVE_COLORS.get(str(row["sleeve"]), NEUTRAL_COLOR),
+                   hatch=_fill_for(float(row["weight"])), edgecolor="white",
+                   linewidth=0.8)
+        ax.axhline(0, color="black", lw=0.6)
+        ax.set_xticks(range(len(by_ticker)))
+        ax.set_xticklabels(list(by_ticker.index), rotation=45)
+        ax.set_ylabel("% of total risk")
+        ax.set_title("Share of book risk by ticker")
+        ax.grid(axis="y", alpha=0.2)
+        fig.tight_layout()
+        st.pyplot(fig, width="stretch")
+        plt.close(fig)
         st.dataframe(
-            risk_df.style.map(
-                lambda v: "color: #2ecc71" if v > 0 else "color: #e74c3c",
-                subset=["weight", "pctr", "mctr"],
-            ),
+            risk_df[["sleeve", "weight", "mctr", "ctr", "pctr"]].round(4),
             width="stretch",
         )
-        st.caption(f"PCTR sum: {risk_df['pctr'].sum():.6f} (must = 1.0 within 1e-6)")
+        st.caption(
+            f"PCTR sum: {risk_df['pctr'].sum():.6f} (must = 1.0 within 1e-6). MCTR is "
+            f"annualized vol, PCTR is the share of the book's total. {LONG_SHORT_NOTE}."
+        )
 
 
 def render(
@@ -317,17 +498,10 @@ def render(
         else:
             st.success(f"{prefix}All positions NORMAL — no stop states active.")
 
-    if not df_trade.empty and "action" in df_trade.columns:
-        st.dataframe(
-            df_trade.style.map(
-                lambda v: "color: green" if v == "buy"
-                else ("color: red" if "sell" in str(v) else "color: grey"),
-                subset=["action"],
-            ),
-            width="stretch",
-            hide_index=True,
-        )
-    elif not df_trade.empty:
+    # No colour on the action column: green and red mean on-target and breach in
+    # this dashboard, and a buy is neither. Buy vs sell/short is in the words, and
+    # the long/short treatment is the fill style, not a colour.
+    if not df_trade.empty:
         st.dataframe(df_trade, width="stretch", hide_index=True)
 
     # ---- approve / reject: requires sign-in ----
@@ -400,228 +574,288 @@ def render(
     st.markdown("---")
 
     # ================================================================
-    # Panel I -- Live Portfolio Snapshot
+    # Exposure -- panels I and J, merged
+    #
+    # I and J each computed sum(|signed_notional|) / NAV, so the same number was on
+    # screen twice under two names. Gross exposure IS leverage: one quantity, one
+    # place. What is worth showing is the pair that says different things, net (how
+    # directional the book is) and gross (how big it is), each against the stored
+    # target rather than against nothing.
     # ================================================================
-    st.markdown("### I - Live Portfolio Snapshot")
+    st.markdown("### Exposure - current vs target")
 
     positions_data = _get_positions()
+    from signals.trend_signal import G_MAX_DEFAULT
 
-    col_gmv, col_nav, col_unreal = st.columns(3)
-    if positions_data:
-        total_gmv = sum(abs(float(p.get("signed_notional", 0))) for p in positions_data)
-        col_gmv.metric("Live GMV", f"${total_gmv:,.0f}")
-    else:
-        col_gmv.metric("Live GMV", "—")
-    col_nav.metric("Live NAV", f"${nav:,.0f}")
-    if positions_data:
-        net_exposure = sum(float(p.get("signed_notional", 0)) for p in positions_data)
-        unrealized = nav - net_exposure if net_exposure != 0 else 0
-        col_unreal.metric("Net Exposure", f"${net_exposure:+,.0f}",
-                          delta=f"{net_exposure/nav*100:.1f}% of NAV" if nav else None)
-    else:
-        col_unreal.metric("Net Exposure", "—")
+    snapshot_date = str(positions_data[0].get("trade_date", "—")) if positions_data else "—"
+    net_usd = sum(float(p.get("signed_notional") or 0.0) for p in positions_data)
+    gross_usd = sum(abs(float(p.get("signed_notional") or 0.0)) for p in positions_data)
+    net_pct = net_usd / nav * 100 if nav else 0.0
+    gross_x = gross_usd / nav if nav else 0.0
+    target_net_pct = sum(float(r.get("target wt") or 0.0) for r in proposed_rows) * 100
+    target_gross_x = sum(abs(float(r.get("target wt") or 0.0)) for r in proposed_rows)
 
-    # NAV breakdown by asset class
+    st.markdown(
+        f"Long/short book. **Net near zero is the intent** (no directional bet); "
+        f"**gross near {float(G_MAX_DEFAULT):.2f}x NAV is the intent** (full deployment). "
+        f"Current: net {net_pct:+.1f}% of NAV vs target {target_net_pct:+.1f}%; "
+        f"gross {gross_x:.2f}x vs target {target_gross_x:.2f}x. "
+        f"Snapshot {snapshot_date}."
+    )
+
+    col_net, col_gross = st.columns(2)
+    col_net.metric(
+        "Net exposure",
+        f"${net_usd:+,.0f}",
+        delta=f"{net_pct:+.1f}% of NAV vs target {target_net_pct:+.1f}%",
+        delta_color="off",
+    )
+    col_gross.metric(
+        "Gross exposure (= leverage)",
+        f"{gross_x:.2f}x NAV",
+        delta=f"target {target_gross_x:.2f}x, hard cap {float(G_MAX_DEFAULT):.2f}x",
+        delta_color="off",
+    )
+
+    off_target: list[str] = []
+    if abs(net_pct) > NET_BAND_PCT:
+        off_target.append(
+            f"net is {net_pct:+.1f}% of NAV, outside the +/-{NET_BAND_PCT:.0f}% band"
+        )
+    if gross_x > GROSS_FLAG_X:
+        off_target.append(
+            f"gross is {gross_x:.2f}x, above the {GROSS_FLAG_X:.2f}x overshoot mark"
+        )
+    if gross_x < GROSS_FLOOR_X:
+        off_target.append(
+            f"gross is {gross_x:.2f}x, below the {GROSS_FLOOR_X:.2f}x floor"
+        )
+    if off_target:
+        st.error("Off target: " + "; ".join(off_target) + ".")
+    else:
+        st.success(
+            f"On target: net {net_pct:+.1f}% of NAV (band +/-{NET_BAND_PCT:.0f}%), "
+            f"gross {gross_x:.2f}x (floor {GROSS_FLOOR_X:.2f}x, "
+            f"overshoot mark {GROSS_FLAG_X:.2f}x)."
+        )
+
+    st.caption(
+        f"{len(positions_data)} positions, market values as of the {snapshot_date} "
+        f"snapshot. The target is the signal weights stored for {as_of_date}. "
+        f"Leverage is the same number as gross: exposure per dollar of equity."
+    )
+
     if positions_data:
         import matplotlib.pyplot as plt
-        TICKER_CLASS = {
-            "SPY": "equity", "EFA": "equity", "EEM": "equity",
-            "IEF": "rates", "TLT": "rates",
-            "HYG": "credit", "LQD": "credit",
-            "GLD": "commodity",
-        }
-        class_gmv: dict[str, float] = {}
-        for p in positions_data:
-            t = p.get("ticker", "")
-            notional = float(p.get("signed_notional", 0))
-            cls = TICKER_CLASS.get(t, "other")
-            class_gmv[cls] = class_gmv.get(cls, 0) + abs(notional)
 
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 3.5))
-        classes = list(class_gmv.keys())
-        values = [class_gmv[c] for c in classes]
-        colors = {"equity": "#3498db", "rates": "#2ecc71", "credit": "#e74c3c",
-                  "commodity": "#f39c12", "other": "#95a5a6"}
-        bar_colors = [colors.get(c, "#95a5a6") for c in classes]
-
-        ax1.bar(classes, values, color=bar_colors, alpha=0.85)
-        ax1.set_title("GMV by Asset Class")
-        ax1.set_ylabel("$")
-        ax1.tick_params(axis="x", rotation=30)
-
-        ax2.pie(values, labels=classes, colors=bar_colors, autopct="%1.0f%%",
-                startangle=90)
-        ax2.set_title("NAV Allocation")
-
+        current, target = _sleeve_exposure(positions_data, proposed_rows, nav)
+        fig, ax = plt.subplots(figsize=(10, 3.2))
+        width = 0.38
+        for i, sleeve in enumerate(SLEEVE_ORDER):
+            cur = current[sleeve] / nav * 100 if nav else 0.0
+            tgt = target[sleeve] / nav * 100 if nav else 0.0
+            color = SLEEVE_COLORS[sleeve]
+            ax.bar(i - width / 2, cur, width, color=color, hatch=_fill_for(cur),
+                   edgecolor="white", linewidth=0.8)
+            ax.bar(i + width / 2, tgt, width, color=color, alpha=0.35,
+                   edgecolor=NEUTRAL_COLOR, linewidth=0.8)
+            ax.text(i - width / 2, cur, f"{cur:+.0f}%", ha="center",
+                    va="bottom" if cur >= 0 else "top", fontsize=8)
+        ax.axhline(0, color="black", lw=0.6)
+        ax.set_xticks(range(len(SLEEVE_ORDER)))
+        ax.set_xticklabels([s.capitalize() for s in SLEEVE_ORDER])
+        ax.set_ylabel("net exposure, % of NAV")
+        ax.set_title("Net exposure by sleeve: current vs target")
+        ax.grid(axis="y", alpha=0.2)
         fig.tight_layout()
         st.pyplot(fig, width="stretch")
         plt.close(fig)
+        st.caption(
+            f"Full bar = the sleeve's current net exposure ({LONG_SHORT_NOTE}); "
+            f"pale bar = the signal's target for {as_of_date}."
+        )
     else:
-        st.info("No positions yet — asset class breakdown will appear after execution.")
-
-    st.markdown("---")
-
-    # ---------------------------------------------------------------- Panel J: open positions
-    st.markdown("### J - Open Positions")
-    if positions_data:
-        df_pos = pd.DataFrame(positions_data)
-        if "signed_notional" in df_pos.columns and nav > 0:
-            df_pos["weight %"] = (df_pos["signed_notional"].astype(float) / nav * 100).round(2)
-            df_pos["|notional|"] = df_pos["signed_notional"].astype(float).abs()
-
-        total_gmv = df_pos["|notional|"].sum() if "|notional|" in df_pos.columns else 0
-        net_exposure = df_pos["signed_notional"].astype(float).sum() if "signed_notional" in df_pos.columns else 0
-
-        col1, col2, col3 = st.columns(3)
-        col1.metric("GMV", f"${total_gmv:,.0f}")
-        col2.metric("Net Exposure", f"${net_exposure:+,.0f}")
-        col3.metric("Leverage", f"{total_gmv/nav:.2f}x" if nav > 0 else "—")
-
-        st.dataframe(df_pos, width="stretch", hide_index=True)
-        st.caption("Weights shown as % of live NAV. Long = positive, short = negative.")
-    else:
-        st.info("No open positions — run the execution cron to populate.")
+        st.info("No positions yet -- the sleeve view appears after the first execution run.")
 
     st.markdown("---")
 
     # ================================================================
-    # Panel K -- NAV Tracker (factor-colored, anchored to live NAV)
+    # Panel K -- account value, and what trading cost
+    #
+    # The old panel plotted nav - cumulative(net_pnl), and pnl_log.net_pnl is minus the
+    # day's turnover cost, so the "NAV" line was reconstructed out of costs: across the
+    # whole recorded history it spans about $106 on a $102k account, so it read as flat,
+    # and because cost only ever subtracts it sloped the wrong way while the account
+    # rose. Equity now comes from pnl_log.live_nav, which run_execution writes each run,
+    # and cost is charted as cost, on its own chart.
     # ================================================================
-    st.markdown("### K - NAV Tracker")
+    st.markdown("### K - Account value and turnover cost")
     pnl_rows = _get_pnl_log()
-    attr_all = _get_live_attribution(500)  # full history for cumulative
-    FACTOR_COLORS = {"equity": "#3498db", "rates": "#2ecc71", "credit": "#e74c3c",
-                     "commodity": "#f39c12"}
+    df_pnl = pd.DataFrame(pnl_rows).sort_values("trade_date") if pnl_rows else pd.DataFrame()
+    equity_rows = (
+        df_pnl[df_pnl["live_nav"].notna()]
+        if "live_nav" in df_pnl.columns
+        else pd.DataFrame()
+    )
 
-    if pnl_rows and attr_all:
+    st.markdown("**Account value over time.** The account's equity as recorded at each run.")
+    if not equity_rows.empty:
         import matplotlib.pyplot as plt
         import matplotlib.dates as mdates
-        import numpy as np
 
-        df_pnl = pd.DataFrame(pnl_rows).sort_values("trade_date")
-        df_pnl["cumulative_net_pnl"] = df_pnl["net_pnl"].cumsum()
-
-        # Anchor to live NAV
-        cumulative_now = df_pnl["cumulative_net_pnl"].iloc[-1]
-        starting_nav = nav - cumulative_now
-
-        # Factor breakdown over time from live_attribution
-        df_attr = pd.DataFrame(attr_all)
-        if "asset_class" in df_attr.columns and "run_date" in df_attr.columns:
-            factor_pnl = df_attr.groupby(["run_date", "asset_class"])["net_pnl"].sum().unstack(fill_value=0)
-            factor_pnl = factor_pnl.sort_index()
-            factor_cum = factor_pnl.cumsum()
-
-            fig, ax = plt.subplots(figsize=(14, 3.5))
-            dates = pd.to_datetime(factor_cum.index)
-            classes = [c for c in ["equity", "rates", "credit", "commodity"] if c in factor_cum.columns]
-
-            # Stacked area by factor
-            y_stack = np.zeros(len(dates))
-            for cls in classes:
-                vals = factor_cum[cls].values + starting_nav / len(classes)  # distribute starting NAV
-                # Better: anchor each factor's cumulative to its share of starting NAV
-                ax.fill_between(dates, y_stack + starting_nav, y_stack + starting_nav + factor_cum[cls].values,
-                                alpha=0.7, color=FACTOR_COLORS.get(cls, "#95a5a6"),
-                                label=cls.capitalize())
-                y_stack += factor_cum[cls].values
-
-            # Total NAV line on top
-            nav_series = starting_nav + df_pnl.set_index("trade_date")["cumulative_net_pnl"]
-            nav_series = nav_series.reindex(factor_cum.index)
-            ax.plot(dates, nav_series.values, color="black", lw=1.5, label="Total NAV")
-
-            ax.axhline(starting_nav, color="gray", lw=0.5, ls="--", alpha=0.5)
-            ax.set_title("NAV by Factor (stacked cumulative P&L per asset class)")
-            ax.set_ylabel("$")
-            ax.legend(fontsize=8, loc="upper left")
-            ax.grid(alpha=0.2)
-            ax.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d"))
-            fig.tight_layout()
-            st.pyplot(fig, width="stretch")
-            plt.close(fig)
-            st.caption(f"Current NAV: ${nav:,.0f}  |  Starting NAV (inferred): ${starting_nav:,.0f}")
-        else:
-            st.info("live_attribution missing asset_class column — showing total only.")
-    elif pnl_rows:
-        # Fallback: total NAV only
-        import matplotlib.pyplot as plt
-        import matplotlib.dates as mdates
-        df_pnl = pd.DataFrame(pnl_rows).sort_values("trade_date")
-        df_pnl["cumulative_net_pnl"] = df_pnl["net_pnl"].cumsum()
-        cumulative_now = df_pnl["cumulative_net_pnl"].iloc[-1]
-        starting_nav = nav - cumulative_now
-        df_pnl["nav_series"] = starting_nav + df_pnl["cumulative_net_pnl"]
-
+        eq_dates = pd.to_datetime(equity_rows["trade_date"])
+        eq_values = equity_rows["live_nav"].astype(float)
         fig, ax = plt.subplots(figsize=(14, 3))
-        ax.fill_between(pd.to_datetime(df_pnl["trade_date"]), starting_nav,
-                         df_pnl["nav_series"], color="#1b5e8a", alpha=0.15)
-        ax.plot(pd.to_datetime(df_pnl["trade_date"]), df_pnl["nav_series"],
-                color="#1b5e8a", lw=2.0, marker="o", markersize=3)
-        ax.axhline(starting_nav, color="gray", lw=0.5, ls="--")
-        ax.set_title("Account NAV (no factor breakdown available)")
-        ax.set_ylabel("$")
+        ax.plot(eq_dates, eq_values, color=NEUTRAL_COLOR, lw=2.0, marker="o", markersize=3)
+        ax.set_ylabel("account equity, $")
+        ax.set_title("Account value over time")
         ax.grid(alpha=0.2)
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d"))
         fig.tight_layout()
         st.pyplot(fig, width="stretch")
         plt.close(fig)
-        st.caption(f"Current NAV: ${nav:,.0f}  |  Starting NAV: ${starting_nav:,.0f}")
+        st.caption(
+            f"Last ${float(eq_values.iloc[-1]):,.2f} on "
+            f"{str(equity_rows['trade_date'].iloc[-1])}. Recorded high "
+            f"${float(eq_values.max()):,.2f}, low ${float(eq_values.min()):,.2f}, "
+            f"over {len(equity_rows)} recorded run(s)."
+        )
     else:
-        st.info("No P&L data yet — NAV tracker will appear after fills.")
+        st.info(
+            "No account equity recorded yet. `pnl_log.live_nav` starts filling from the "
+            "next execution run, and the chart then shows the account's real equity "
+            "instead of a line rebuilt out of turnover costs."
+        )
+
+    if not df_pnl.empty and "turnover_cost" in df_pnl.columns:
+        import matplotlib.pyplot as plt
+
+        costs = df_pnl["turnover_cost"].fillna(0.0).astype(float)
+        total_cost = float(costs.sum())
+        st.markdown(
+            f"**Turnover cost per run.** Total to date ${total_cost:,.2f} over "
+            f"{len(df_pnl)} runs."
+        )
+        fig, ax = plt.subplots(figsize=(14, 2.2))
+        ax.bar(pd.to_datetime(df_pnl["trade_date"]), costs, color=NEUTRAL_COLOR, width=0.8)
+        ax.set_ylabel("$")
+        ax.set_title("Turnover cost per run")
+        ax.grid(axis="y", alpha=0.2)
+        fig.tight_layout()
+        st.pyplot(fig, width="stretch")
+        plt.close(fig)
+        st.caption(
+            "Cost is a drag on the account value above, not the result: a single-digit "
+            "dollar run ($0 to $3, 0.00-0.02% of NAV) is normal. "
+            "(`pnl_log.gross_pnl` is the day's traded notional, not a P&L.)"
+        )
+    else:
+        st.info("No turnover-cost rows yet -- the cost chart appears after the first run.")
 
     st.markdown("---")
 
     # ================================================================
-    # Panel M-A -- Risk Contribution (MCTR/PCTR)
+    # Panel M-A -- risk contribution by sleeve
     # ================================================================
-    st.markdown("### M-A — Risk Contribution (MCTR/PCTR)")
+    st.markdown("### M-A - Risk contribution (MCTR/PCTR)")
 
     with st.spinner("Computing risk decomposition..."):
         if positions_data:
             _render_mctr_pctr(nav, positions_data)
         else:
-            st.info("No positions — MCTR/PCTR requires open positions.")
+            st.info("No positions -- risk contribution needs an open book.")
 
     st.markdown("---")
 
     # ================================================================
-    # Panel M-B -- P&L by Factor / Asset Class
+    # Panel M-B -- the run's three dollars, kept apart
+    #
+    # Three different quantities used to share one label. The daily email keeps book
+    # P&L and turnover cost apart; this panel now does the same, and names the third
+    # for what it is: the mark from fill to close on the legs filled that day, which
+    # is not the book's result.
     # ================================================================
-    st.markdown("### M-B — P&L by Factor (latest run)")
+    st.markdown("### M-B - Today's result")
 
-    attr_rows = _get_live_attribution(20)
+    last_run = df_pnl.iloc[-1] if not df_pnl.empty else None
+    run_date = str(last_run["trade_date"]) if last_run is not None else "—"
+    book_pnl = last_run.get("book_pnl") if last_run is not None else None
+    cost_today = last_run.get("turnover_cost") if last_run is not None else None
+    nav_at_run = last_run.get("live_nav") if last_run is not None else None
+
+    col_book, col_cost = st.columns(2)
+
+    if book_pnl is None or pd.isna(book_pnl):
+        col_book.metric(
+            "Book P&L (equity move since previous run)", "not recorded yet"
+        )
+    else:
+        book_pct = (float(book_pnl) / float(nav_at_run) * 100) if nav_at_run else None
+        col_book.metric(
+            "Book P&L (equity move since previous run)",
+            f"${float(book_pnl):+,.2f}",
+            delta=f"{book_pct:+.2f}% of NAV" if book_pct is not None else None,
+            delta_color="off",
+        )
+
+    if cost_today is None or pd.isna(cost_today):
+        col_cost.metric("Turnover cost today", "—")
+    else:
+        col_cost.metric("Turnover cost today", _fmt_dollars(float(cost_today)))
+
+    cost_total = (
+        float(df_pnl["turnover_cost"].fillna(0.0).sum())
+        if "turnover_cost" in df_pnl.columns
+        else 0.0
+    )
+    st.caption(
+        f"Book P&L is the account's equity move since the previous run, on the last run "
+        f"({run_date}): tens to hundreds of dollars a day is ordinary noise on this "
+        f"account. Turnover cost today is a drag on it, not part of it -- "
+        f"${cost_total:,.2f} cumulative over {len(df_pnl)} runs, and a single-digit "
+        f"dollar day ($0 to $3, 0.00-0.02% of NAV) is normal. The two are different "
+        f"quantities and neither is derived from the other."
+    )
+
+    attr_rows = _get_live_attribution(60)
     if attr_rows:
         import matplotlib.pyplot as plt
-        import numpy as np
-        df_attr = pd.DataFrame(attr_rows)
-        latest_date = df_attr["run_date"].max()
-        df_latest = df_attr[df_attr["run_date"] == latest_date]
-        st.caption(f"Latest execution: {latest_date}")
-        if not df_latest.empty and "asset_class" in df_latest.columns:
-            # Aggregate net P&L by asset class
-            class_pnl = df_latest.groupby("asset_class")["net_pnl"].sum().sort_values()
-            factor_colors = {
-                "equity": "#3498db", "rates": "#2ecc71", "credit": "#e74c3c",
-                "commodity": "#f39c12",
-            }
-            bar_colors = [factor_colors.get(c, "#95a5a6") for c in class_pnl.index]
 
-            fig, ax = plt.subplots(figsize=(10, 3))
-            bars = ax.barh(class_pnl.index, class_pnl.values, color=bar_colors, alpha=0.85)
-            ax.axvline(0, color="black", lw=0.5)
-            ax.set_title("Net P&L by Factor / Asset Class")
-            ax.set_xlabel("$")
-            for bar, val in zip(bars, class_pnl.values):
-                ax.text(val + (0.02 if val >= 0 else -0.08), bar.get_y() + bar.get_height()/2,
-                        f"${val:+,.2f}", va="center", fontsize=9)
+        df_attr = pd.DataFrame(attr_rows)
+        attr_date = str(df_attr["run_date"].max())
+        df_latest = df_attr[df_attr["run_date"] == attr_date]
+        if not df_latest.empty and "asset_class" in df_latest.columns:
+            mark = df_latest.groupby("asset_class")["net_pnl"].sum()
+            mark = mark.reindex([s for s in SLEEVE_ORDER if s in mark.index])
+            total_mark = float(mark.sum())
+
+            st.markdown(
+                f"**Fill-day mark on {attr_date}'s filled legs, by sleeve "
+                f"(not the book's P&L).**"
+            )
+            fig, ax = plt.subplots(figsize=(9, 2.8))
+            bars = ax.bar(
+                [s.capitalize() for s in mark.index], mark.values,
+                color=[SLEEVE_COLORS.get(s, NEUTRAL_COLOR) for s in mark.index],
+                alpha=0.9,
+            )
+            ax.axhline(0, color="black", lw=0.6)
+            ax.set_ylabel("$")
+            ax.set_title("Fill-to-close mark on the day's filled legs, by sleeve")
+            for bar, val in zip(bars, mark.values):
+                ax.text(bar.get_x() + bar.get_width() / 2, val, f"${val:+,.2f}",
+                        ha="center", va="bottom" if val >= 0 else "top", fontsize=9)
+            ax.grid(axis="y", alpha=0.2)
             fig.tight_layout()
             st.pyplot(fig, width="stretch")
             plt.close(fig)
-
-            total = class_pnl.sum()
-            st.caption(f"Total net P&L: ${total:+,.2f}")
+            st.caption(
+                f"${total_mark:+,.2f} across {len(df_latest)} filled leg(s) on "
+                f"{attr_date}, net of their turnover cost. One day, filled legs only, so "
+                f"it is not a period return and not the book's P&L: single digits to low "
+                f"tens of dollars is normal here."
+            )
         else:
-            st.info("No attribution rows for latest run.")
+            st.info("No attribution rows for the latest run.")
     else:
-        st.info("No live_attribution data yet — populates after execution cron runs.")
+        st.info("No live_attribution rows yet -- they populate after an execution run.")

@@ -289,6 +289,13 @@ def _run(summary: RunSummary) -> int:
         # P&L for the summary email.
         previous_live_nav: float | None = float(_nav_str) if _nav_str else None
         nav = previous_live_nav if previous_live_nav is not None else nav_live
+        # The book's result, computed once and used twice: the summary email reports it
+        # and the pnl_log row stores it, so the dashboard plots the account's real equity
+        # and a real book P&L instead of re-deriving either from costs. None on the first
+        # run, when there is no previous reading to compare against.
+        nav_change: float | None = (
+            nav_live - previous_live_nav if previous_live_nav is not None else None
+        )
         logger.info("nav=%.2f (frozen Supabase; live Alpaca=%.2f)", nav, nav_live)
 
         from dashboard.supabase_client import fetch_positions as _fetch_positions
@@ -621,12 +628,17 @@ def _run(summary: RunSummary) -> int:
         if dry_run:
             logger.info("dry run: NOT writing pnl_log (no fills executed)")
         else:
+            # gross_pnl here is the day's traded notional and net_pnl is minus its cost;
+            # neither is the book's result. live_nav and book_pnl are, which is why the
+            # dashboard plots those two and labels the cost as a cost.
             write_pnl_log({
                 "trade_date": today,
                 "gross_pnl": round(total_gross, 4),
                 "net_pnl": round(total_net_pnl, 4),
                 "turnover_cost": round(total_cost, 4),
                 "borrow_cost": 0.0,
+                "live_nav": round(nav_live, 2),
+                "book_pnl": round(nav_change, 2) if nav_change is not None else None,
             })
 
     # What the summary email reports. The book's P&L is the change in live Alpaca NAV
@@ -636,9 +648,7 @@ def _run(summary: RunSummary) -> int:
     summary.nav_frozen = nav
     summary.nav_live = nav_live
     summary.previous_live_nav = previous_live_nav
-    summary.nav_change = (
-        nav_live - previous_live_nav if previous_live_nav is not None else None
-    )
+    summary.nav_change = nav_change
     summary.turnover_cost = total_cost
     summary.record_basis_refresh(basis_report)
 

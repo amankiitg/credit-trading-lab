@@ -10,8 +10,13 @@ Tables (created by the user in the Supabase dashboard):
              -- current positions; written by v8.6 execution job
 
   pnl_log    (trade_date date PK, gross_pnl float8, net_pnl float8,
-              turnover_cost float8, borrow_cost float8, created_at timestamptz)
-             -- daily aggregate P&L; written by v8.6 execution job
+              turnover_cost float8, borrow_cost float8, live_nav float8,
+              book_pnl float8, created_at timestamptz)
+             -- one row per execution run. gross_pnl is the day's traded notional and
+             -- net_pnl is minus its turnover cost, so neither is a P&L. The book's
+             -- result is book_pnl (the move in account equity since the previous run)
+             -- and the account's equity at that run is live_nav. Both are null on
+             -- rows written before sprint v9.7.
 
 Reads SUPABASE_URL and SUPABASE_SECRET_KEY from the environment (.env).
 The URL stored in .env includes the /rest/v1/ suffix; this module strips it

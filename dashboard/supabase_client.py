@@ -362,3 +362,34 @@ def write_cron_run(job_name: str, run_date: str) -> bool:
     except Exception as exc:
         _log.error("write_cron_run failed: %s", exc)
         return False
+
+
+def fetch_last_cron_run(job_name: str) -> dict | None:
+    """The newest cron_runs row for a job, or None when there is none.
+
+    run_date is an ISO date string in this table, so ordering by it is ordering
+    chronologically and the newest row is the last run that completed. The dashboard
+    uses this as the execution-window gate: whether the run for today has happened is
+    a question about a recorded run, because a cron can fire late and the scheduled
+    time cannot answer it.
+
+    Returns None if Supabase is unavailable, which reads as "no run recorded". The
+    caller must not turn that into "already ran": an unreadable gate is not a locked
+    day, and the decision write is checked separately.
+    """
+    client = get_supabase_client()
+    if client is None:
+        return None
+    try:
+        resp = (
+            client.table("cron_runs")
+            .select("run_date,completed_at")
+            .eq("job_name", job_name)
+            .order("run_date", desc=True)
+            .limit(1)
+            .execute()
+        )
+        return resp.data[0] if resp.data else None
+    except Exception as exc:
+        _log.error("fetch_last_cron_run(%s) failed: %s", job_name, exc)
+        return None

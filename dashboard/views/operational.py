@@ -34,6 +34,7 @@ import streamlit as st
 
 from dashboard.supabase_client import (
     fetch_decision_for_date,
+    fetch_last_cron_run,
     fetch_live_attribution,
     fetch_pnl_log,
     fetch_positions,
@@ -73,6 +74,128 @@ GROSS_FLAG_X = 2.05       # above this is a mark-to-market overshoot between run
 GROSS_FLOOR_X = 1.80      # the floor observed across the recorded snapshots
 RISK_TICKER_FLAG_PCT = 40.0   # one position above 40% of book risk is concentration
 RISK_SLEEVE_FLAG_PCT = 60.0   # one sleeve above 60% of book risk is concentration
+
+# ---------------------------------------------------------------- decision window
+#
+# The approve/reject buttons are shown only while a decision can still change what
+# runs. The gate is the execution run's own record in cron_runs, never the clock: the
+# cron can fire late, and a scheduled time that has passed says nothing about whether
+# the run has happened.
+EXECUTION_JOB = "run_execution"
+
+# Context only, never a gate. render.yaml schedules credit-lab-execution at
+# "30 14 * * 1-5" UTC.
+EXECUTION_CRON_UTC = "14:30 UTC"
+
+DECISION_STATE_NO_SIGNAL = "no_signal"
+DECISION_STATE_OPEN = "open"
+DECISION_STATE_LOCKED = "locked"
+
+
+def _today_utc() -> str:
+    """Today's date in UTC as YYYY-MM-DD.
+
+    The execution cron stamps its cron_runs row with its own container's date, which
+    is UTC on Render. Comparing against that row means using the same basis, so the
+    dashboard uses UTC too: on a box set to US Eastern the local date rolls over four
+    or five hours before UTC does, and in those hours the local date is not the date
+    the run was written under.
+    """
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+def decision_window(
+    *,
+    today: str,
+    as_of_date: str | None,
+    has_proposal: bool,
+    last_execution_run_date: str | None,
+) -> tuple[str, str]:
+    """Which decision state the panel is in, and the reason in plain words.
+
+      no_signal -- no proposal is on file, or the one on file has already been acted
+                   on by an execution run and no newer signal has arrived.
+      open      -- a proposal is on file and no run has acted on it yet. This is the
+                   only state that shows the buttons.
+      locked    -- an execution run has already completed today, so today's decision
+                   is settled, whatever it was.
+
+    `last_execution_run_date` is the newest run_execution row in cron_runs, or None.
+    Dates here are ISO strings, so they compare chronologically as strings.
+
+    The "already acted on" test is `run > as_of`. A proposal computed from the close
+    of day A is acted on by the first run after it, which has a run_date later than A;
+    the run on day A itself acted on the previous proposal. That is why the normal
+    morning (last run == as_of) stays open, and why a weekend stays open: the run that
+    will act on a Friday signal is Monday's, which has not happened yet.
+    """
+    if not has_proposal or not as_of_date or as_of_date == "—":
+        return DECISION_STATE_NO_SIGNAL, "no proposal is on file yet"
+
+    if last_execution_run_date == today:
+        return (
+            DECISION_STATE_LOCKED,
+            f"the execution run for {today} has already been recorded",
+        )
+
+    if last_execution_run_date and last_execution_run_date > as_of_date:
+        return (
+            DECISION_STATE_NO_SIGNAL,
+            f"the {as_of_date} signal was already acted on by the "
+            f"{last_execution_run_date} run, and no newer signal has arrived",
+        )
+
+    return (
+        DECISION_STATE_OPEN,
+        f"the {as_of_date} signal has not been acted on yet",
+    )
+
+
+def _render_execution_outcome(
+    *,
+    today: str,
+    as_of_date: str,
+    decision: str | None,
+    attr_rows: list[dict],
+    pnl_row: dict | None,
+) -> None:
+    """What today's execution run did, for the locked state.
+
+    The filled legs are the direct record of what traded. If that write is missing
+    (the run filled but the attribution write failed) the pnl_log row still carries
+    the day's traded notional, so the fallback reports what it can instead of
+    claiming nothing traded.
+    """
+    if decision == "reject":
+        st.error(f"Skipped, you rejected: nothing traded on the {as_of_date} signal.")
+        return
+
+    legs = [r for r in attr_rows if str(r.get("run_date")) == today]
+    if legs:
+        tickers = ", ".join(sorted({str(r.get("ticker")) for r in legs}))
+        mark = sum(float(r.get("net_pnl") or 0.0) for r in legs)
+        st.success(
+            f"Traded: {len(legs)} leg(s) filled today on the {as_of_date} signal "
+            f"({tickers}). Fill-day mark ${mark:+,.2f}."
+        )
+        return
+
+    # pnl_log.gross_pnl is the day's traded notional, not a P&L.
+    traded_notional = float(pnl_row.get("gross_pnl") or 0.0) if pnl_row else 0.0
+    if traded_notional > 0:
+        cost = float(pnl_row.get("turnover_cost") or 0.0) if pnl_row else 0.0
+        st.success(
+            f"Traded: ${traded_notional:,.2f} of notional today, turnover cost "
+            f"${cost:,.2f}. Leg-level detail was not recorded for this run."
+        )
+        return
+
+    st.success(
+        "Ran with no fills: the execution run completed today and filled nothing. "
+        "The daily email has the reason."
+    )
 
 
 def _sleeve_of(ticker: str) -> str:
@@ -154,6 +277,18 @@ def _get_pnl_log() -> list[dict]:
 def _get_live_attribution(limit: int) -> list[dict]:
     """Live attribution rows, newest first. `limit` is part of the cache key."""
     return fetch_live_attribution(limit=limit)
+
+
+@st.cache_data(ttl=60)
+def _get_last_execution_run() -> dict | None:
+    """The newest run_execution row in cron_runs, or None.
+
+    Deliberately a shorter TTL than the display readers: this is the gate that hides
+    the approve/reject buttons once the run has happened, and a five-minute cache
+    would leave the buttons live for five minutes after the decision was settled.
+    Sixty seconds still collapses the repeated reads within a single interaction.
+    """
+    return fetch_last_cron_run(EXECUTION_JOB)
 
 
 @st.cache_data(ttl=300)
@@ -504,7 +639,7 @@ def render(
     if not df_trade.empty:
         st.dataframe(df_trade, width="stretch", hide_index=True)
 
-    # ---- approve / reject: requires sign-in ----
+    # ---- approve / reject: requires sign-in, and only while the window is open ----
     supabase_ok = bool(os.environ.get("SUPABASE_SECRET_KEY"))
 
     if not is_authenticated and secrets_configured:
@@ -513,25 +648,52 @@ def render(
             st.login("google")
         st.markdown("---")
         # skip decision/auto-approve UI for unauthenticated visitors
+    elif not supabase_ok:
+        # Without credentials the window cannot be read, so the panel will not claim to
+        # know it, and a decision could not be written anyway.
+        st.warning(
+            "Supabase credentials not configured -- the decision window cannot be read "
+            "and a decision could not be saved. Set SUPABASE_URL and "
+            "SUPABASE_SECRET_KEY in .env and restart."
+        )
     else:
+        today = _today_utc()
         existing = fetch_decision_for_date(as_of_date)
+        last_run = _get_last_execution_run()
+        last_run_date = str(last_run["run_date"]) if last_run else None
+        state, window_reason = decision_window(
+            today=today,
+            as_of_date=as_of_date,
+            has_proposal=bool(proposed_rows),
+            last_execution_run_date=last_run_date,
+        )
 
         auto_approve = get_auto_approve()
         new_val = st.toggle(
             "Auto-approve: execute every day unless I explicitly reject",
             value=auto_approve,
-            disabled=not supabase_ok,
             help="When ON, the v8.6 cron runs each morning without needing a daily approval. "
                  "Turn OFF to require an explicit approve each day.",
         )
+        # The toggle is a standing setting, not a per-day decision, so it stays usable
+        # in every window state. The copy below reports the stored value, and after a
+        # failed write the stored value is the old one, so it is the effective value
+        # that decides which sentence is true.
+        effective_auto_approve = auto_approve
         if new_val != auto_approve:
-            set_auto_approve(new_val)
-            if new_val:
-                st.success("Auto-approve ON -- trades will execute daily unless you reject.")
+            if set_auto_approve(new_val):
+                effective_auto_approve = new_val
+                if new_val:
+                    st.success("Auto-approve ON -- trades will execute daily unless you reject.")
+                else:
+                    st.info("Auto-approve OFF -- you must approve each morning to trade.")
             else:
-                st.info("Auto-approve OFF -- you must approve each morning to trade.")
+                st.error(
+                    "Could not save the auto-approve setting: the write to Supabase "
+                    "failed, so the setting is unchanged. Try again."
+                )
 
-        if auto_approve:
+        if effective_auto_approve:
             st.caption(
                 "Cron logic: execute unless `decision = reject` for today. "
                 "No row or `decision = approve` both trigger execution."
@@ -542,34 +704,50 @@ def render(
                 "No row or `decision = reject` both skip execution."
             )
 
-        st.markdown("**Today's decision:**")
+        st.caption(
+            f"Scheduled execution: {EXECUTION_CRON_UTC} on weekdays. Whether this panel "
+            f"offers a decision is decided by the recorded run, not the clock."
+        )
 
-        if not supabase_ok:
-            st.warning(
-                "Supabase credentials not configured -- decisions cannot be saved. "
-                "Set SUPABASE_URL and SUPABASE_SECRET_KEY in .env and restart."
+        if state == DECISION_STATE_LOCKED:
+            st.markdown(f"**Locked for today ({today}).** {window_reason.capitalize()}.")
+            _render_execution_outcome(
+                today=today,
+                as_of_date=as_of_date,
+                decision=existing,
+                attr_rows=_get_live_attribution(60),
+                pnl_row=next(
+                    (r for r in _get_pnl_log() if str(r.get("trade_date")) == today),
+                    None,
+                ),
             )
 
-        if existing == "approve":
-            st.success(f"Approved for {as_of_date} -- trades will execute at next cron run.")
-            if st.button("Change to: Reject / skip today", disabled=not supabase_ok, key=f"reject_{as_of_date}"):
-                if write_decision(as_of_date, "reject"):
-                    st.rerun()
-
-        elif existing == "reject":
-            st.error(f"Rejected for {as_of_date} -- no trades will execute.")
-            if st.button("Change to: Approve all trades", type="primary", disabled=not supabase_ok, key=f"approve_{as_of_date}"):
-                if write_decision(as_of_date, "approve"):
-                    st.rerun()
+        elif state == DECISION_STATE_NO_SIGNAL:
+            st.info(f"Waiting for the next signal: {window_reason}.")
 
         else:
-            col_approve, col_reject = st.columns(2)
-            if col_approve.button("Approve all trades", type="primary", disabled=not supabase_ok, key=f"approve_{as_of_date}"):
-                if write_decision(as_of_date, "approve"):
-                    st.rerun()
-            if col_reject.button("Reject / skip today", disabled=not supabase_ok, key=f"reject_{as_of_date}"):
-                if write_decision(as_of_date, "reject"):
-                    st.rerun()
+            st.markdown(f"**Awaiting your decision for {as_of_date}.** {window_reason.capitalize()}.")
+
+            if existing == "approve":
+                st.success(f"Approved for {as_of_date} -- trades will execute at next cron run.")
+                if st.button("Change to: Reject / skip today", key=f"reject_{as_of_date}"):
+                    if write_decision(as_of_date, "reject"):
+                        st.rerun()
+
+            elif existing == "reject":
+                st.error(f"Rejected for {as_of_date} -- no trades will execute.")
+                if st.button("Change to: Approve all trades", type="primary", key=f"approve_{as_of_date}"):
+                    if write_decision(as_of_date, "approve"):
+                        st.rerun()
+
+            else:
+                col_approve, col_reject = st.columns(2)
+                if col_approve.button("Approve all trades", type="primary", key=f"approve_{as_of_date}"):
+                    if write_decision(as_of_date, "approve"):
+                        st.rerun()
+                if col_reject.button("Reject / skip today", key=f"reject_{as_of_date}"):
+                    if write_decision(as_of_date, "reject"):
+                        st.rerun()
 
     st.markdown("---")
 

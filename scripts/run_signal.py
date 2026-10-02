@@ -7,7 +7,10 @@ Schedule: "30 21 * * 1-5" UTC
 What it does:
   1. NYSE calendar check -- skip if today is not a trading day.
   2. Idempotency check -- exit 0 if this job already ran for today.
-  3. Reload universe closes (yfinance cache).
+  3. Reload universe closes and the distribution cache (yfinance). Missing closes
+     abort the run, because the signal cannot be computed without them. Missing
+     distributions do not: they are recorded, and the sleeve P&L refuses the session
+     rather than booking a missing payout as a price loss.
   4. Run v8.2 signal pipeline to compute proposed weights.
   5. Write decision='proposed' to Supabase decisions table for as_of_date.
   6. Record the completed run in cron_runs.
@@ -150,6 +153,63 @@ def _run(summary: RunSummary) -> int:
         as_of_date = str(close.index[-1].date())
         logger.info("as_of_date: %s (latest close available)", as_of_date)
     summary.signal_as_of = as_of_date
+
+    # -- 3c. Refresh the distribution cache, on the same deadline and retry policy as the
+    #        closes. Ex-dates are what matter: the unadjusted close drops on the ex-date,
+    #        so a distribution the cache does not know about turns that drop into a fake
+    #        price loss in the sleeve decomposition.
+    #
+    #        A failure here does NOT abort the run. The signal is the run's product and
+    #        the distributions are not, and refusing to write a signal because Yahoo
+    #        would not serve a dividend table would let bookkeeping veto the one thing
+    #        this job exists to do. Step 8 refuses the session instead, and the reason
+    #        reaches the email so the missing line is explained rather than mysterious.
+    from signals.dividends import ingest as ingest_dividends
+
+    with step("3c refresh distributions from yfinance (retry loop)", logger):
+        div_attempt = 0
+        div_report: dict = {"ok": False, "as_of": None, "failed": "not attempted"}
+        while True:
+            div_attempt += 1
+            try:
+                div_report = ingest_dividends(UNIVERSE)
+                logger.info(
+                    "distributions refreshed on attempt %d: %s across %s ticker(s)",
+                    div_attempt,
+                    div_report.get("distributions"),
+                    div_report.get("tickers"),
+                )
+                break
+            except Exception as exc:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    div_report = {
+                        "ok": False,
+                        "as_of": None,
+                        "failed": (
+                            f"{type(exc).__name__}: {exc} after {div_attempt} "
+                            f"attempt(s)"
+                        ),
+                    }
+                    logger.error(
+                        "distribution refresh failed after %d attempt(s): %s -- the "
+                        "sleeve P&L for this session will be refused rather than "
+                        "booking a missing payout as a price loss",
+                        div_attempt, exc,
+                    )
+                    break
+                wait = min(RETRY_INTERVAL_SECS, remaining)
+                logger.warning(
+                    "distribution refresh attempt %d failed (%s: %s) -- retrying in "
+                    "%.0fs",
+                    div_attempt, type(exc).__name__, exc, wait,
+                )
+                time.sleep(wait)
+
+    if not div_report.get("ok"):
+        summary.extra.append(
+            f"Distributions not refreshed: {div_report.get('failed')}"
+        )
 
     # What the hole repair filled during ingest, if anything. surfacing it here is
     # the point of the daily email: a fill is a silent data change otherwise.

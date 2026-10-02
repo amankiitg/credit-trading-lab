@@ -2,6 +2,11 @@ venv/
 __pycache__/
 data/*.csv
 
+# Written by signals.dividends.ingest: the date the distribution cache was refreshed.
+# It changes every session, and a container with no marker is correctly read as never
+# refreshed here rather than as fresh.
+data/raw/dividends_as_of.json
+
 # credentials -- never commit
 .env
 .env.*

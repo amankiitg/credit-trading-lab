@@ -275,8 +275,12 @@ def test_a_single_session_has_no_previous_one() -> None:
 # ------------------------------------------------------------------ the write path
 
 
-def _stub_session(monkeypatch, *, positions):
-    """Stub the two readers and capture writes. No database, no data files."""
+def _stub_session(monkeypatch, *, positions, dividends_as_of_value=TRADE_DATE):
+    """Stub the readers and capture writes. No database, no data files.
+
+    `dividends_as_of_value` is the refresh date the cache reports; the default is the
+    session's own date, which is fresh.
+    """
     import dashboard.supabase_client as sb
     import signals.dividends as div_mod
     import signals.etf_universe as etf
@@ -294,6 +298,9 @@ def _stub_session(monkeypatch, *, positions):
         lambda tickers, close_index, **k: pd.DataFrame(
             {t: [0.0, DIVIDENDS[t]] for t in DIVIDENDS}, index=index
         ),
+    )
+    monkeypatch.setattr(
+        div_mod, "dividends_as_of", lambda raw_dir=None: dividends_as_of_value
     )
     monkeypatch.setattr(sb, "fetch_position_snapshot", lambda d: list(positions))
     monkeypatch.setattr(
@@ -508,3 +515,138 @@ def test_the_session_date_is_the_close_date_not_the_wall_clock() -> None:
     result = _compute()
     assert {row["trade_date"] for row in result.rows} == {TRADE_DATE}
     assert TRADE_DATE != PRIOR_DATE
+
+
+# ------------------------------------------------------------------ the ex-date offset
+
+
+def test_an_ex_date_reads_as_roughly_zero_for_a_long() -> None:
+    """Why the price leg uses the unadjusted close and why a carry leg exists at all.
+
+    On an ex-date of $1.00 the unadjusted close drops by about $1.00. On 10 shares that
+    is -$10 of price and +$10 of carry, so the position's session is flat: the holder
+    was paid, not damaged. A decomposition that saw only the price leg would book a loss
+    that never happened, which is exactly what a stale distribution cache produced.
+    """
+    result = compute_sleeve_pnl(
+        trade_date=TRADE_DATE,
+        prior_date=PRIOR_DATE,
+        positions=[{"ticker": "HYG", "shares": 10}],
+        close_prev={"HYG": 100.0},
+        close_now={"HYG": 99.0},
+        dividends={"HYG": 1.0},
+    )
+
+    assert result.status == STATUS_OK, result.reason
+    credit = next(row for row in result.rows if row["sleeve"] == "credit")
+    assert credit["price_pnl"] == pytest.approx(-10.0)
+    assert credit["carry_pnl"] == pytest.approx(10.0)
+    assert credit["total"] == pytest.approx(0.0)
+    assert result.book_gross_pnl == pytest.approx(0.0)
+
+
+def test_an_ex_date_reads_as_roughly_zero_for_a_short() -> None:
+    """The same day from the other side: the short pays the distribution.
+
+    A short in a name that goes ex is not a windfall. The price leg gains the amount
+    the close dropped and the carry leg gives it back, and both signs matter.
+    """
+    result = compute_sleeve_pnl(
+        trade_date=TRADE_DATE,
+        prior_date=PRIOR_DATE,
+        positions=[{"ticker": "HYG", "shares": -10}],
+        close_prev={"HYG": 100.0},
+        close_now={"HYG": 99.0},
+        dividends={"HYG": 1.0},
+    )
+
+    credit = next(row for row in result.rows if row["sleeve"] == "credit")
+    assert credit["price_pnl"] == pytest.approx(10.0)
+    assert credit["carry_pnl"] == pytest.approx(-10.0)
+    assert credit["total"] == pytest.approx(0.0)
+
+
+def test_a_realistic_ex_date_offsets_rather_than_cancels() -> None:
+    """The close does not drop by exactly the distribution, so the legs roughly offset.
+
+    A $1.00 distribution on a $100 close that drops $0.98 leaves $0.20 on 10 shares: 2%
+    of the distribution, which is the carry leg explaining nearly all of the move.
+    """
+    result = compute_sleeve_pnl(
+        trade_date=TRADE_DATE,
+        prior_date=PRIOR_DATE,
+        positions=[{"ticker": "HYG", "shares": 10}],
+        close_prev={"HYG": 100.0},
+        close_now={"HYG": 99.02},
+        dividends={"HYG": 1.0},
+    )
+
+    credit = next(row for row in result.rows if row["sleeve"] == "credit")
+    distribution = 10.0
+    assert abs(credit["total"]) <= 0.05 * distribution, (
+        "the residual must be small against the distribution, not the same size as it"
+    )
+
+
+def test_without_the_distribution_the_same_day_reads_as_a_fake_price_loss() -> None:
+    """The negative control for the two tests above.
+
+    This is the bug: the close drops, no carry is recorded, and a flat session is
+    reported as a $10 loss. It is why a cache that cannot vouch for the session refuses
+    it instead of computing it.
+    """
+    result = compute_sleeve_pnl(
+        trade_date=TRADE_DATE,
+        prior_date=PRIOR_DATE,
+        positions=[{"ticker": "HYG", "shares": 10}],
+        close_prev={"HYG": 100.0},
+        close_now={"HYG": 99.0},
+        dividends={},
+    )
+
+    credit = next(row for row in result.rows if row["sleeve"] == "credit")
+    assert credit["carry_pnl"] == 0.0
+    assert credit["total"] == pytest.approx(-10.0)
+
+
+# ------------------------------------------------------------------ distribution freshness
+
+
+def test_a_distribution_cache_older_than_the_session_refuses_it(monkeypatch) -> None:
+    """A cache that predates the session cannot vouch for its payouts."""
+    written = _stub_session(
+        monkeypatch, positions=POSITIONS, dividends_as_of_value=PRIOR_DATE
+    )
+
+    report = record_daily_sleeve_pnl(as_of_date=TRADE_DATE)
+
+    assert report["written"] is False
+    assert report["status"] == STATUS_UNCOMPARABLE
+    assert f"last refreshed on {PRIOR_DATE}" in report["reason"]
+    assert "read as a price loss" in report["reason"]
+    assert written == []
+
+
+def test_an_unrecorded_refresh_date_refuses_the_session(monkeypatch) -> None:
+    """Never refreshed is not fresh: a fresh container has the committed cache and no
+    marker, and its coverage is unknown."""
+    written = _stub_session(
+        monkeypatch, positions=POSITIONS, dividends_as_of_value=None
+    )
+
+    report = record_daily_sleeve_pnl(as_of_date=TRADE_DATE)
+
+    assert report["written"] is False
+    assert report["status"] == STATUS_UNCOMPARABLE
+    assert "never refreshed" in report["reason"]
+    assert written == []
+
+
+def test_a_cache_refreshed_for_the_session_computes_it(monkeypatch) -> None:
+    """Negative control for the two refusals: a current cache computes normally."""
+    written = _stub_session(monkeypatch, positions=POSITIONS)
+
+    report = record_daily_sleeve_pnl(as_of_date=TRADE_DATE)
+
+    assert report["written"] is True, report
+    assert len(written) == 4

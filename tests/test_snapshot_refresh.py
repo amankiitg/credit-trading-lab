@@ -173,7 +173,7 @@ def test_an_empty_book_still_writes_live_nav(monkeypatch) -> None:
 # ------------------------------------------------------------------ fix 2: the wiring
 
 def test_run_signal_refreshes_the_basis_after_writing_the_signal(
-    monkeypatch, no_real_email
+    monkeypatch, no_real_email, no_dividend_fetch
 ) -> None:
     """The post-close refresh is what keeps the proposal's basis at most a day old.
 
@@ -207,6 +207,7 @@ def test_run_signal_refreshes_the_basis_after_writing_the_signal(
     monkeypatch.setattr(sb, "write_decision", lambda d, dec: True)
 
     called: list = []
+
     monkeypatch.setattr(
         snap, "refresh_snapshot",
         lambda **kw: called.append(kw) or {
@@ -228,7 +229,7 @@ def test_run_signal_refreshes_the_basis_after_writing_the_signal(
 
 
 def test_run_signal_escalates_the_subject_when_the_refresh_fails(
-    monkeypatch, no_real_email
+    monkeypatch, no_real_email, no_dividend_fetch
 ) -> None:
     """Both jobs must show a failed basis refresh in the subject, not only the body."""
     import numpy as np

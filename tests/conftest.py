@@ -30,3 +30,26 @@ def no_real_email(monkeypatch) -> list:
 
     monkeypatch.setattr(alerts, "send_alert_email", _spy)
     return sent
+
+
+@pytest.fixture
+def no_dividend_fetch(monkeypatch) -> dict:
+    """Keep the signal job's distribution refresh off the network.
+
+    The job refreshes distributions alongside closes, so any test that drives
+    `run_signal.main()` to step 3c would otherwise reach Yahoo. The returned dict is
+    the report shape `signals.dividends.ingest` produces, so a test can read the
+    refresh date it recorded.
+    """
+    import signals.dividends as div
+
+    from datetime import date
+
+    report = {
+        "ok": True,
+        "tickers": 8,
+        "distributions": 0,
+        "as_of": date.today().isoformat(),
+    }
+    monkeypatch.setattr(div, "ingest", lambda *a, **k: dict(report))
+    return report

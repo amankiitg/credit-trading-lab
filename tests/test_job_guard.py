@@ -232,11 +232,16 @@ def test_step_budget_restores_the_job_deadline() -> None:
     )
 
 
-def test_signal_job_skips_an_over_budget_advisory_overlay(monkeypatch, caplog) -> None:
+def test_signal_job_skips_an_over_budget_advisory_overlay(
+    monkeypatch, caplog, no_dividend_fetch
+) -> None:
     """The advisory overlay must never stop the run from writing a fresh signal.
 
     The v9.1 stop ladder is display-only (its gate was REJECTED, weights are never
     modified), so an over-budget or broken overlay has to be skipped, not fatal.
+
+    `no_dividend_fetch` is required because this test runs the job all the way to the
+    end: without it the distribution refresh at step 3c would reach Yahoo from a test.
     """
     import execution.calendar_utils as cal
     import risk.stop_loss as sl

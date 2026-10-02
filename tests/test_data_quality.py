@@ -140,7 +140,9 @@ def test_the_2026_09_24_gap_shape_is_caught() -> None:
 
 # ---------------------------------------------------------------- job level
 
-def test_signal_job_refuses_to_write_when_the_gate_fails(monkeypatch, caplog) -> None:
+def test_signal_job_refuses_to_write_when_the_gate_fails(
+    monkeypatch, caplog, no_dividend_fetch
+) -> None:
     """The whole point: a bad matrix must not reach Supabase.
 
     Task item 3: log which ticker and date, and exit non-zero.

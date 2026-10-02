@@ -38,6 +38,14 @@ A day that cannot be computed is refused rather than zero-filled: no position sn
 for the previous session (the first day, and any day after a run that never wrote one),
 an instrument with no share count in that snapshot, no sleeve mapping, or no close on
 either side. A missing input is not a flat day.
+
+The distribution cache is a refusal of its own kind. A payout that was never fetched is
+invisible in the data -- a ticker that paid nothing and a ticker that was never asked
+are the same empty rows -- while the unadjusted close still drops on the ex-date, so a
+missing distribution would be booked as a price loss that never happened. The cache
+records the date it was last refreshed and a session is only computed when that date
+reaches the session being measured. That check is what makes the carry leg trustworthy
+rather than merely present.
 """
 
 from __future__ import annotations
@@ -306,7 +314,7 @@ def record_daily_sleeve_pnl(*, as_of_date: str, log=None) -> dict:
             fetch_position_snapshot,
             write_daily_sleeve_pnl,
         )
-        from signals.dividends import load_dividend_matrix
+        from signals.dividends import dividends_as_of, load_dividend_matrix
         from signals.etf_universe import UNIVERSE, load_universe_close
 
         close = load_universe_close(UNIVERSE, column="close")
@@ -314,6 +322,24 @@ def record_daily_sleeve_pnl(*, as_of_date: str, log=None) -> dict:
         if as_of_date not in sessions:
             report["status"] = STATUS_UNCOMPARABLE
             report["reason"] = f"the close cache has no row for {as_of_date}"
+            log.info("sleeve P&L not computed: %s", report["reason"])
+            return report
+
+        # The cache must be at least as new as the session being measured. Only the
+        # recorded refresh date can say so: the data cannot, because a ticker that paid
+        # nothing and a ticker that was never fetched are both empty rows, while the
+        # unadjusted close drops on the ex-date either way.
+        cached_as_of = dividends_as_of()
+        if cached_as_of is None or cached_as_of < as_of_date:
+            refreshed = (
+                "never refreshed" if cached_as_of is None
+                else f"last refreshed on {cached_as_of}"
+            )
+            report["status"] = STATUS_UNCOMPARABLE
+            report["reason"] = (
+                f"the distribution cache was {refreshed}, before {as_of_date}: a payout "
+                f"in this session could be missing and would read as a price loss"
+            )
             log.info("sleeve P&L not computed: %s", report["reason"])
             return report
 

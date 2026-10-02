@@ -77,6 +77,10 @@ class RunSummary:
     basis_nav: float | None = None
     basis_skipped: str | None = None
     basis_failed: str | None = None
+    # The session's book P&L decomposed by sleeve and into carry vs price. Written only
+    # when the four sleeves reconciled to the whole-book total.
+    sleeve_pnl: dict | None = None
+    sleeve_pnl_note: str | None = None
     extra: list[str] = field(default_factory=list)
 
     def mark_skip(self, reason: str) -> None:
@@ -98,6 +102,34 @@ class RunSummary:
             return
         self.basis_positions = report.get("tickers")
         self.basis_nav = report.get("nav")
+
+    def record_sleeve_pnl(self, report: dict) -> None:
+        """Record the day's sleeve decomposition, or why there is not one.
+
+        Three outcomes and they read differently on purpose. A written day carries its
+        numbers. A day with no prior snapshot is not computed, which is the expected
+        state on the first run and on any day after a run that wrote no snapshot, and
+        is not a failure. A day whose sleeves did not reconcile, or whose write was
+        rejected, is FAILED: those are real problems and the numbers are missing
+        rather than absent by construction.
+        """
+        if report.get("written"):
+            self.sleeve_pnl = {
+                "trade_date": report.get("trade_date"),
+                "prior_date": report.get("prior_date"),
+                "sleeves": report.get("sleeves") or {},
+                "carry": 0.0 if report.get("carry_total") is None else report["carry_total"],
+                "price": 0.0 if report.get("price_total") is None else report["price_total"],
+                "book": 0.0 if report.get("book_gross_pnl") is None else report["book_gross_pnl"],
+            }
+            return
+
+        status = report.get("status")
+        reason = report.get("reason") or "no reason recorded"
+        if status in ("mismatch", "write_failed", "error"):
+            self.sleeve_pnl_note = f"Sleeve P&L FAILED ({status}): {reason}"
+        else:
+            self.sleeve_pnl_note = f"Sleeve P&L: not computed ({reason})"
 
 
 # Severity order for the subject line. A failed basis refresh lifts a clean run to
@@ -188,6 +220,24 @@ def body_for(summary: RunSummary, last_step: str | None = None) -> str:
         )
     if summary.turnover_cost is not None:
         lines.append(f"Turnover cost today: ${summary.turnover_cost:,.2f}")
+
+    # The session's P&L split by sleeve and into carry vs price, on the book held at the
+    # previous close. Distinct from the Book P&L line above, which is the raw equity
+    # move and includes intraday marks and the trades themselves.
+    if summary.sleeve_pnl is not None:
+        sleeves = ", ".join(
+            f"{name} ${value:+,.2f}"
+            for name, value in summary.sleeve_pnl["sleeves"].items()
+        )
+        lines.append(
+            f"Sleeve P&L {summary.sleeve_pnl['trade_date']} on the "
+            f"{summary.sleeve_pnl['prior_date']} book: {sleeves}; "
+            f"carry ${summary.sleeve_pnl['carry']:+,.2f}, "
+            f"price ${summary.sleeve_pnl['price']:+,.2f}, "
+            f"book ${summary.sleeve_pnl['book']:+,.2f}"
+        )
+    elif summary.sleeve_pnl_note:
+        lines.append(summary.sleeve_pnl_note)
 
     lines.append(
         f"Orders: {len(summary.filled)} filled, {len(summary.skipped)} skipped, "

@@ -11,6 +11,8 @@ What it does:
   4. Run v8.2 signal pipeline to compute proposed weights.
   5. Write decision='proposed' to Supabase decisions table for as_of_date.
   6. Record the completed run in cron_runs.
+  7. Refresh the cached position snapshot and live_nav from Alpaca.
+  8. Decompose the session's book P&L by sleeve and into carry vs price.
 
 Every step logs begin and done, and the whole job runs under a hard deadline
 (execution/job_guard.py), so a hang is both locatable in the log and impossible
@@ -59,6 +61,12 @@ SIGNAL_JOB_MAX_SECS: float = float(
 # be able to stop the run from writing a fresh signal. Override with
 # OVERLAY_MAX_SECS.
 OVERLAY_MAX_SECS: float = float(os.environ.get("OVERLAY_MAX_SECS", "120"))
+
+# Budget for the daily sleeve P&L decomposition. It reads the previous session's
+# snapshot and the local price cache and writes its own table; it can never change the
+# signal, so it gets a bound of its own rather than a share of the job's remaining time.
+# Override with SLEEVE_PNL_MAX_SECS.
+SLEEVE_PNL_MAX_SECS: float = float(os.environ.get("SLEEVE_PNL_MAX_SECS", "120"))
 
 
 def main(max_secs: float | None = None) -> int:
@@ -312,7 +320,18 @@ def _run(summary: RunSummary) -> int:
     summary.record_basis_refresh(refresh)
     if refresh.get("failed"):
         logger.warning("snapshot refresh failed: %s", refresh.get("skipped"))
+    # -- 8. Daily sleeve P&L: this session's book P&L split into the four sleeves and,
+    #        inside each, carry vs price. It belongs here rather than in the execution
+    #        job because only this job runs after the close: at 14:30 UTC the session's
+    #        closing price does not exist yet, and this decomposition is defined on
+    #        closes. Bookkeeping like the refresh above: it reports what it did, writes
+    #        nothing unless the sleeves reconcile, and can never fail the run.
+    from risk.sleeve_pnl import record_daily_sleeve_pnl
 
+    with step("8 daily sleeve P&L (carry vs price)", logger):
+        with step_budget(SLEEVE_PNL_MAX_SECS, logger):
+            sleeve_report = record_daily_sleeve_pnl(as_of_date=as_of_date, log=logger)
+    summary.record_sleeve_pnl(sleeve_report)
     logger.info("run_signal complete for %s", today)
     return 0
 

@@ -18,6 +18,14 @@ Tables (created by the user in the Supabase dashboard):
              -- and the account's equity at that run is live_nav. Both are null on
              -- rows written before sprint v9.7.
 
+  daily_sleeve_pnl (trade_date text, sleeve text, price_pnl float8, carry_pnl float8,
+              total float8, book_total float8, created_at timestamptz,
+              PRIMARY KEY (trade_date, sleeve))
+             -- one row per session and sleeve, written by the signal cron (v9.8).
+             -- trade_date here is the session the P&L belongs to, measured on the
+             -- book held at the previous close, and is not necessarily the run date.
+             -- The four rows of a session sum to book_total, which is the gate.
+
 Reads SUPABASE_URL and SUPABASE_SECRET_KEY from the environment (.env).
 The URL stored in .env includes the /rest/v1/ suffix; this module strips it
 before constructing the client (create_client needs the project root URL).
@@ -139,6 +147,31 @@ def fetch_positions(latest_only: bool = True) -> list[dict]:
             )
         return resp.data or []
     except Exception:
+        return []
+
+
+def fetch_position_snapshot(trade_date: str) -> list[dict]:
+    """Every position row for one trade_date, or [] when there is none.
+
+    The sleeve decomposition needs the book as it stood at a specific session's close
+    rather than the latest one: the latest snapshot for a session is rewritten by the
+    signal run that asks for it, which is that session's closing book, not the book
+    that was held into it.
+    """
+    client = get_supabase_client()
+    if client is None:
+        return []
+    try:
+        resp = (
+            client.table("positions")
+            .select("*")
+            .eq("trade_date", trade_date)
+            .order("ticker")
+            .execute()
+        )
+        return resp.data or []
+    except Exception as exc:
+        _log.error("fetch_position_snapshot(%s) failed: %s", trade_date, exc)
         return []
 
 
@@ -393,3 +426,47 @@ def fetch_last_cron_run(job_name: str) -> dict | None:
     except Exception as exc:
         _log.error("fetch_last_cron_run(%s) failed: %s", job_name, exc)
         return None
+
+
+# ---------------------------------------------------------------- daily sleeve P&L (v9.8)
+
+def write_daily_sleeve_pnl(rows: list[dict]) -> bool:
+    """Upsert one session's sleeve rows. PK is (trade_date, sleeve), so a re-run of
+    the same session overwrites rather than duplicating it.
+
+    Only ever called with rows that passed the reconciliation gate: the caller writes
+    nothing at all for a session that did not reconcile.
+    """
+    client = get_supabase_client()
+    if client is None or not rows:
+        return False
+    try:
+        client.table("daily_sleeve_pnl").upsert(rows).execute()
+        return True
+    except Exception as exc:
+        _log.error("write_daily_sleeve_pnl failed: %s", exc)
+        return False
+
+
+def fetch_daily_sleeve_pnl(limit: int = 2000) -> list[dict]:
+    """Sleeve P&L rows, newest first. Four rows per session.
+
+    2000 rows is 500 sessions, which is more than the table will hold for a while; the
+    dashboard's chart needs the whole history rather than a window, so the limit is
+    only a guard against an unbounded read.
+    """
+    client = get_supabase_client()
+    if client is None:
+        return []
+    try:
+        resp = (
+            client.table("daily_sleeve_pnl")
+            .select("*")
+            .order("trade_date", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return resp.data or []
+    except Exception as exc:
+        _log.error("fetch_daily_sleeve_pnl failed: %s", exc)
+        return []

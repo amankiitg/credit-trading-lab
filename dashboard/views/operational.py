@@ -8,6 +8,7 @@ number with no reference point cannot be read.
          The only interactive panel; the cron reads the same decisions row.
   Exposure  Net and gross/leverage for the live book against the stored target.
   K      Account value over time, and turnover cost per run on its own chart.
+  L      The book's P&L by sleeve, carry versus price, since the first recorded day.
   M-A    Share of the book's total volatility, by sleeve.
   M-B    The run's three dollars: book P&L, turnover cost, fill-day mark by sleeve.
 
@@ -33,6 +34,7 @@ import pandas as pd
 import streamlit as st
 
 from dashboard.supabase_client import (
+    fetch_daily_sleeve_pnl,
     fetch_decision_for_date,
     fetch_last_cron_run,
     fetch_live_attribution,
@@ -277,6 +279,16 @@ def _get_pnl_log() -> list[dict]:
 def _get_live_attribution(limit: int) -> list[dict]:
     """Live attribution rows, newest first. `limit` is part of the cache key."""
     return fetch_live_attribution(limit=limit)
+
+
+@st.cache_data(ttl=300)
+def _get_daily_sleeve_pnl() -> list[dict]:
+    """Sleeve P&L rows, four per session, newest first.
+
+    The whole history rather than a window: the chart is cumulative, so dropping the
+    earliest sessions would change what the line says, not just how far back it draws.
+    """
+    return fetch_daily_sleeve_pnl()
 
 
 @st.cache_data(ttl=60)
@@ -929,6 +941,98 @@ def render(
         )
     else:
         st.info("No turnover-cost rows yet -- the cost chart appears after the first run.")
+
+    st.markdown("---")
+
+    # ================================================================
+    # Panel L -- the book's P&L by sleeve, carry vs price
+    #
+    # Written by the signal cron, because it is the only job that runs after the close.
+    # One row per sleeve per session, each carrying the session's book total, so the
+    # reconciliation (the four sleeves sum to the book) is checkable from the table
+    # itself and is restated in the caption below rather than taken on trust.
+    # ================================================================
+    st.markdown("### L - Book P&L by sleeve (carry vs price)")
+
+    sleeve_rows = _get_daily_sleeve_pnl()
+    if sleeve_rows:
+        import matplotlib.pyplot as plt
+        import numpy as np
+        from matplotlib.lines import Line2D
+        from matplotlib.patches import Patch
+
+        df_sleeve = pd.DataFrame(sleeve_rows)
+        df_sleeve = df_sleeve[df_sleeve["sleeve"].isin(SLEEVE_ORDER)]
+        sessions = sorted(df_sleeve["trade_date"].unique())
+
+        def _band(column: str) -> pd.DataFrame:
+            wide = df_sleeve.pivot_table(
+                index="trade_date", columns="sleeve", values=column, aggfunc="sum"
+            )
+            return wide.reindex(index=sessions, columns=list(SLEEVE_ORDER)).fillna(0.0)
+
+        price_cum = _band("price_pnl").cumsum()
+        carry_cum = _band("carry_pnl").cumsum()
+        book_cum = (
+            df_sleeve.groupby("trade_date")["book_total"].first()
+            .reindex(sessions)
+            .fillna(0.0)
+            .cumsum()
+        )
+
+        st.markdown(
+            "**Book P&L by sleeve.** Where the account's result came from: each band is "
+            "one sleeve's contribution to the book's P&L since the first recorded "
+            "session, stacked, and the black line is the book's total."
+        )
+
+        xs = pd.to_datetime(list(price_cum.index))
+        fig, ax = plt.subplots(figsize=(14, 4))
+        stack = np.zeros(len(xs))
+        for sleeve in SLEEVE_ORDER:
+            colour = SLEEVE_COLORS[sleeve]
+            price = price_cum[sleeve].to_numpy(dtype="float64")
+            ax.fill_between(xs, stack, stack + price, color=colour, alpha=0.85,
+                            linewidth=0)
+            stack = stack + price
+            carry = carry_cum[sleeve].to_numpy(dtype="float64")
+            ax.fill_between(xs, stack, stack + carry, color=colour, alpha=0.45,
+                            hatch=SHORT_HATCH, edgecolor="white", linewidth=0)
+            stack = stack + carry
+
+        total = book_cum.to_numpy(dtype="float64")
+        ax.plot(xs, total, color="black", lw=1.6)
+        ax.axhline(0, color="black", lw=0.6)
+        ax.set_ylabel("cumulative P&L, $")
+        ax.set_title("Book P&L by sleeve: carry and price, stacked")
+        ax.grid(alpha=0.2)
+        handles = [
+            Patch(facecolor=SLEEVE_COLORS[s], label=s.capitalize()) for s in SLEEVE_ORDER
+        ]
+        handles.append(Line2D([0], [0], color="black", lw=1.6, label="Book total"))
+        ax.legend(handles=handles, fontsize=8, loc="upper left")
+        fig.tight_layout()
+        st.pyplot(fig, width="stretch")
+        plt.close(fig)
+
+        gap = float(total[-1] - stack[-1]) if len(total) else 0.0
+        st.caption(
+            f"Solid band = price move, hatched band = distributions received (carry). "
+            f"Measured on the book held at the previous close, so a trade contributes "
+            f"from the session after it. The four sleeves sum to the book total to "
+            f"within ${abs(gap):,.6f} over {len(sessions)} session(s), which is the "
+            f"gate the writer applies before storing a session at all."
+        )
+        if float(df_sleeve["carry_pnl"].abs().sum()) == 0.0:
+            st.caption(
+                "Carry is $0.00 in every recorded session: no distribution is recorded "
+                "for those dates."
+            )
+    else:
+        st.info(
+            "No sleeve P&L recorded yet. The signal cron writes one row per sleeve per "
+            "session, so this fills from its next run."
+        )
 
     st.markdown("---")
 

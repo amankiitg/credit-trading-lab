@@ -72,21 +72,32 @@ def ingest(
 def load_universe_close(
     tickers: list[str] = UNIVERSE,
     raw_dir: Path = RAW_DIR,
+    column: str = "adj_close",
 ) -> pd.DataFrame:
-    """Outer-joined adj_close matrix, date x ticker.
+    """Outer-joined close matrix, date x ticker.
 
     Outer join is deliberate: staggered inception (e.g. GLD from 2004,
     SPY from 1993) is preserved as leading NaN per column, rather than
     truncated to the latest common start date. This is what makes the
     point-in-time universe-membership check meaningful downstream.
+
+    `column` defaults to adj_close, which is what the signal and every backtest
+    read. Pass "close" for the unadjusted series: adj_close is back-adjusted, so a
+    price difference between two adjusted closes already contains the distributions
+    paid in between, and a separate carry leg added to it would count them twice.
+    The dividend decomposition in risk/sleeve_pnl.py needs the raw series for the
+    price leg for exactly that reason.
     """
+    if column not in ("adj_close", "close"):
+        raise ValueError(f"column must be 'adj_close' or 'close', got {column!r}")
+
     frames = []
     for t in tickers:
         path = raw_dir / f"{t}.parquet"
         if not path.exists():
             raise FileNotFoundError(f"{path} missing -- run etf_universe.ingest() first")
         df = pd.read_parquet(path)
-        frames.append(df[["adj_close"]].rename(columns={"adj_close": t}))
+        frames.append(df[[column]].rename(columns={column: t}))
     merged = pd.concat(frames, axis=1, join="outer").sort_index()
     merged.index.name = "date"
     return merged

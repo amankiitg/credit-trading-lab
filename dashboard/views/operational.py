@@ -71,7 +71,9 @@ LONG_SHORT_NOTE = "solid = long, hatched = short"
 
 # Reference points, from the spec. Display thresholds only, not enforced limits:
 # the execution layer's own limits are G_MAX_DEFAULT (gross) and the delta band.
-NET_BAND_PCT = 5.0        # |net| above 5% of NAV is off target
+# The band around the signal's target net, in percentage points of NAV. Not a band
+# around zero: this is a per-asset trend book, so net is the sum of independent calls.
+NET_BAND_PP = 5.0         # net more than this far from its target is off target
 GROSS_FLAG_X = 2.05       # above this is a mark-to-market overshoot between runs
 GROSS_FLOOR_X = 1.80      # the floor observed across the recorded snapshots
 RISK_TICKER_FLAG_PCT = 40.0   # one position above 40% of book risk is concentration
@@ -212,6 +214,39 @@ def _fill_for(signed: float | None) -> str | None:
     if signed is None:
         return None
     return SHORT_HATCH if float(signed) < 0 else None
+
+
+def net_flag(net_pct: float, target_net_pct: float) -> str | None:
+    """The net leg's flag sentence, or None when it sits inside its band.
+
+    The band is around the signal's target, not around zero. This is a per-asset trend
+    book: each name takes its own long or short call, so net is whatever those eight
+    calls add up to and drifts as prices move. A book at -51% net is not a breach of
+    anything if the signal asked for -53%; it is only off target to the extent it has
+    moved away from what was asked for. Measured in percentage points of NAV.
+    """
+    gap_pp = net_pct - target_net_pct
+    if abs(gap_pp) <= NET_BAND_PP:
+        return None
+    return (
+        f"net is {net_pct:+.1f}% of NAV against a target of {target_net_pct:+.1f}%, "
+        f"{gap_pp:+.1f}pp outside the +/-{NET_BAND_PP:.0f}pp band"
+    )
+
+
+def gross_flag(gross_x: float) -> str | None:
+    """The gross leg's flag sentence, or None. Measured against 2.0x, unchanged.
+
+    The signal caps gross at G_MAX_DEFAULT (2.0x) when it sizes, so this is the one
+    quantity here that does have an intended level rather than a target it may roam
+    around: above the mark means the book has drifted over the cap since the snapshot,
+    below the floor means it is running materially smaller than intended.
+    """
+    if gross_x > GROSS_FLAG_X:
+        return f"gross is {gross_x:.2f}x, above the {GROSS_FLAG_X:.2f}x overshoot mark"
+    if gross_x < GROSS_FLOOR_X:
+        return f"gross is {gross_x:.2f}x, below the {GROSS_FLOOR_X:.2f}x floor"
+    return None
 
 
 def _fmt_dollars(value: float | None) -> str:
@@ -768,9 +803,9 @@ def render(
     #
     # I and J each computed sum(|signed_notional|) / NAV, so the same number was on
     # screen twice under two names. Gross exposure IS leverage: one quantity, one
-    # place. What is worth showing is the pair that says different things, net (how
-    # directional the book is) and gross (how big it is), each against the stored
-    # target rather than against nothing.
+    # place. What is worth showing is the pair that says different things, net (the sum
+    # of the individual calls, which is not targeted at zero) and gross (how big the
+    # book is), each against the stored target rather than against nothing.
     # ================================================================
     st.markdown("### Exposure - current vs target")
 
@@ -778,16 +813,19 @@ def render(
     from signals.trend_signal import G_MAX_DEFAULT
 
     snapshot_date = str(positions_data[0].get("trade_date", "—")) if positions_data else "—"
-    net_usd = sum(float(p.get("signed_notional") or 0.0) for p in positions_data)
-    gross_usd = sum(abs(float(p.get("signed_notional") or 0.0)) for p in positions_data)
+    notionals = [float(p.get("signed_notional") or 0.0) for p in positions_data]
+    net_usd = sum(notionals)
+    gross_usd = sum(abs(n) for n in notionals)
     net_pct = net_usd / nav * 100 if nav else 0.0
     gross_x = gross_usd / nav if nav else 0.0
+    longs = sum(1 for n in notionals if n > 0)
+    shorts = sum(1 for n in notionals if n < 0)
     target_net_pct = sum(float(r.get("target wt") or 0.0) for r in proposed_rows) * 100
     target_gross_x = sum(abs(float(r.get("target wt") or 0.0)) for r in proposed_rows)
 
     st.markdown(
-        f"Long/short book. **Net near zero is the intent** (no directional bet); "
-        f"**gross near {float(G_MAX_DEFAULT):.2f}x NAV is the intent** (full deployment). "
+        f"**Net is the sum of each asset's trend call. It is not targeted at zero.** "
+        f"Gross is the size of the book, aimed near {float(G_MAX_DEFAULT):.2f}x NAV. "
         f"Current: net {net_pct:+.1f}% of NAV vs target {target_net_pct:+.1f}%; "
         f"gross {gross_x:.2f}x vs target {target_gross_x:.2f}x. "
         f"Snapshot {snapshot_date}."
@@ -807,32 +845,28 @@ def render(
         delta_color="off",
     )
 
-    off_target: list[str] = []
-    if abs(net_pct) > NET_BAND_PCT:
-        off_target.append(
-            f"net is {net_pct:+.1f}% of NAV, outside the +/-{NET_BAND_PCT:.0f}% band"
-        )
-    if gross_x > GROSS_FLAG_X:
-        off_target.append(
-            f"gross is {gross_x:.2f}x, above the {GROSS_FLAG_X:.2f}x overshoot mark"
-        )
-    if gross_x < GROSS_FLOOR_X:
-        off_target.append(
-            f"gross is {gross_x:.2f}x, below the {GROSS_FLOOR_X:.2f}x floor"
-        )
+    st.markdown(f"**{longs} long, {shorts} short.**")
+
+    off_target = [
+        message
+        for message in (net_flag(net_pct, target_net_pct), gross_flag(gross_x))
+        if message
+    ]
     if off_target:
         st.error("Off target: " + "; ".join(off_target) + ".")
     else:
         st.success(
-            f"On target: net {net_pct:+.1f}% of NAV (band +/-{NET_BAND_PCT:.0f}%), "
+            f"On target: net {net_pct:+.1f}% of NAV against a target of "
+            f"{target_net_pct:+.1f}% (band +/-{NET_BAND_PP:.0f}pp); "
             f"gross {gross_x:.2f}x (floor {GROSS_FLOOR_X:.2f}x, "
             f"overshoot mark {GROSS_FLAG_X:.2f}x)."
         )
 
     st.caption(
-        f"{len(positions_data)} positions, market values as of the {snapshot_date} "
-        f"snapshot. The target is the signal weights stored for {as_of_date}. "
-        f"Leverage is the same number as gross: exposure per dollar of equity."
+        f"Market values as of the {snapshot_date} snapshot; the target is the signal "
+        f"weights stored for {as_of_date}. Net is not a target of its own: it is "
+        f"whatever the individual calls add up to. Leverage is the same number as "
+        f"gross: exposure per dollar of equity."
     )
 
     if positions_data:

@@ -382,7 +382,7 @@ def _run(summary: RunSummary) -> int:
         logger.warning("snapshot refresh failed: %s", refresh.get("skipped"))
     # -- 8. Daily sleeve P&L: this session's book P&L split into the four sleeves and,
     #        inside each, carry vs price. It belongs here rather than in the execution
-    #        job because only this job runs after the close: at 14:30 UTC the session's
+    #        job because only this job runs after the close: at 10:31 ET the session's
     #        closing price does not exist yet, and this decomposition is defined on
     #        closes. Bookkeeping like the refresh above: it reports what it did, writes
     #        nothing unless the sleeves reconcile, and can never fail the run.

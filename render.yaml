@@ -7,8 +7,13 @@
 #
 # UTC cron schedules and DST:
 #   Signal cron  "30 21 * * 1-5" = 17:30 EDT / 16:30 EST (both after 16:00 ET close)
-#   Exec cron    "30 14 * * 1-5" = 10:30 EDT / 09:30 EST (both in clean execution window)
-#   Render cron is UTC; the UTC schedule is DST-correct without runtime logic.
+#   Exec cron    "31 14,15 * * 1-5" = two firings a day, because UTC cannot express
+#                "10:31 in New York": 14:31 UTC is 10:31 EDT but 09:31 EST, and 15:31
+#                UTC is 11:31 EDT but 10:31 EST. run_execution.py keeps the firing that
+#                falls in the 10:20-10:45 ET window and exits immediately on the other,
+#                so the book trades at the same New York time all year. The filter is in
+#                the job rather than the schedule because the schedule cannot see the
+#                change: it is the one place DST has to be handled at runtime.
 #
 # Secret isolation:
 #   Dashboard gets Supabase + Google OIDC secrets only. NO Alpaca keys.
@@ -85,7 +90,9 @@ services:
     name: credit-lab-execution
     runtime: python
     buildCommand: pip install -e .
-    schedule: "30 14 * * 1-5"
+    # Two firings, one per UTC hour, of which the job keeps the 10:31 ET one (see the
+    # daylight-saving note at the top of this file). The second is a no-op that exits 0.
+    schedule: "31 14,15 * * 1-5"
     startCommand: python scripts/run_execution.py
     envVars:
       - key: SUPABASE_URL

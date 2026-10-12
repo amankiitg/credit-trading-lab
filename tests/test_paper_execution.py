@@ -1580,6 +1580,8 @@ def _run_execution_with_stub(
     """
     import json as _json
     from datetime import date as _date
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
 
     import dashboard.supabase_client as sb_mod
     import execution.alpaca_paper as ap_mod
@@ -1588,6 +1590,15 @@ def _run_execution_with_stub(
 
     today = _date.today().isoformat()
     submit_failure = submit_failure or {}
+
+    # The daylight-saving gate refuses to run outside 10:20-10:45 ET, so the harness says
+    # what time it is. 10:31 ET is the real firing; a test that wants the other side of
+    # the guard patches this itself.
+    monkeypatch.setattr(
+        cal_mod,
+        "new_york_now",
+        lambda: datetime(2026, 10, 12, 10, 31, tzinfo=ZoneInfo("America/New_York")),
+    )
 
     # Fills must mark at the same prices the whole-share conversion used, or a
     # short leg would appear to fill for less than it was sized for.

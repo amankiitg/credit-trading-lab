@@ -3,15 +3,69 @@
 Both cron scripts (run_signal.py and run_execution.py) call is_trading_day
 before doing any work, then check_already_ran before executing, and call
 write_cron_run at the END of a successful run only so partial runs retry.
+
+It also holds the execution window, which is the daylight-saving guard: the execution
+cron fires twice a day in UTC and this decides which firing is the real one.
 """
 
 from __future__ import annotations
 
 import logging
+from datetime import datetime, time
 
 logger = logging.getLogger(__name__)
 
 _NYSE_CALENDAR = None
+_NEW_YORK = None
+
+# ------------------------------------------------ the daylight-saving execution window
+#
+# UTC cannot express "10:31 in New York". A fixed UTC schedule is an hour out for half
+# the year, and on the winter side that hour puts the market orders into the 09:30 ET
+# opening auction, which is exactly what this window exists to prevent.
+#
+# So the schedule carries the redundancy (render.yaml: "31 14,15 * * 1-5") and this
+# decides which firing is real: 14:31 UTC is 10:31 EDT but 09:31 EST, while 15:31 UTC is
+# 11:31 EDT but 10:31 EST. Exactly one of the two falls inside the window below, every
+# day of the year, so the book trades at the same New York time in both seasons.
+#
+# The window is 25 minutes wide rather than an instant because Render firings arrive a
+# few seconds late and a late firing must still be recognised; it also means a firing
+# more than about 14 minutes late is skipped rather than executed, which is the safe
+# direction to fail and is visible as a day with no summary email at all.
+#
+# US daylight-saving transitions happen on a Sunday, so no weekday firing lands on one.
+EXECUTION_WINDOW_START_ET: time = time(10, 20)
+EXECUTION_WINDOW_END_ET: time = time(10, 45)
+
+
+def _new_york():
+    """The New York zone, loaded once.
+
+    Lazy and cached like the calendar above, so a runtime with no tz database cannot
+    break the import of this module for both cron jobs.
+    """
+    global _NEW_YORK
+    if _NEW_YORK is None:
+        from zoneinfo import ZoneInfo
+        _NEW_YORK = ZoneInfo("America/New_York")
+    return _NEW_YORK
+
+
+def new_york_now() -> datetime:
+    """The current time in New York, daylight-saving aware."""
+    return datetime.now(_new_york())
+
+
+def in_execution_window(now_et: datetime) -> bool:
+    """True when the New York clock is inside the execution window.
+
+    Takes the moment rather than reading the clock, so both firings can be checked on
+    both sides of a daylight-saving change without waiting for one. `now_et` must
+    already be in New York time: the comparison is on wall-clock time, so a moment in
+    another zone would compare the wrong hour.
+    """
+    return EXECUTION_WINDOW_START_ET <= now_et.time() <= EXECUTION_WINDOW_END_ET
 
 
 def _get_nyse() -> object:

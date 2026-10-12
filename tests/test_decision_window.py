@@ -55,7 +55,7 @@ def _state(
 def test_a_fresh_proposal_with_no_run_since_is_open() -> None:
     """The normal morning: yesterday's signal, and yesterday's own run is the newest.
 
-    Yesterday's 14:30 run acted on the signal from the day before, so a last run date
+    Yesterday's morning run acted on the signal from the day before, so a last run date
     equal to the as-of date means this proposal is still waiting. Open is the only
     state that shows the buttons.
     """

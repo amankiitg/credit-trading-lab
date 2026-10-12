@@ -1,10 +1,14 @@
 """Morning execution cron -- sprint v8.6.
 
-Schedule: "30 14 * * 1-5" UTC
-  = 10:30 EDT (UTC-4, summer) = 09:30 EST (UTC-5, winter)
-  Both fall in the clean execution window after the 09:30 ET NYSE open.
+Schedule: "31 14,15 * * 1-5" UTC -- two firings, because UTC cannot express "10:31 in
+New York". 14:31 UTC is 10:31 EDT (summer) but 09:31 EST (winter); 15:31 UTC is 11:31
+EDT but 10:31 EST. Exactly one of the two lands inside the 10:20-10:45 ET window, so
+the book trades at the same New York time all year and never in the 09:30 opening
+auction.
 
 What it does:
+  0. Daylight-saving gate -- the window above. The off-hour firing exits 0 here, before
+     even the summary machinery is imported: no email, no cron_runs row, no writes.
   1. NYSE calendar check -- skip if today is not a trading day.
   2. Idempotency check -- exit 0 if this job already ran for today.
   3. Read the decision from Supabase for as_of_date (most recent close).
@@ -96,8 +100,35 @@ def main(max_secs: float | None = None) -> int:
     via execution.alpaca_paper.apply_request_timeout.
 
     All of the exit handling lives in execution.daily_summary.execute_job, so
-    every outcome (success, skip, halt, timeout, crash) produces one email.
+    every outcome (success, skip, halt, timeout, crash) produces one email. The
+    single exception is the off-hour daylight-saving firing below, which produces
+    none: it did not run the job, it declined to, and one email per firing would
+    mean two a day for one day's work.
     """
+    from execution.calendar_utils import (
+        EXECUTION_WINDOW_END_ET,
+        EXECUTION_WINDOW_START_ET,
+        in_execution_window,
+        new_york_now,
+    )
+
+    # -- 0. Daylight-saving gate. FIRST, before the summary machinery is imported and
+    #       before anything can reach Supabase or the broker: the cron fires twice and
+    #       the other firing is an hour off the New York morning. It exits 0 rather than
+    #       failing, because there is nothing wrong with it: it simply is not the firing
+    #       that does the work, and cron_runs must stay empty so the real firing is not
+    #       mistaken for an idempotent re-run.
+    now_et = new_york_now()
+    if not in_execution_window(now_et):
+        logger.info(
+            "skipping: off-hour daylight-saving firing at %s ET -- the execution "
+            "window is %s-%s ET. Nothing ran: no email, no run record, no writes.",
+            now_et.strftime("%H:%M:%S"),
+            EXECUTION_WINDOW_START_ET.strftime("%H:%M"),
+            EXECUTION_WINDOW_END_ET.strftime("%H:%M"),
+        )
+        return 0
+
     from execution.alpaca_paper import DRY_RUN_DEFAULT
     from execution.daily_summary import execute_job
 

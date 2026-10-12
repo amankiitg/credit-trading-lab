@@ -88,8 +88,9 @@ RISK_SLEEVE_FLAG_PCT = 60.0   # one sleeve above 60% of book risk is concentrati
 EXECUTION_JOB = "run_execution"
 
 # Context only, never a gate. render.yaml schedules credit-lab-execution at
-# "30 14 * * 1-5" UTC.
-EXECUTION_CRON_UTC = "14:30 UTC"
+# "31 14,15 * * 1-5" UTC, two firings of which the job keeps the one inside its
+# 10:20-10:45 ET window, so the real execution time is 10:31 ET all year.
+EXECUTION_CRON_ET = "10:30 ET"
 
 DECISION_STATE_NO_SIGNAL = "no_signal"
 DECISION_STATE_OPEN = "open"
@@ -752,7 +753,7 @@ def render(
             )
 
         st.caption(
-            f"Scheduled execution: {EXECUTION_CRON_UTC} on weekdays. Whether this panel "
+            f"Scheduled execution: {EXECUTION_CRON_ET} on weekdays. Whether this panel "
             f"offers a decision is decided by the recorded run, not the clock."
         )
 

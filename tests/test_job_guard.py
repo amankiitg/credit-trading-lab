@@ -19,6 +19,8 @@ from __future__ import annotations
 import logging
 import socket
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -174,6 +176,12 @@ def test_execution_job_exits_nonzero_when_a_step_hangs(monkeypatch, caplog) -> N
     monkeypatch.setattr(cal, "is_trading_day", lambda d: True)
     monkeypatch.setattr(cal, "check_already_ran", lambda job, d: False)
     monkeypatch.setattr(sb, "get_setting", lambda key: time.sleep(300))
+    # Inside the execution window, or the job exits 0 at the daylight-saving gate before
+    # it ever reaches the hung call.
+    monkeypatch.setattr(
+        cal, "new_york_now",
+        lambda: datetime(2026, 10, 12, 10, 31, tzinfo=ZoneInfo("America/New_York")),
+    )
 
     with caplog.at_level(logging.INFO):
         code = run_exec.main(max_secs=1)

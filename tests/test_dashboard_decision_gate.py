@@ -245,7 +245,7 @@ def test_the_scheduled_time_is_shown_as_context(monkeypatch) -> None:
     at, _ = _render(monkeypatch, last_run=YESTERDAY)
 
     text = _text(at)
-    assert "14:30 UTC" in text
+    assert "10:30 ET" in text
     assert "recorded run, not the clock" in text
 
 

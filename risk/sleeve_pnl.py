@@ -54,6 +54,7 @@ from dataclasses import dataclass, field
 from typing import Mapping
 
 from risk.attribution import RECONCILE_TOL, SLEEVES
+from risk.execution_pnl import record_execution_component
 from signals.etf_universe import ASSET_CLASS
 
 STATUS_OK = "ok"
@@ -429,6 +430,16 @@ def record_daily_sleeve_pnl(*, as_of_date: str, log=None) -> dict:
             return report
 
         report["written"] = True
+        # The traded part of the session, and the reconciliation against equity. Both
+        # live here rather than in the caller so a single place decides what the
+        # decomposition could not see; neither can fail the write above it.
+        report["execution"] = record_execution_component(
+            session=as_of_date,
+            close_prev=close_prev,
+            carry_total=report["carry_total"],
+            book_total=result.book_gross_pnl,
+            log=log,
+        )
         return report
 
     except _BOOKKEEPING_ERRORS as exc:

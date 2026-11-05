@@ -279,6 +279,46 @@ def get_live_nav(client) -> float:
         return PAPER_NAV_DEFAULT
 
 
+# ---------------------------------------------------------------- session fills
+
+def fetch_session_fills(client, session_date: str) -> list[dict]:
+    """The session's fills from the account activity history -- a read, never an order.
+
+    The sleeve decomposition measures the book held at the prior close and cannot see a
+    trade: what was bought or sold during the session changed the account without
+    changing the snapshot it started from. The broker has the record, so it is read
+    rather than inferred.
+
+    The window is deliberately a day wide on either side and the caller filters by
+    session: the account's activity timestamps are UTC, and asking for exactly one date
+    would silently drop a fill that crossed midnight UTC.
+    """
+    from datetime import date as _date, timedelta
+
+    try:
+        from alpaca.trading.requests import GetActivitiesRequest
+
+        day = _date.fromisoformat(session_date)
+        request = GetActivitiesRequest(
+            activity_types=["FILL"],
+            after=day - timedelta(days=1),
+            until=day + timedelta(days=1),
+            page_size=100,
+        )
+        activities = client.get_activities(request)
+    except Exception as exc:
+        logger.warning("fetch_session_fills(%s) failed: %s", session_date, exc)
+        return []
+
+    fills: list[dict] = []
+    for item in activities or []:
+        try:
+            fills.append(item.model_dump())
+        except AttributeError:
+            fills.append(dict(item))
+    return fills
+
+
 # ---------------------------------------------------------------- positions
 
 def get_live_book(

@@ -1,6 +1,10 @@
 venv/
 __pycache__/
 data/*.csv
+# Except this one. The hand-curated distribution override is data the cron needs,
+# not scratch output: Render builds from the repo and has no persistent disk, so a
+# file that stays ignored does not exist in the container that refreshes the cache.
+!data/distributions_override.csv
 
 # Written by signals.dividends.ingest: the date the distribution cache was refreshed.
 # It changes every session, and a container with no marker is correctly read as never

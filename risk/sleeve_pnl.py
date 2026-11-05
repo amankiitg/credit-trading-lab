@@ -53,6 +53,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Mapping
 
+from execution.job_guard import JobTimeout
 from risk.attribution import RECONCILE_TOL, SLEEVES
 from signals.etf_universe import ASSET_CLASS
 
@@ -418,8 +419,11 @@ def record_daily_sleeve_pnl(*, as_of_date: str, log=None) -> dict:
         report["written"] = True
         return report
 
-    except Exception as exc:
-        # Broad on purpose, including the imports: this is bookkeeping.
+    except (Exception, JobTimeout) as exc:
+        # Broad on purpose, including the imports: this is bookkeeping. JobTimeout is
+        # listed separately because it derives from BaseException, not Exception, so the
+        # step's own deadline would otherwise escape this handler, unwind through step()
+        # -- which re-raises -- and fail a run whose signal was already written.
         report["status"] = "error"
         report["reason"] = f"{type(exc).__name__}: {exc}"
         log.warning("sleeve P&L skipped for %s: %s", as_of_date, report["reason"])

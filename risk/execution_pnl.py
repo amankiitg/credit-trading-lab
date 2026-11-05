@@ -34,6 +34,14 @@ _SELL_SIDES = frozenset({"sell", "sell_short"})
 # accrual, a fee, a rounding in a fill price. Above it, something is unaccounted for.
 RECONCILE_WARN_DOLLARS = 50.0
 
+# The portfolio-history endpoint stamps an equity point with the calendar day of the
+# session BEFORE the one it reports: pairing the point stamped D with the point stamped
+# D+1 reproduces the session's close-to-close move, and pairing it with D-1 does not.
+# Measured over 2026-10-02..11-04, the two pairings give a worst day of $1.84 against
+# $1,974.87 -- see the PR. Set this to 0 the day the endpoint starts stamping the session
+# it belongs to; the reconciliation will then say so loudly instead of drifting quietly.
+EQUITY_LAG_SESSIONS = 1
+
 
 @dataclass(frozen=True)
 class ExecutionPnl:
@@ -160,6 +168,39 @@ def execution_pnl(
     return ExecutionPnl(rows=rows, total=total, fill_count=count, skipped=skipped)
 
 
+def session_equity_change(
+    equity: Mapping[str, float],
+    sessions: list[str],
+    session: str,
+    lag: int = EQUITY_LAG_SESSIONS,
+) -> float | None:
+    """The change in account equity across one session, or None when it cannot be known.
+
+    Both sides of the reconciliation have to be measured close to close, which means the
+    equity points on either side of the session and not a NAV sampled in the middle of the
+    morning. A missing point is answered with None rather than with the nearest earlier
+    value: a nearest-value lookup silently compares two different windows, which is the
+    failure mode this whole exercise exists to remove.
+    """
+    try:
+        index = sessions.index(session)
+    except ValueError:
+        return None
+
+    # lag is how far the stamp is from the session it describes: 0 means the point stamped
+    # with the session's own date is that session's close; 1 means it carries the previous
+    # session's close, so the session's own value sits on the next stamp.
+    start, end = index + lag - 1, index + lag
+    if start < 0 or end >= len(sessions):
+        return None
+
+    opening = equity.get(sessions[start])
+    closing = equity.get(sessions[end])
+    if opening is None or closing is None:
+        return None
+    return float(closing) - float(opening)
+
+
 def reconcile(
     expected_pnl: float,
     nav_change: float,
@@ -205,6 +246,7 @@ def record_execution_component(
     *,
     session: str,
     close_now: Mapping[str, float],
+    sessions: list[str] | None = None,
     carry_total: float,
     book_total: float,
     log=None,
@@ -233,8 +275,11 @@ def record_execution_component(
     }
 
     try:
-        from dashboard.supabase_client import fetch_pnl_log
-        from execution.alpaca_paper import connect, fetch_session_fills, get_live_nav
+        from execution.alpaca_paper import (
+            connect,
+            fetch_equity_history,
+            fetch_session_fills,
+        )
 
         client = connect()
         if client is None:
@@ -250,21 +295,18 @@ def record_execution_component(
         report["fill_count"] = pnl.fill_count
         report["skipped"] = pnl.skipped
 
-        # Equity is read now, at the run; the anchor is the last NAV the execution job
-        # recorded before this session. The two are not on the same clock -- one is the
-        # close, the other 10:31 -- which is exactly why the comparison warns instead of
-        # refusing.
-        nav_now = get_live_nav(client)
-        history = {
-            str(row.get("trade_date")): row.get("live_nav")
-            for row in fetch_pnl_log(limit=60)
-        }
-        prior_dates = sorted(d for d in history if d < session and history[d] is not None)
-        if not prior_dates:
-            report["reason"] = "no earlier NAV to reconcile against"
+        # Equity comes from the portfolio history, not from a NAV sampled at the 10:31
+        # execution run: a decomposition measured close to close cannot be reconciled
+        # against a number taken in the middle of the morning, and the difference between
+        # the two clocks was larger than every real discrepancy it was meant to find.
+        equity = fetch_equity_history(client, session)
+        change = session_equity_change(equity, list(sessions or []), session)
+        if change is None:
+            report["reason"] = (
+                "no end-of-day equity on both sides of this session, so the "
+                "reconciliation has nothing to compare"
+            )
             return report
-
-        nav_prev = float(history[prior_dates[-1]])
 
         # The paper account never books the distributions a short position owes, so its
         # equity sits above the economic book by exactly that amount. Adding it back is
@@ -273,12 +315,12 @@ def record_execution_component(
         add_back = -float(carry_total or 0.0)
         report["paper_add_back"] = add_back
         expected = float(book_total) + pnl.total + add_back
-        report["reconciliation"] = reconcile(expected, nav_now - nav_prev)
+        report["reconciliation"] = reconcile(expected, change)
         if report["reconciliation"]["warn"]:
             log.warning(
                 "execution P&L does not reconcile for %s: pipeline %.2f + execution "
                 "%.2f + paper add-back %.2f vs equity change %.2f (gap %.2f)",
-                session, book_total, pnl.total, add_back, nav_now - nav_prev,
+                session, book_total, pnl.total, add_back, change,
                 report["reconciliation"]["gap"],
             )
         return report

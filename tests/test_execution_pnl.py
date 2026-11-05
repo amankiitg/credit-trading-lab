@@ -153,6 +153,40 @@ def test_the_short_distribution_adjustment_is_named_not_absorbed() -> None:
     assert "no adjustment" in ep.short_distribution_note(0.0)
 
 
+def test_the_equity_change_spans_the_session_not_the_morning() -> None:
+    """Both sides close to close: the points either side of the session, nothing else."""
+    sessions = ["2026-10-30", "2026-11-02", "2026-11-03"]
+    equity = {"2026-10-30": 1000.0, "2026-11-02": 1050.0, "2026-11-03": 990.0}
+
+    assert ep.session_equity_change(equity, sessions, "2026-11-02", lag=0) == pytest.approx(50.0)
+    assert ep.session_equity_change(equity, sessions, "2026-11-03", lag=0) == pytest.approx(-60.0)
+    assert ep.session_equity_change(equity, sessions, "2026-10-30", lag=0) is None, "no point before it"
+
+
+def test_the_endpoint_stamps_a_point_one_session_early() -> None:
+    """Measured, not assumed: the point stamped D is the session before the one it reports.
+
+    Pairing D with D+1 is what reproduced the session's move to within $1.84 across
+    2026-10-02..11-04; pairing D with D-1 was out by up to $1,974.87.
+    """
+    sessions = ["2026-10-30", "2026-11-02", "2026-11-03"]
+    equity = {"2026-10-30": 1000.0, "2026-11-02": 1050.0, "2026-11-03": 990.0}
+
+    assert ep.session_equity_change(equity, sessions, "2026-10-30") == pytest.approx(50.0)
+    assert ep.session_equity_change(equity, sessions, "2026-11-02") == pytest.approx(-60.0)
+    assert ep.session_equity_change(equity, sessions, "2026-11-03") is None, "no point after it"
+
+
+def test_a_missing_equity_day_is_not_back_filled() -> None:
+    """A nearest-earlier lookup would silently compare two different windows."""
+    sessions = ["2026-10-30", "2026-11-02", "2026-11-03"]
+    equity = {"2026-10-29": 900.0, "2026-10-30": 1000.0, "2026-11-03": 990.0}
+
+    assert ep.session_equity_change(equity, sessions, "2026-10-30") is None
+    assert ep.session_equity_change({}, sessions, "2026-10-30") is None
+    assert ep.session_equity_change(equity, sessions, "2026-12-24") is None, "not a session"
+
+
 def test_the_reconciliation_adds_back_what_paper_never_debits(monkeypatch) -> None:
     """pipeline + execution + paper add-back, against the change in equity.
 
@@ -160,7 +194,6 @@ def test_the_reconciliation_adds_back_what_paper_never_debits(monkeypatch) -> No
     equity never sees the $436.18 this book owed on 2026-11-02, so without it every short
     month reads as an unexplained loss of exactly the carry.
     """
-    import dashboard.supabase_client as sb
     import execution.alpaca_paper as ap
 
     monkeypatch.setattr(ap, "connect", lambda dry_run=True: object())
@@ -168,17 +201,18 @@ def test_the_reconciliation_adds_back_what_paper_never_debits(monkeypatch) -> No
         ap, "fetch_session_fills",
         lambda client, day: [
             {"symbol": "TLT", "qty": "100", "side": "sell", "price": "81.00",
-             "transaction_time": "2026-11-02T15:00:00Z"}
+             "transaction_time": "2026-10-30T15:00:00Z"}
         ],
     )
-    monkeypatch.setattr(ap, "get_live_nav", lambda client: 1000.0)
     monkeypatch.setattr(
-        sb, "fetch_pnl_log", lambda limit=60: [{"trade_date": "2026-10-30", "live_nav": 1300.0}]
+        ap, "fetch_equity_history",
+        lambda client, day: {"2026-10-30": 1300.0, "2026-11-02": 1000.0},
     )
 
     report = ep.record_execution_component(
-        session="2026-11-02",
+        session="2026-10-30",
         close_now={"TLT": 81.84},
+        sessions=["2026-10-30", "2026-11-02"],
         carry_total=-436.1833,
         book_total=-358.1542,
     )
@@ -190,7 +224,7 @@ def test_the_reconciliation_adds_back_what_paper_never_debits(monkeypatch) -> No
     expected = -358.1542 - 84.0 + 436.1833
     reconciliation = report["reconciliation"]
     assert reconciliation["expected"] == pytest.approx(expected)
-    assert reconciliation["nav_change"] == pytest.approx(-300.0)
+    assert reconciliation["nav_change"] == pytest.approx(-300.0), "equity 1300 -> 1000"
     assert reconciliation["gap"] == pytest.approx(-300.0 - expected)
 
 
@@ -215,6 +249,27 @@ def test_the_hook_reports_an_error_instead_of_raising(monkeypatch) -> None:
     assert report["status"] == "error"
     assert "alpaca down" in report["reason"]
     assert report["note"], "the short-distribution note is still supplied"
+
+
+def test_a_session_with_no_equity_point_is_reported_not_guessed(monkeypatch) -> None:
+    """Missing equity is a named reason, never a zero and never a guess."""
+    import execution.alpaca_paper as ap
+
+    monkeypatch.setattr(ap, "connect", lambda dry_run=True: object())
+    monkeypatch.setattr(ap, "fetch_session_fills", lambda client, day: [])
+    monkeypatch.setattr(ap, "fetch_equity_history", lambda client, day: {"2026-10-30": 1300.0})
+
+    report = ep.record_execution_component(
+        session="2026-10-30",
+        close_now={"TLT": 81.84},
+        sessions=["2026-10-30", "2026-11-02"],
+        carry_total=0.0,
+        book_total=0.0,
+    )
+
+    assert report["status"] == "ok"
+    assert report["reconciliation"] is None
+    assert "equity" in report["reason"]
 
 
 def test_step_eight_attaches_the_execution_block(monkeypatch) -> None:

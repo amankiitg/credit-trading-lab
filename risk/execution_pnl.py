@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Iterable, Mapping
 
 # Alpaca's fill sides. sell_short and buy_to_cover are the short leg's two directions,
@@ -34,13 +34,14 @@ _SELL_SIDES = frozenset({"sell", "sell_short"})
 # accrual, a fee, a rounding in a fill price. Above it, something is unaccounted for.
 RECONCILE_WARN_DOLLARS = 50.0
 
-# The portfolio-history endpoint stamps an equity point with the calendar day of the
-# session BEFORE the one it reports: pairing the point stamped D with the point stamped
-# D+1 reproduces the session's close-to-close move, and pairing it with D-1 does not.
-# Measured over 2026-10-02..11-04, the two pairings give a worst day of $1.84 against
-# $1,974.87 -- see the PR. Set this to 0 the day the endpoint starts stamping the session
-# it belongs to; the reconciliation will then say so loudly instead of drifting quietly.
-EQUITY_LAG_SESSIONS = 1
+# The portfolio-history endpoint does not stamp a point on most session dates. Measured
+# over 2026-10-02..11-04 it had 24 points for 24 sessions but on the wrong labels: every
+# Monday was missing and every Saturday present, because each close is stamped with the
+# FOLLOWING calendar day. Reading the close of session D as "the first stamp strictly
+# after D" recovers all 24 sessions (max residual $1.84); reading it as "the stamp on D"
+# recovers 14 and reaches $1,974.87. convention_check() re-tests that every run and says
+# so if the endpoint ever changes its mind.
+EQUITY_STAMP_OFFSET_DAYS = 1
 
 
 @dataclass(frozen=True)
@@ -168,11 +169,26 @@ def execution_pnl(
     return ExecutionPnl(rows=rows, total=total, fill_count=count, skipped=skipped)
 
 
+def close_equity(
+    equity: Mapping[str, float], session: str, offset_days: int = EQUITY_STAMP_OFFSET_DAYS
+) -> float | None:
+    """The account equity at the close of `session`, or None when it is not there.
+
+    The endpoint stamps a close with the following calendar day, so the close of session D
+    is the first stamp strictly after D. Reading it as "the stamp on D" loses every Monday
+    (whose close is stamped Tuesday) and invents every Saturday.
+    """
+    day = date.fromisoformat(session) + timedelta(days=offset_days - 1)
+    for stamp in sorted(equity):
+        if date.fromisoformat(str(stamp)) > day:
+            return float(equity[stamp])
+    return None
+
+
 def session_equity_change(
     equity: Mapping[str, float],
     sessions: list[str],
     session: str,
-    lag: int = EQUITY_LAG_SESSIONS,
 ) -> float | None:
     """The change in account equity across one session, or None when it cannot be known.
 
@@ -186,19 +202,76 @@ def session_equity_change(
         index = sessions.index(session)
     except ValueError:
         return None
-
-    # lag is how far the stamp is from the session it describes: 0 means the point stamped
-    # with the session's own date is that session's close; 1 means it carries the previous
-    # session's close, so the session's own value sits on the next stamp.
-    start, end = index + lag - 1, index + lag
-    if start < 0 or end >= len(sessions):
+    if index == 0:
         return None
 
-    opening = equity.get(sessions[start])
-    closing = equity.get(sessions[end])
-    if opening is None or closing is None:
+    closing = close_equity(equity, session)
+    opening = close_equity(equity, sessions[index - 1])
+    if closing is None or opening is None:
         return None
-    return float(closing) - float(opening)
+    return closing - opening
+
+
+def convention_check(
+    book_by_session: Mapping[str, float],
+    equity: Mapping[str, float],
+    sessions: list[str],
+    window: int = 10,
+) -> dict:
+    """Is the stamp-offset reading still the better one? Re-tested every run.
+
+    Two readings of the same series: the close of a session is the first stamp after it
+    (what this module uses), or it is the stamp on the session's own date (what a plain
+    reading would assume). The one that explains the trailing window better is the one the
+    data is actually following, so if the endpoint changes convention the comparison flips
+    and the email says so instead of the reconciliation drifting quietly.
+
+    Execution P&L is deliberately left out: this compares two readings of the same series
+    against the same expected values, so including it would only shrink both residuals
+    equally.
+    """
+    checked = [
+        day
+        for day in sessions
+        if day in book_by_session and equity
+    ]
+    checked = checked[-window:] if window > 0 else checked[::]
+    if len(checked) < 3:
+        return {"verdict": "unknown", "reason": "not enough sessions to compare"}
+
+    current: list[float] = []
+    naive: list[float] = []
+    for day in checked:
+        expected = float(book_by_session[day])
+        shifted = session_equity_change(equity, sessions, day)
+        if shifted is not None:
+            current.append(abs(shifted - expected))
+
+        index = sessions.index(day)
+        if index == 0:
+            continue
+        opening = equity.get(sessions[index - 1])
+        closing = equity.get(day)
+        if opening is None or closing is None:
+            continue
+        naive.append(abs(float(closing) - float(opening) - expected))
+
+    if len(current) < 3 or len(naive) < 3:
+        return {"verdict": "unknown", "reason": "not enough paired sessions to compare"}
+
+    current_mean = sum(current) / len(current)
+    naive_mean = sum(naive) / len(naive)
+    return {
+        "verdict": "naive_better" if naive_mean < current_mean else "current_better",
+        "current_mean_abs": current_mean,
+        "naive_mean_abs": naive_mean,
+        "sessions": len(current),
+        "warning": (
+            "EQUITY_LAG convention may have changed"
+            if naive_mean < current_mean
+            else None
+        ),
+    }
 
 
 def reconcile(
@@ -270,6 +343,7 @@ def record_execution_component(
         "fill_count": 0,
         "skipped": [],
         "reconciliation": None,
+        "convention": None,
         "paper_add_back": -float(carry_total or 0.0),
         "note": short_distribution_note(carry_total),
     }
@@ -316,6 +390,24 @@ def record_execution_component(
         report["paper_add_back"] = add_back
         expected = float(book_total) + pnl.total + add_back
         report["reconciliation"] = reconcile(expected, change)
+
+        # Re-test the stamp convention on every run. It is one read of the rows this run
+        # already compares against, and it is the only thing that would notice the broker
+        # changing how it labels a close -- which would otherwise show up as a permanent
+        # "unexplained" gap rather than as a changed assumption.
+        try:
+            from dashboard.supabase_client import fetch_daily_sleeve_pnl
+
+            book_by_session = {
+                str(row.get("trade_date")): float(row["book_total"])
+                for row in fetch_daily_sleeve_pnl(limit=400)
+                if row.get("book_total") is not None
+            }
+            report["convention"] = convention_check(
+                book_by_session, equity, list(sessions or [])
+            )
+        except Exception as exc:  # never let the self-check cost the reconciliation
+            report["convention"] = {"verdict": "unknown", "reason": str(exc)}
         if report["reconciliation"]["warn"]:
             log.warning(
                 "execution P&L does not reconcile for %s: pipeline %.2f + execution "

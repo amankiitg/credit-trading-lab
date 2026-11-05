@@ -163,6 +163,18 @@ class RunSummary:
         }
         self.execution_note = report.get("note")
 
+        convention = report.get("convention") or {}
+        if convention.get("warning"):
+            # The anchor's assumption, not the book, has changed. Say so every run until
+            # someone looks: a wrong convention reads as a permanent gap that nobody can
+            # explain and everybody learns to ignore.
+            self.execution_note = (
+                f"{convention['warning']}: the naive pairing now explains the trailing "
+                f"window better (mean |gap| "
+                f"{convention.get('naive_mean_abs', 0.0):.2f} against "
+                f"{convention.get('current_mean_abs', 0.0):.2f})."
+            )
+
         reconciliation = report.get("reconciliation")
         if reconciliation:
             self.reconciliation = reconciliation

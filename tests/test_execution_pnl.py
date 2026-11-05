@@ -153,38 +153,70 @@ def test_the_short_distribution_adjustment_is_named_not_absorbed() -> None:
     assert "no adjustment" in ep.short_distribution_note(0.0)
 
 
-def test_the_equity_change_spans_the_session_not_the_morning() -> None:
-    """Both sides close to close: the points either side of the session, nothing else."""
-    sessions = ["2026-10-30", "2026-11-02", "2026-11-03"]
-    equity = {"2026-10-30": 1000.0, "2026-11-02": 1050.0, "2026-11-03": 990.0}
+def test_a_monday_with_no_stamp_of_its_own_still_has_a_close() -> None:
+    """The endpoint has no point on most Mondays and a stray one on most Saturdays.
 
-    assert ep.session_equity_change(equity, sessions, "2026-11-02", lag=0) == pytest.approx(50.0)
-    assert ep.session_equity_change(equity, sessions, "2026-11-03", lag=0) == pytest.approx(-60.0)
-    assert ep.session_equity_change(equity, sessions, "2026-10-30", lag=0) is None, "no point before it"
-
-
-def test_the_endpoint_stamps_a_point_one_session_early() -> None:
-    """Measured, not assumed: the point stamped D is the session before the one it reports.
-
-    Pairing D with D+1 is what reproduced the session's move to within $1.84 across
-    2026-10-02..11-04; pairing D with D-1 was out by up to $1,974.87.
+    Each close is stamped with the following calendar day, so the close of Monday
+    2026-11-02 is stamped 2026-11-03. Reading a close as "the stamp on the session" finds
+    14 of 24 sessions and loses every Monday; reading it as "the first stamp after the
+    session" finds all 24.
     """
-    sessions = ["2026-10-30", "2026-11-02", "2026-11-03"]
-    equity = {"2026-10-30": 1000.0, "2026-11-02": 1050.0, "2026-11-03": 990.0}
+    equity = {"2026-10-31": 900.0, "2026-11-03": 1000.0, "2026-11-04": 1010.0}
+    sessions = ["2026-10-30", "2026-11-02", "2026-11-03", "2026-11-04"]
 
-    assert ep.session_equity_change(equity, sessions, "2026-10-30") == pytest.approx(50.0)
-    assert ep.session_equity_change(equity, sessions, "2026-11-02") == pytest.approx(-60.0)
-    assert ep.session_equity_change(equity, sessions, "2026-11-03") is None, "no point after it"
+    assert ep.close_equity(equity, "2026-10-30") == pytest.approx(900.0)
+    assert ep.close_equity(equity, "2026-11-02") == pytest.approx(1000.0), "stamped the day after"
+    assert ep.session_equity_change(equity, sessions, "2026-11-02") == pytest.approx(100.0)
+
+
+def test_the_equity_change_spans_the_session_not_the_morning() -> None:
+    """Both sides close to close: the closes either side of the session, nothing else."""
+    sessions = ["2026-10-29", "2026-10-30", "2026-11-02"]
+    equity = {"2026-10-30": 1000.0, "2026-11-01": 1040.0, "2026-11-03": 990.0}
+
+    assert ep.session_equity_change(equity, sessions, "2026-10-30") == pytest.approx(40.0)
+    assert ep.session_equity_change(equity, sessions, "2026-11-02") == pytest.approx(-50.0)
 
 
 def test_a_missing_equity_day_is_not_back_filled() -> None:
     """A nearest-earlier lookup would silently compare two different windows."""
-    sessions = ["2026-10-30", "2026-11-02", "2026-11-03"]
-    equity = {"2026-10-29": 900.0, "2026-10-30": 1000.0, "2026-11-03": 990.0}
+    sessions = ["2026-10-29", "2026-10-30", "2026-11-02"]
 
-    assert ep.session_equity_change(equity, sessions, "2026-10-30") is None
     assert ep.session_equity_change({}, sessions, "2026-10-30") is None
-    assert ep.session_equity_change(equity, sessions, "2026-12-24") is None, "not a session"
+    assert ep.session_equity_change({"2026-10-30": 1000.0}, sessions, "2026-10-30") is None
+    assert ep.session_equity_change({"2026-10-30": 1000.0}, sessions, "2026-12-24") is None
+    assert ep.session_equity_change({"2026-10-30": 1.0}, sessions, "2026-10-29") is None, "first session"
+
+
+def test_the_convention_check_notices_when_the_naive_reading_wins() -> None:
+    """If the endpoint starts stamping the session it belongs to, this run says so."""
+    sessions = [f"2026-10-{d:02d}" for d in range(1, 11)]
+    equity = {s: float(1000 + i * i) for i, s in enumerate(sessions)}
+    # book = the naive delta, so the naive pairing explains it exactly and the shifted one
+    # does not.
+    book = {s: equity[s] - equity[sessions[i - 1]] for i, s in enumerate(sessions) if i}
+
+    result = ep.convention_check(book, equity, sessions, window=10)
+
+    assert result["verdict"] == "naive_better"
+    assert result["warning"] == "EQUITY_LAG convention may have changed"
+    assert result["naive_mean_abs"] < result["current_mean_abs"]
+
+
+def test_the_convention_check_stays_quiet_when_the_shifted_reading_wins() -> None:
+    sessions = [f"2026-10-{d:02d}" for d in range(1, 11)]
+    equity = {s: float(1000 + i * i) for i, s in enumerate(sessions)}
+    # book = the shifted delta: close(s_i) - close(s_{i-1}) under "first stamp after".
+    book = {}
+    for i, s in enumerate(sessions):
+        if i == 0 or i == len(sessions) - 1:
+            continue
+        book[s] = equity[sessions[i + 1]] - equity[s]
+
+    result = ep.convention_check(book, equity, sessions, window=10)
+
+    assert result["verdict"] == "current_better"
+    assert result["warning"] is None
 
 
 def test_the_reconciliation_adds_back_what_paper_never_debits(monkeypatch) -> None:
@@ -212,7 +244,7 @@ def test_the_reconciliation_adds_back_what_paper_never_debits(monkeypatch) -> No
     report = ep.record_execution_component(
         session="2026-10-30",
         close_now={"TLT": 81.84},
-        sessions=["2026-10-30", "2026-11-02"],
+        sessions=["2026-10-29", "2026-10-30", "2026-11-02"],
         carry_total=-436.1833,
         book_total=-358.1542,
     )

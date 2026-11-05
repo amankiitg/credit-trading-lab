@@ -340,6 +340,80 @@ def test_step_eight_attaches_the_execution_block(monkeypatch) -> None:
     assert report["execution"]["reconciliation"]["warn"] is True
 
 
+def _step_eight_fixture(monkeypatch):
+    """Step 8 with stubbed readers, and a spy on what it writes."""
+    import dashboard.supabase_client as sb
+    import pandas as pd
+    import signals.dividends as div_mod
+    import signals.etf_universe as etf
+
+    trade_date, prior_date = "2026-11-02", "2026-10-30"
+    index = pd.DatetimeIndex([prior_date, trade_date])
+    close = pd.DataFrame({"TLT": [81.84, 81.73]}, index=index)
+    written: list[list[dict]] = []
+
+    monkeypatch.setattr(etf, "load_universe_close", lambda *a, **k: close)
+    monkeypatch.setattr(
+        div_mod, "load_dividend_matrix",
+        lambda tickers, close_index, **k: pd.DataFrame({"TLT": [0.0, 0.3432]}, index=index),
+    )
+    monkeypatch.setattr(div_mod, "dividends_as_of", lambda raw_dir=None: trade_date)
+    monkeypatch.setattr(sb, "fetch_position_snapshot", lambda d: [{"ticker": "TLT", "shares": -330.0}])
+    monkeypatch.setattr(sb, "write_daily_sleeve_pnl", lambda rows: written.append(rows) or True)
+    return sb, written, trade_date
+
+
+def test_a_schema_without_the_execution_column_still_writes_the_sleeve_rows(
+    monkeypatch, caplog
+) -> None:
+    """The decomposition is the product; the execution split is an extra.
+
+    A missing column must cost the day nothing but a log line: carry, price and total are
+    written exactly as before, and the execution figure still reaches the email.
+    """
+    import logging
+
+    sb, written, trade_date = _step_eight_fixture(monkeypatch)
+    monkeypatch.setattr(sb, "execution_column_exists", lambda: False)
+    monkeypatch.setattr(
+        sp, "record_execution_component",
+        lambda **kw: {"status": "ok", "total": -12.5, "by_sleeve": {"rates": -12.5},
+                      "fill_count": 1, "reconciliation": None,
+                      "note": "paper does not debit short distributions"},
+    )
+
+    with caplog.at_level(logging.WARNING):
+        report = sp.record_daily_sleeve_pnl(as_of_date=trade_date)
+
+    assert report["written"] is True, "the write must succeed without the column"
+    assert report["execution_column"] == "missing"
+    assert len(written) == 1 and len(written[0]) == 4
+    assert all("execution_pnl" not in row for row in written[0]), "no column, no key"
+    assert all(row["carry_pnl"] is not None for row in written[0])
+
+    assert "execution column missing, run migration" in caplog.text
+    assert report["execution"]["total"] == pytest.approx(-12.5), "still in the report"
+
+
+def test_a_schema_with_the_column_writes_the_execution_split(monkeypatch) -> None:
+    """With the column applied, the per-sleeve split goes into the row."""
+    sb, written, trade_date = _step_eight_fixture(monkeypatch)
+    monkeypatch.setattr(sb, "execution_column_exists", lambda: True)
+    monkeypatch.setattr(
+        sp, "record_execution_component",
+        lambda **kw: {"status": "ok", "total": 12.5, "by_sleeve": {"rates": 12.5},
+                      "fill_count": 2, "reconciliation": None, "note": None},
+    )
+
+    report = sp.record_daily_sleeve_pnl(as_of_date=trade_date)
+
+    assert report["written"] is True
+    rows = {row["sleeve"]: row for row in written[0]}
+    assert rows["rates"]["execution_pnl"] == pytest.approx(12.5)
+    assert rows["credit"]["execution_pnl"] == pytest.approx(0.0), "no fills, no execution P&L"
+    assert rows["rates"]["carry_pnl"] == pytest.approx(-113.256, abs=0.01), "TLT only in this fixture"
+
+
 def test_the_email_says_the_gap_out_loud(monkeypatch) -> None:
     """The warning has to reach a human, not just the log."""
     from execution.daily_summary import RunSummary

@@ -423,16 +423,9 @@ def record_daily_sleeve_pnl(*, as_of_date: str, log=None) -> dict:
             report["price_total"],
         )
 
-        if not write_daily_sleeve_pnl(result.rows):
-            report["status"] = "write_failed"
-            report["reason"] = "Supabase rejected the daily_sleeve_pnl write"
-            log.error("sleeve P&L write FAILED for %s: %s", as_of_date, report["reason"])
-            return report
-
-        report["written"] = True
-        # The traded part of the session, and the reconciliation against equity. Both
-        # live here rather than in the caller so a single place decides what the
-        # decomposition could not see; neither can fail the write above it.
+        # The traded part of the session, and the reconciliation against equity. Computed
+        # before the write so the per-sleeve split can go into the row when the column
+        # exists; it cannot fail, so nothing downstream depends on it succeeding.
         report["execution"] = record_execution_component(
             session=as_of_date,
             close_now=close_now,
@@ -441,6 +434,44 @@ def record_daily_sleeve_pnl(*, as_of_date: str, log=None) -> dict:
             book_total=result.book_gross_pnl,
             log=log,
         )
+
+        # A schema without the column must still record carry, price and total: the
+        # decomposition is the product and the execution split is an extra. Written in
+        # two shapes rather than attempted-and-retried so a failed write is never mistaken
+        # for a missing column.
+        from dashboard.supabase_client import execution_column_exists
+
+        rows = result.rows
+        if execution_column_exists():
+            execution_by_sleeve = (report["execution"] or {}).get("by_sleeve") or {}
+            has_execution = (report["execution"] or {}).get("status") == "ok"
+            rows = [
+                {
+                    **row,
+                    "execution_pnl": (
+                        float(execution_by_sleeve.get(row["sleeve"], 0.0))
+                        if has_execution
+                        else None
+                    ),
+                }
+                for row in result.rows
+            ]
+        else:
+            report["execution_column"] = "missing"
+            log.warning(
+                "execution column missing, run migration: daily_sleeve_pnl.execution_pnl "
+                "does not exist, so %s is written with carry, price and total only; the "
+                "execution split still reaches the email and the reconciliation",
+                as_of_date,
+            )
+
+        if not write_daily_sleeve_pnl(rows):
+            report["status"] = "write_failed"
+            report["reason"] = "Supabase rejected the daily_sleeve_pnl write"
+            log.error("sleeve P&L write FAILED for %s: %s", as_of_date, report["reason"])
+            return report
+
+        report["written"] = True
         return report
 
     except _BOOKKEEPING_ERRORS as exc:

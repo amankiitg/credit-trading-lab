@@ -36,6 +36,42 @@ YF_TIMEOUT_SECS: float = float(os.environ.get("NETWORK_TIMEOUT_SECS", "30"))
 # Records when the cache was last refreshed, next to the files it describes.
 AS_OF_FILENAME: str = "dividends_as_of.json"
 
+# A hand-curated escape hatch for payouts the vendor has not published yet. Committed
+# on purpose so it ships inside the Render image: the cron has no persistent disk, so a
+# file that is not in git does not exist in the container.
+DISTRIBUTIONS_OVERRIDE: Path = Path("data") / "distributions_override.csv"
+
+# Monthly payers: the iShares funds whose ex-date is the first business day of every
+# month. Only these are held to the month-start check. Quarterly and semiannual payers
+# (SPY, EFA, EEM) are deliberately absent: their gap is three to six months, so the same
+# check would refuse them every month that is not a pay month.
+MONTHLY_PAYERS: frozenset[str] = frozenset({"TLT", "IEF", "HYG", "LQD"})
+
+# Funds that never distribute. An empty history is the correct value for these, not a
+# data gap: GLD holds metal and pays no income.
+NON_PAYERS: frozenset[str] = frozenset({"GLD"})
+
+# How long the vendor has to publish the month-start payout before its absence counts as
+# a missing row. The ex-date is the first business day; asking for it on the day itself
+# would refuse that same session every month.
+MONTHLY_GRACE_BUSINESS_DAYS: int = 2
+
+# January is exempt. iShares paid on 2025-12-19 and then on 2026-02-02 -- a 45-day gap
+# with no January ex-date at all -- so requiring one refuses a month that has no payout
+# by construction, and would refuse it every year.
+EXEMPT_MONTHS: frozenset[int] = frozenset({1})
+
+
+class StaleDividendCacheError(RuntimeError):
+    """A monthly payer's history stops short of a payout it should already have had.
+
+    Named so the retry loop and the log can tell it apart from a transport failure: a
+    429 might clear on the next attempt, while a vendor that simply has not published
+    October yet never will inside the same run. Raised before anything is written, so
+    the previous cache and its marker survive and the stale-marker refusal in
+    risk/sleeve_pnl.py decides the session instead of a fresh date vouching for a hole.
+    """
+
 
 @contextlib.contextmanager
 def _socket_timeout(seconds: float):
@@ -56,7 +92,10 @@ def _socket_timeout(seconds: float):
 
 
 def fetch_dividends(
-    tickers: list[str], timeout: float = YF_TIMEOUT_SECS
+    tickers: list[str],
+    timeout: float = YF_TIMEOUT_SECS,
+    override_path: Path | None = DISTRIBUTIONS_OVERRIDE,
+    as_of: date | None = None,
 ) -> dict[str, pd.Series]:
     """Pull per-share distribution history for each ticker from yfinance.
 
@@ -66,6 +105,11 @@ def fetch_dividends(
 
     Raises on any ticker failing, and writes nothing: a partial cache is worse than an
     old one, because the tickers that did not answer would read as having paid nothing.
+
+    The override CSV is merged in before validation, so a payout the vendor has not
+    published yet can be supplied by hand and counted. Then every monthly payer is held
+    to its own schedule: a history that stops before a month-start ex-date that was
+    already due raises StaleDividendCacheError here, ahead of any write.
     """
     out: dict[str, pd.Series] = {}
     with _socket_timeout(timeout):
@@ -75,7 +119,164 @@ def fetch_dividends(
             s = pd.Series(div.to_numpy(dtype="float64"), index=idx, name="dividend")
             s = s.groupby(s.index).sum().sort_index()
             out[t] = s
+
+    # Only the tickers the caller asked for: an override row for a fund that is not in
+    # this run's universe must not appear in the result as if it had been fetched.
+    override = {
+        t: s for t, s in load_distributions_override(override_path).items() if t in out
+    }
+    out = merge_distribution_sources(out, override)
+
+    validate_monthly_coverage(out, as_of=as_of, tickers=list(out))
     return out
+
+
+def load_distributions_override(
+    path: Path | None = DISTRIBUTIONS_OVERRIDE,
+) -> dict[str, pd.Series]:
+    """Per-ticker ex-date series from the hand-curated override CSV, or {} if absent.
+
+    Columns are ticker, ex_date, amount, source. The source column is not used by the
+    pipeline: it is there so whoever reads the file can see where a number came from and
+    whether anyone has checked it against the issuer.
+    """
+    if path is None:
+        return {}
+    path = Path(path)
+    if not path.exists():
+        return {}
+
+    frame = pd.read_csv(path)
+    required = {"ticker", "ex_date", "amount"}
+    absent = required - set(frame.columns)
+    if absent:
+        raise ValueError(
+            f"{path} is missing column(s): {', '.join(sorted(absent))} "
+            f"-- expected ticker, ex_date, amount, source"
+        )
+
+    rows: dict[str, dict[pd.Timestamp, float]] = {}
+    for _, row in frame.iterrows():
+        ticker = str(row["ticker"]).strip().upper()
+        day = pd.Timestamp(str(row["ex_date"]).strip()).normalize()
+        rows.setdefault(ticker, {})[day] = float(row["amount"])
+
+    return {
+        ticker: pd.Series(values, name="dividend").sort_index()
+        for ticker, values in rows.items()
+    }
+
+
+def merge_distribution_sources(
+    fetched: dict[str, pd.Series], override: dict[str, pd.Series]
+) -> dict[str, pd.Series]:
+    """Merge a fetched history with an override, the override winning on a shared date.
+
+    The override is meant to add what the vendor has not published, but a wrong vendor
+    row is also worth correcting without waiting for it, so a conflict resolves to the
+    curated amount rather than the fetched one.
+    """
+    merged = dict(fetched)
+    for ticker, extra in override.items():
+        extra = extra.rename("dividend")
+        base = merged.get(ticker)
+        if base is None or len(base) == 0:
+            merged[ticker] = extra
+            continue
+        kept = base[~base.index.isin(extra.index)]
+        merged[ticker] = pd.concat([kept, extra]).sort_index().rename("dividend")
+    return merged
+
+
+def _first_business_day_of(month: date) -> date:
+    """The first business day of `month`: a monthly payer's scheduled ex-date."""
+    return pd.bdate_range(start=month.replace(day=1), periods=1)[0].date()
+
+
+def _business_days_after(day: date, count: int) -> date:
+    return (pd.Timestamp(day) + pd.offsets.BDay(count)).date()
+
+
+def missing_month_start_ex_dates(
+    series: pd.Series,
+    as_of: date,
+    grace_business_days: int = MONTHLY_GRACE_BUSINESS_DAYS,
+) -> list[date]:
+    """The month-start ex-dates a monthly payer owed by `as_of` and does not show.
+
+    The walk starts at the month of the last recorded ex-date rather than at the fund's
+    inception: everything earlier is settled history, and the failure this catches is a
+    feed that has stopped, which only ever shows up at the tail. A month is only due once
+    the grace period has passed, so a session on the ex-date itself is not a failure.
+    """
+    paid = (
+        pd.DatetimeIndex(series.index).normalize()
+        if len(series)
+        else pd.DatetimeIndex([])
+    )
+
+    if len(paid):
+        cursor = paid.max().date().replace(day=1)
+    else:
+        cursor = as_of.replace(day=1)
+
+    missing: list[date] = []
+    stop = as_of.replace(day=1)
+    while cursor <= stop:
+        if cursor.month not in EXEMPT_MONTHS:
+            expected = _first_business_day_of(cursor)
+            start = pd.Timestamp(cursor)
+            if cursor < stop:
+                # A finished month is judged on the whole of it. The December 2025 payout
+                # landed on the 19th rather than the first business day, so a window
+                # narrower than the month would refuse a month that did pay.
+                end = start + pd.offsets.MonthEnd(0)
+                window = paid[(paid >= start) & (paid <= end)]
+            else:
+                # The current month is judged on the schedule: due once the grace period
+                # after the month-start ex-date has passed, absent from then on.
+                due = _business_days_after(expected, grace_business_days)
+                if as_of < due:
+                    break
+                window = paid[(paid >= start) & (paid <= pd.Timestamp(due))]
+            if len(window) == 0:
+                missing.append(expected)
+        cursor = (pd.Timestamp(cursor) + pd.offsets.MonthBegin(1)).date()
+    return missing
+
+
+def validate_monthly_coverage(
+    data: dict[str, pd.Series],
+    as_of: date | None = None,
+    tickers: list[str] | None = None,
+) -> None:
+    """Raise StaleDividendCacheError when a monthly payer has stopped being paid.
+
+    Schedule-aware on purpose. A flat "newest row is recent" rule would refuse SPY every
+    month that is not a quarter end, and a flat "any row this year" rule would pass a
+    feed that died in June -- which is exactly the state this exists to catch.
+    """
+    as_of = as_of or date.today()
+    checked = list(data) if tickers is None else list(tickers)
+    problems: list[str] = []
+
+    for ticker in checked:
+        if ticker in NON_PAYERS or ticker not in MONTHLY_PAYERS:
+            continue
+        series = data.get(ticker)
+        if series is None:
+            series = pd.Series(dtype="float64")
+        missing = missing_month_start_ex_dates(series, as_of)
+        if missing:
+            dates = ", ".join(d.isoformat() for d in missing)
+            problems.append(f"{ticker} has no ex-date for {dates}")
+
+    if problems:
+        raise StaleDividendCacheError(
+            "the distribution feed has not caught up with the payout schedule: "
+            + "; ".join(problems)
+            + f" (as of {as_of.isoformat()})"
+        )
 
 
 def write_dividends(data: dict[str, pd.Series], raw_dir: Path = RAW_DIR) -> None:
@@ -84,7 +285,11 @@ def write_dividends(data: dict[str, pd.Series], raw_dir: Path = RAW_DIR) -> None
         s.to_frame().to_parquet(raw_dir / f"{t}_dividends.parquet")
 
 
-def ingest(tickers: list[str], raw_dir: Path = RAW_DIR) -> dict:
+def ingest(
+    tickers: list[str],
+    raw_dir: Path = RAW_DIR,
+    override_path: Path | None = DISTRIBUTIONS_OVERRIDE,
+) -> dict:
     """Refresh the whole distribution cache for `tickers`, all or nothing.
 
     Raises if any ticker fails to fetch, having written nothing, so the caller's retry
@@ -97,7 +302,7 @@ def ingest(tickers: list[str], raw_dir: Path = RAW_DIR) -> dict:
 
     Returns a report: {ok, tickers, distributions, as_of}.
     """
-    data = fetch_dividends(tickers)
+    data = fetch_dividends(tickers, override_path=override_path)
     for t, s in data.items():
         nonzero = int((s > 0).sum())
         first = s.index.min().date() if len(s) else None

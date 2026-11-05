@@ -1,0 +1,9 @@
+ticker,ex_date,amount,source
+TLT,2026-10-01,0.3116,declared 2026-09-30 | dividendinvestor.com
+TLT,2026-11-02,0.3432,declared 2026-10-30 | dividendinvestor.com + dividenddata.com
+IEF,2026-10-01,0.3069,declared 2026-09-30 | dividendinvestor.com
+IEF,2026-11-02,0.3115,declared 2026-10-30 | dividendinvestor.com + dividenddata.com
+HYG,2026-10-01,0.3416,declared 2026-09-30 | dividendinvestor.com (+ Oct delta from 10-30 notice)
+HYG,2026-11-02,0.4014,declared 2026-10-30 | dividendinvestor.com + dividenddata.com
+LQD,2026-10-01,0.4387,declared 2026-09-30 | dividendinvestor.com
+LQD,2026-11-02,0.4000,declared 2026-10-30 | dividendinvestor.com + dividenddata.com

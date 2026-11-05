@@ -53,7 +53,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Mapping
 
-from execution.job_guard import JobTimeout
 from risk.attribution import RECONCILE_TOL, SLEEVES
 from signals.etf_universe import ASSET_CLASS
 
@@ -310,6 +309,19 @@ def record_daily_sleeve_pnl(*, as_of_date: str, log=None) -> dict:
         "sleeves": None,
     }
 
+    # JobTimeout derives from BaseException, so `except Exception` never sees a step deadline.
+    # Imported here rather than at module scope so that `risk` has no import dependency on
+    # `execution`: a tool that only recomputes arithmetic from stored inputs must not drag
+    # the job machinery in with it. The fallback keeps the handler working if the import
+    # fails, at the cost of no longer catching the timeout -- a strictly smaller loss than
+    # turning the handler itself into a NameError.
+    try:
+        from execution.job_guard import JobTimeout as _JobTimeout
+
+        _BOOKKEEPING_ERRORS: tuple[type[BaseException], ...] = (Exception, _JobTimeout)
+    except Exception:  # pragma: no cover - the jobs always have job_guard
+        _BOOKKEEPING_ERRORS = (Exception,)
+
     try:
         from dashboard.supabase_client import (
             fetch_position_snapshot,
@@ -419,11 +431,11 @@ def record_daily_sleeve_pnl(*, as_of_date: str, log=None) -> dict:
         report["written"] = True
         return report
 
-    except (Exception, JobTimeout) as exc:
-        # Broad on purpose, including the imports: this is bookkeeping. JobTimeout is
-        # listed separately because it derives from BaseException, not Exception, so the
-        # step's own deadline would otherwise escape this handler, unwind through step()
-        # -- which re-raises -- and fail a run whose signal was already written.
+    except _BOOKKEEPING_ERRORS as exc:
+        # Broad on purpose, including the imports: this is bookkeeping. JobTimeout is in
+        # that tuple because it derives from BaseException, not Exception, so the step's
+        # own deadline would otherwise escape this handler, unwind through step() -- which
+        # re-raises -- and fail a run whose signal was already written.
         report["status"] = "error"
         report["reason"] = f"{type(exc).__name__}: {exc}"
         log.warning("sleeve P&L skipped for %s: %s", as_of_date, report["reason"])

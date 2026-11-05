@@ -435,7 +435,7 @@ def record_daily_sleeve_pnl(*, as_of_date: str, log=None) -> dict:
         # decomposition could not see; neither can fail the write above it.
         report["execution"] = record_execution_component(
             session=as_of_date,
-            close_prev=close_prev,
+            close_now=close_now,
             carry_total=report["carry_total"],
             book_total=result.book_gross_pnl,
             log=log,

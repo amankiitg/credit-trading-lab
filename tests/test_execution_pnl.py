@@ -43,34 +43,48 @@ def test_the_side_decides_the_sign_and_short_sides_are_not_guessed() -> None:
 # ------------------------------------------------------------------ the arithmetic
 
 
-def test_a_short_sold_below_the_prior_close_is_a_gain() -> None:
-    """Selling 100 at 81.00 into a book that closed at 81.84 earns the 0.84 difference."""
+def test_a_buy_that_settles_above_the_fill_earns_the_difference() -> None:
+    """Hand-computed: 100 bought at 50.00 into a 50.30 close is +30.00."""
     pnl = ep.execution_pnl(
-        [_fill("TLT", 100, "sell_short", 81.00)],
-        {"TLT": 81.84},
+        [{"symbol": "TLT", "qty": "100", "side": "buy", "price": "50.00"}],
+        {"TLT": 50.30},
         sleeve_of={"TLT": "rates"},
-        session="2026-11-02",
     )
 
     assert pnl.fill_count == 1
-    assert pnl.total == pytest.approx(-100 * (81.00 - 81.84))
-    assert pnl.total > 0, "a short sale below the prior close is a gain"
-    assert pnl.by_sleeve == {"rates": pytest.approx(84.0)}
+    assert pnl.total == pytest.approx(30.00)
+    assert pnl.by_sleeve == {"rates": pytest.approx(30.00)}
 
 
-def test_a_buy_above_the_prior_close_costs_the_difference() -> None:
+def test_a_sell_that_settles_above_the_fill_loses_the_difference() -> None:
+    """Hand-computed: 100 sold at 50.00 into a 50.30 close is -30.00.
+
+    The shares left the book at 50.00 and finished at 50.30, so the account gave up the
+    move it would have earned had it held them.
+    """
     pnl = ep.execution_pnl(
-        [_fill("HYG", 50, "buy", 77.20)],
+        [{"symbol": "TLT", "qty": "100", "side": "sell", "price": "50.00"}],
+        {"TLT": 50.30},
+        sleeve_of={"TLT": "rates"},
+    )
+
+    assert pnl.fill_count == 1
+    assert pnl.total == pytest.approx(-30.00)
+
+
+def test_a_buy_above_the_close_costs_the_difference() -> None:
+    pnl = ep.execution_pnl(
+        [_fill("HYG", 50, "buy", 77.60)],
         {"HYG": 77.43},
         sleeve_of={"HYG": "credit"},
         session="2026-11-02",
     )
 
-    assert pnl.total == pytest.approx(50 * (77.20 - 77.43))
+    assert pnl.total == pytest.approx(50 * (77.43 - 77.60))
     assert pnl.total < 0
 
 
-def test_a_fill_without_a_prior_close_is_named_not_guessed() -> None:
+def test_a_fill_without_a_close_is_named_not_guessed() -> None:
     """A ticker the cache has no close for contributes nothing and says so."""
     pnl = ep.execution_pnl(
         [_fill("NEW", 10, "buy", 50.0)], {}, session="2026-11-02"
@@ -91,7 +105,19 @@ def test_only_the_session_s_own_fills_are_counted() -> None:
     pnl = ep.execution_pnl(fills, {"TLT": 81.84}, session="2026-11-02")
 
     assert pnl.fill_count == 1
-    assert pnl.total == pytest.approx(-10 * (81.0 - 81.84))
+    assert pnl.total == pytest.approx(-10 * (81.84 - 81.0))
+
+
+def test_a_five_digit_fraction_timestamp_still_parses() -> None:
+    """Alpaca sends five fractional digits, and Python <3.11 raises on those.
+
+    A parse that returns None instead of raising would drop every fill silently, which is
+    the worst of both worlds: no error, no execution line, and a reconciliation that says
+    the trades never happened.
+    """
+    assert ep.session_of({"transaction_time": "2026-10-01T14:31:31.35178+00:00"}) == "2026-10-01"
+    assert ep.session_of({"transaction_time": "2026-11-02T15:32:43.019284Z"}) == "2026-11-02"
+    assert ep.session_of({"transaction_time": "nonsense"}) is None
 
 
 # ------------------------------------------------------------------ the reconciliation
@@ -127,6 +153,47 @@ def test_the_short_distribution_adjustment_is_named_not_absorbed() -> None:
     assert "no adjustment" in ep.short_distribution_note(0.0)
 
 
+def test_the_reconciliation_adds_back_what_paper_never_debits(monkeypatch) -> None:
+    """pipeline + execution + paper add-back, against the change in equity.
+
+    The add-back is the whole reason the reconciliation can be compared at all: paper
+    equity never sees the $436.18 this book owed on 2026-11-02, so without it every short
+    month reads as an unexplained loss of exactly the carry.
+    """
+    import dashboard.supabase_client as sb
+    import execution.alpaca_paper as ap
+
+    monkeypatch.setattr(ap, "connect", lambda dry_run=True: object())
+    monkeypatch.setattr(
+        ap, "fetch_session_fills",
+        lambda client, day: [
+            {"symbol": "TLT", "qty": "100", "side": "sell", "price": "81.00",
+             "transaction_time": "2026-11-02T15:00:00Z"}
+        ],
+    )
+    monkeypatch.setattr(ap, "get_live_nav", lambda client: 1000.0)
+    monkeypatch.setattr(
+        sb, "fetch_pnl_log", lambda limit=60: [{"trade_date": "2026-10-30", "live_nav": 1300.0}]
+    )
+
+    report = ep.record_execution_component(
+        session="2026-11-02",
+        close_now={"TLT": 81.84},
+        carry_total=-436.1833,
+        book_total=-358.1542,
+    )
+
+    assert report["status"] == "ok"
+    assert report["total"] == pytest.approx(-84.0), "100 sold at 81.00 into an 81.84 close"
+    assert report["paper_add_back"] == pytest.approx(436.1833)
+
+    expected = -358.1542 - 84.0 + 436.1833
+    reconciliation = report["reconciliation"]
+    assert reconciliation["expected"] == pytest.approx(expected)
+    assert reconciliation["nav_change"] == pytest.approx(-300.0)
+    assert reconciliation["gap"] == pytest.approx(-300.0 - expected)
+
+
 # ------------------------------------------------------------------ the job's hook
 
 
@@ -141,7 +208,7 @@ def test_the_hook_reports_an_error_instead_of_raising(monkeypatch) -> None:
     monkeypatch.setattr(ap, "connect", _boom)
 
     report = ep.record_execution_component(
-        session="2026-11-02", close_prev={"TLT": 81.84}, carry_total=-436.18,
+        session="2026-11-02", close_now={"TLT": 81.84}, carry_total=-436.18,
         book_total=-358.15,
     )
 

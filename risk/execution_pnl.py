@@ -19,6 +19,7 @@ arithmetic on it.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Iterable, Mapping
@@ -80,8 +81,13 @@ def session_of(fill: Mapping[str, object]) -> str | None:
     stamp = fill.get("transaction_time") or fill.get("date")
     if not stamp:
         return None
+    text = str(stamp).replace("Z", "+00:00")
+    # Alpaca sends five fractional digits ("...T14:31:31.35178+00:00"). Python before
+    # 3.11 accepts only three or six and raises on the rest -- which would silently
+    # drop every fill instead of failing loudly, so the fraction is normalised first.
+    text = re.sub(r"\.(\d+)", lambda m: "." + (m.group(1) + "000000")[:6], text, count=1)
     try:
-        parsed = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(text)
     except ValueError:
         return None
     if parsed.tzinfo is None:
@@ -91,15 +97,22 @@ def session_of(fill: Mapping[str, object]) -> str | None:
 
 def execution_pnl(
     fills: Iterable[Mapping[str, object]],
-    close_prev: Mapping[str, float],
+    close_now: Mapping[str, float],
     sleeve_of: Mapping[str, str] | None = None,
     session: str | None = None,
 ) -> ExecutionPnl:
-    """Shares traded x (fill price - prior close), per ticker, for one session.
+    """Shares traded x (close - fill price), per ticker, for one session.
 
-    close_prev is the unadjusted close of the prior session, the same anchor the price
-    leg uses: the executed part of the move is the part that happened after the fill, so
-    the reference has to be the price the fill replaced.
+    This is the missing term, not a slippage measure. The price leg books
+    shares_held_at_prior_close x (close - prior close); the account actually held a
+    different book for part of the session, and the difference is exactly the shares
+    traded earning the move from their fill to the close:
+
+        true = S_prev x (close - prev) + traded x (close - fill)
+
+    A buy above the close loses the difference, and so does a sell below it -- the shares
+    left the book above where they finished. Both signs fall out of the arithmetic once
+    sells are negative shares traded.
     """
     rows: list[dict] = []
     skipped: list[str] = []
@@ -124,12 +137,12 @@ def execution_pnl(
             skipped.append(f"{ticker}: no fill price")
             continue
 
-        prior = close_prev.get(ticker)
-        if prior is None or float(prior) <= 0.0:
-            skipped.append(f"{ticker}: no prior close to measure the fill against")
+        settle = close_now.get(ticker)
+        if settle is None or float(settle) <= 0.0:
+            skipped.append(f"{ticker}: no close to measure the fill against")
             continue
 
-        pnl = shares * (price - float(prior))
+        pnl = shares * (float(settle) - price)
         sleeve = (sleeve_of or {}).get(ticker)
         rows.append(
             {
@@ -137,7 +150,7 @@ def execution_pnl(
                 "sleeve": sleeve,
                 "shares": shares,
                 "fill_price": price,
-                "prior_close": float(prior),
+                "close": float(settle),
                 "pnl": pnl,
             }
         )
@@ -191,7 +204,7 @@ def short_distribution_note(carry_total: float, carry_paper: float = 0.0) -> str
 def record_execution_component(
     *,
     session: str,
-    close_prev: Mapping[str, float],
+    close_now: Mapping[str, float],
     carry_total: float,
     book_total: float,
     log=None,
@@ -215,6 +228,7 @@ def record_execution_component(
         "fill_count": 0,
         "skipped": [],
         "reconciliation": None,
+        "paper_add_back": -float(carry_total or 0.0),
         "note": short_distribution_note(carry_total),
     }
 
@@ -228,7 +242,7 @@ def record_execution_component(
             return report
 
         fills = fetch_session_fills(client, session)
-        pnl = execution_pnl(fills, close_prev, sleeve_of=ASSET_CLASS, session=session)
+        pnl = execution_pnl(fills, close_now, sleeve_of=ASSET_CLASS, session=session)
 
         report["status"] = "ok"
         report["total"] = pnl.total
@@ -251,13 +265,20 @@ def record_execution_component(
             return report
 
         nav_prev = float(history[prior_dates[-1]])
-        expected = float(book_total) + pnl.total
+
+        # The paper account never books the distributions a short position owes, so its
+        # equity sits above the economic book by exactly that amount. Adding it back is
+        # the only way the two sides describe the same thing; without it every short
+        # month reads as a few hundred dollars nobody can account for.
+        add_back = -float(carry_total or 0.0)
+        report["paper_add_back"] = add_back
+        expected = float(book_total) + pnl.total + add_back
         report["reconciliation"] = reconcile(expected, nav_now - nav_prev)
         if report["reconciliation"]["warn"]:
             log.warning(
-                "execution P&L does not reconcile for %s: pipeline %.2f + execution %.2f "
-                "vs equity change %.2f (gap %.2f)",
-                session, book_total, pnl.total, nav_now - nav_prev,
+                "execution P&L does not reconcile for %s: pipeline %.2f + execution "
+                "%.2f + paper add-back %.2f vs equity change %.2f (gap %.2f)",
+                session, book_total, pnl.total, add_back, nav_now - nav_prev,
                 report["reconciliation"]["gap"],
             )
         return report

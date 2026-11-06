@@ -152,6 +152,60 @@ def test_body_omits_fields_the_job_never_filled_in() -> None:
     assert "Reason: signal is 3 NYSE sessions old" in body
 
 
+# -------------------------------------------------------- execution fields
+
+def test_body_never_raises_on_a_run_execution_summary() -> None:
+    """run_execution builds a summary without ever touching the execution fields.
+
+    All three -- execution_pnl, execution_note and reconciliation -- default to None
+    there, so the renderer has to take its absent branch on every one of them. A
+    summary email that raised on a field the job never fills would cost the run its
+    only report, which is the exact failure the try/finally exists to prevent.
+    """
+    s = RunSummary(job="run_execution", run_date="2026-11-04")
+
+    body = body_for(s, last_step="12 record run")
+
+    assert "exit code 0" in body
+    assert "Execution" not in body, "no fills were reported, so no execution line"
+    assert "None" not in body, "an unfilled field must be omitted, not printed"
+    assert "Last step started" not in body
+
+
+def test_body_renders_the_execution_lines_when_the_fields_are_set() -> None:
+    """The reverse: when the run did report execution, both lines appear."""
+    s = _summary(
+        job="run_signal",
+        exit_code=0,
+        execution_pnl={
+            "total": -30.0,
+            "fill_count": 2,
+            "by_sleeve": {"equity": 0.0, "rates": 0.0, "credit": 0.0},
+        },
+        execution_note="EQUITY_LAG convention may have changed",
+    )
+
+    body = body_for(s)
+
+    assert "Execution P&L: 2 fills, -30.00 total" in body
+    assert "EQUITY_LAG convention may have changed" in body
+    assert "None" not in body
+
+
+def test_body_omits_the_execution_line_when_only_the_note_is_set() -> None:
+    """A broker that would not answer has a note and no numbers; only the note prints."""
+    s = _summary(
+        job="run_execution",
+        exit_code=0,
+        execution_note="Execution P&L: not available (broker timeout)",
+    )
+
+    body = body_for(s)
+
+    assert "Execution P&L: not available (broker timeout)" in body
+    assert "fills," not in body
+
+
 # ------------------------------------------------------------------ sending
 
 def test_send_summary_sends_one_email(monkeypatch) -> None:

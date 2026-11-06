@@ -11,6 +11,10 @@ data/*.csv
 # refreshed here rather than as fresh.
 data/raw/dividends_as_of.json
 
+# One-off backups taken before a data correction: evidence, not source. They are
+# written by hand and read by a human, so they never belong in the repo.
+backups/
+
 # credentials -- never commit
 .env
 .env.*

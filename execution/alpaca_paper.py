@@ -279,6 +279,89 @@ def get_live_nav(client) -> float:
         return PAPER_NAV_DEFAULT
 
 
+
+# ---------------------------------------------------------------- the equity anchor
+
+def fetch_equity_history(client, session_date: str) -> dict[str, float]:
+    """End-of-day account equity per calendar day, from the portfolio history -- a read.
+
+    Needed because the decomposition is measured close to close, and the only NAV the
+    execution job records is sampled at its 10:31 run. Reconciling a close-to-close number
+    against a mid-morning one compares two different windows, which is why the gap it
+    reported was larger than any real discrepancy in the book.
+
+    Nothing here reads orders or writes anything: one GET on the portfolio history.
+    """
+    from datetime import date as _date, timedelta
+
+    try:
+        from alpaca.trading.requests import GetPortfolioHistoryRequest
+
+        day = _date.fromisoformat(session_date)
+        request = GetPortfolioHistoryRequest(
+            timeframe="1D",
+            start=day - timedelta(days=10),
+            end=day + timedelta(days=2),
+        )
+        history = client.get_portfolio_history(request)
+        stamps = list(history.timestamp or [])
+        values = list(history.equity or [])
+    except Exception as exc:
+        logger.warning("fetch_equity_history(%s) failed: %s", session_date, exc)
+        return {}
+
+    out: dict[str, float] = {}
+    for stamp, value in zip(stamps, values):
+        if value is None:
+            continue
+        try:
+            day_text = datetime.fromtimestamp(int(stamp), tz=timezone.utc).date().isoformat()
+        except (TypeError, ValueError, OSError):
+            continue
+        out[day_text] = float(value)
+    return out
+
+
+# ---------------------------------------------------------------- session fills
+
+def fetch_session_fills(client, session_date: str) -> list[dict]:
+    """The session's fills from the account activity history -- a read, never an order.
+
+    The sleeve decomposition measures the book held at the prior close and cannot see a
+    trade: what was bought or sold during the session changed the account without
+    changing the snapshot it started from. The broker has the record, so it is read
+    rather than inferred.
+
+    The window is deliberately a day wide on either side and the caller filters by
+    session: the account's activity timestamps are UTC, and asking for exactly one date
+    would silently drop a fill that crossed midnight UTC.
+    """
+    from datetime import date as _date, timedelta
+
+    try:
+        from alpaca.trading.requests import GetActivitiesRequest
+
+        day = _date.fromisoformat(session_date)
+        request = GetActivitiesRequest(
+            activity_types=["FILL"],
+            after=day - timedelta(days=1),
+            until=day + timedelta(days=1),
+            page_size=100,
+        )
+        activities = client.get_activities(request)
+    except Exception as exc:
+        logger.warning("fetch_session_fills(%s) failed: %s", session_date, exc)
+        return []
+
+    fills: list[dict] = []
+    for item in activities or []:
+        try:
+            fills.append(item.model_dump())
+        except AttributeError:
+            fills.append(dict(item))
+    return fills
+
+
 # ---------------------------------------------------------------- positions
 
 def get_live_book(

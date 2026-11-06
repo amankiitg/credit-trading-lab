@@ -81,6 +81,9 @@ class RunSummary:
     # when the four sleeves reconciled to the whole-book total.
     sleeve_pnl: dict | None = None
     sleeve_pnl_note: str | None = None
+    execution_pnl: dict | None = None
+    execution_note: str | None = None
+    reconciliation: dict | None = None
     extra: list[str] = field(default_factory=list)
 
     def mark_skip(self, reason: str) -> None:
@@ -113,6 +116,11 @@ class RunSummary:
         rejected, is FAILED: those are real problems and the numbers are missing
         rather than absent by construction.
         """
+        # Independent of whether the decomposition was written: the traded part explains
+        # the session either way, and the reconciliation it drives is the only thing that
+        # would notice the two disagreeing.
+        self.record_execution_pnl(report.get("execution"))
+
         if report.get("written"):
             self.sleeve_pnl = {
                 "trade_date": report.get("trade_date"),
@@ -130,6 +138,53 @@ class RunSummary:
             self.sleeve_pnl_note = f"Sleeve P&L FAILED ({status}): {reason}"
         else:
             self.sleeve_pnl_note = f"Sleeve P&L: not computed ({reason})"
+
+    def record_execution_pnl(self, report: dict | None) -> None:
+        """The traded part of the session, and the equity reconciliation that follows.
+
+        A gap is reported as a WARNING and nothing more. It is measured against equity
+        read at the run, not at the close, so a gap the size of an intraday move is
+        expected; refusing the session over it would hide a decomposition that is still
+        the best available.
+        """
+        if not report:
+            return
+        if report.get("status") != "ok":
+            self.execution_note = (
+                "Execution P&L: not available "
+                f"({report.get('reason') or report.get('status')})"
+            )
+            return
+
+        self.execution_pnl = {
+            "total": report.get("total") or 0.0,
+            "fill_count": report.get("fill_count") or 0,
+            "by_sleeve": report.get("by_sleeve") or {},
+        }
+        self.execution_note = report.get("note")
+
+        convention = report.get("convention") or {}
+        if convention.get("warning"):
+            # The anchor's assumption, not the book, has changed. Say so every run until
+            # someone looks: a wrong convention reads as a permanent gap that nobody can
+            # explain and everybody learns to ignore.
+            self.execution_note = (
+                f"{convention['warning']}: the naive pairing now explains the trailing "
+                f"window better (mean |gap| "
+                f"{convention.get('naive_mean_abs', 0.0):.2f} against "
+                f"{convention.get('current_mean_abs', 0.0):.2f})."
+            )
+
+        reconciliation = report.get("reconciliation")
+        if reconciliation:
+            self.reconciliation = reconciliation
+            if reconciliation.get("warn"):
+                self.execution_note = (
+                    "WARNING: execution P&L does not reconcile. Pipeline plus execution "
+                    f"{reconciliation['expected']:+,.2f} against an equity change of "
+                    f"{reconciliation['nav_change']:+,.2f}, a gap of "
+                    f"{reconciliation['gap']:+,.2f} dollars. {report.get('note') or ''}"
+                ).strip()
 
 
 # Severity order for the subject line. A failed basis refresh lifts a clean run to
@@ -238,6 +293,22 @@ def body_for(summary: RunSummary, last_step: str | None = None) -> str:
         )
     elif summary.sleeve_pnl_note:
         lines.append(summary.sleeve_pnl_note)
+
+    # What the decomposition above cannot see: the shares traded during the session, and
+    # whether the whole thing adds up to the move in account equity.
+    if summary.execution_pnl is not None:
+        traded = ", ".join(
+            f"{name} {value:+,.2f}"
+            for name, value in summary.execution_pnl["by_sleeve"].items()
+            if abs(float(value)) >= 0.005
+        )
+        lines.append(
+            f"Execution P&L: {summary.execution_pnl['fill_count']} fills, "
+            f"{summary.execution_pnl['total']:+,.2f} total"
+            + (f" ({traded})" if traded else "")
+        )
+    if summary.execution_note:
+        lines.append(summary.execution_note)
 
     lines.append(
         f"Orders: {len(summary.filled)} filled, {len(summary.skipped)} skipped, "

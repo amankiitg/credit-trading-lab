@@ -430,6 +430,27 @@ def fetch_last_cron_run(job_name: str) -> dict | None:
 
 # ---------------------------------------------------------------- daily sleeve P&L (v9.8)
 
+def execution_column_exists() -> bool:
+    """Does public.daily_sleeve_pnl carry the execution_pnl column yet?
+
+    Asked with a zero-row select rather than inferred from a failed write: a refusal and
+    a missing column both come back as a falsy result from the writer, and treating a
+    transport failure as "run the migration" would send someone chasing the wrong thing.
+
+    Returns False on any error, which is the safe direction: the caller then writes the
+    columns that certainly exist and says so in the log.
+    """
+    client = get_supabase_client()
+    if client is None:
+        return False
+    try:
+        client.table("daily_sleeve_pnl").select("execution_pnl").limit(1).execute()
+        return True
+    except Exception as exc:
+        _log.info("daily_sleeve_pnl.execution_pnl is not there yet: %s", exc)
+        return False
+
+
 def write_daily_sleeve_pnl(rows: list[dict]) -> bool:
     """Upsert one session's sleeve rows. PK is (trade_date, sleeve), so a re-run of
     the same session overwrites rather than duplicating it.

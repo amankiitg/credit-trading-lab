@@ -35,11 +35,39 @@ from datetime import date
 logger = logging.getLogger("snapshot")
 
 
+def open_paper_client(*, log: logging.Logger | None = None):
+    """Build the read-only paper client the post-close steps share. Never raises.
+
+    `connect()` defaults to DRY_RUN_DEFAULT, which is true on the cron, so a bare call
+    returns no client at all. That default is right for anything that could trade and
+    wrong for a read. Step 8 learned it the hard way on 2026-11-06: it called `connect()`
+    with no arguments, got None, and reported "Execution P&L: not available (no Alpaca
+    client)" every evening, while step 7 -- one line above it -- read the same account
+    through `connect(dry_run=False)`.
+
+    One client, built here and handed to both steps: the position book and the fill
+    history are the same account, and building it twice is how the two drifted apart.
+    """
+    log = log or logger
+    try:
+        from execution.alpaca_paper import connect
+
+        return connect(dry_run=False)
+    except Exception as exc:  # bookkeeping: a missing client is reported, not raised
+        log.warning(
+            "no Alpaca client for the post-close steps (%s: %s) -- the snapshot "
+            "refresh and the execution P&L both report themselves unavailable",
+            type(exc).__name__, exc,
+        )
+        return None
+
+
 def refresh_snapshot(
     *,
     run_date: str | None = None,
     dry_run: bool = False,
     log: logging.Logger | None = None,
+    client: object | None = None,
 ) -> dict:
     """Read live positions and NAV from Alpaca and write the cached snapshot.
 
@@ -67,10 +95,12 @@ def refresh_snapshot(
         from dashboard.supabase_client import set_setting, write_positions
         from execution.alpaca_paper import connect, get_live_book, get_live_nav
 
-        # dry_run=False explicitly: this only reads from the broker, and the
-        # DRY_RUN_DEFAULT flag defaults to on, which would return no client and
-        # silently turn this whole feature into a no-op on the signal cron.
-        client = connect(dry_run=False)
+        # A client passed in is used as it is: the signal job builds one just above and
+        # shares it with step 8. Otherwise build one here, with dry_run=False explicitly,
+        # because DRY_RUN_DEFAULT defaults to on and would return no client at all --
+        # silently turning this whole feature into a no-op on the signal cron.
+        if client is None:
+            client = connect(dry_run=False)
         if client is None:
             report["skipped"] = "no Alpaca client"
             report["failed"] = True

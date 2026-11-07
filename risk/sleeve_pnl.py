@@ -281,7 +281,7 @@ def compute_sleeve_pnl(
 # ---------------------------------------------------------------- the daily job's entry point
 
 
-def record_daily_sleeve_pnl(*, as_of_date: str, log=None) -> dict:
+def record_daily_sleeve_pnl(*, as_of_date: str, log=None, client: object | None = None) -> dict:
     """Compute one session's sleeve P&L from the stored snapshot and the local cache.
 
     Mirrors execution.snapshot.refresh_snapshot: bookkeeping that reports what it did
@@ -292,6 +292,12 @@ def record_daily_sleeve_pnl(*, as_of_date: str, log=None) -> dict:
     than taken from the caller, so the two dates can never disagree about which book
     was held. Reads that snapshot from Supabase and the UNADJUSTED closes and the
     distribution cache from disk; writes nothing at all unless the day reconciles.
+
+    `client` is the paper broker client the caller already built for the snapshot
+    refresh, passed straight through to the execution component. When it is None that
+    component builds its own read-only client, and when it cannot, the day is still
+    written with carry, price and total and the email says the traded part was
+    unavailable.
     """
     import logging
 
@@ -433,6 +439,7 @@ def record_daily_sleeve_pnl(*, as_of_date: str, log=None) -> dict:
             carry_total=report["carry_total"],
             book_total=result.book_gross_pnl,
             log=log,
+            client=client,
         )
 
         # A schema without the column must still record carry, price and total: the

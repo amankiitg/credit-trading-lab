@@ -54,7 +54,7 @@ from dataclasses import dataclass, field
 from typing import Mapping
 
 from risk.attribution import RECONCILE_TOL, SLEEVES
-from risk.execution_pnl import record_execution_component
+from risk.execution_pnl import record_execution_component, record_prior_reconciliation
 from signals.etf_universe import ASSET_CLASS
 
 STATUS_OK = "ok"
@@ -280,6 +280,81 @@ def compute_sleeve_pnl(
 
 # ---------------------------------------------------------------- the daily job's entry point
 
+def session_before(sessions: list[str], session: str) -> str | None:
+    """The trading session immediately before one in the calendar, or None.
+
+    Uses the close cache's session list rather than calendar arithmetic, so a
+    weekend and a holiday need no special case: Monday's predecessor is Friday, and
+    the Wednesday after a Tuesday holiday has Monday as its predecessor.
+    """
+    try:
+        index = sessions.index(session)
+    except ValueError:
+        return None
+    return sessions[index - 1] if index > 0 else None
+
+
+def _reconcile_published_prior(
+    *, prior_date: str, close_prior: Mapping[str, float], sessions: list[str],
+    log, client: object | None,
+) -> dict:
+    """Reconcile the previous session from the row that was actually published.
+
+    The book total comes from the four stored sleeve rows for prior_date -- the
+    number the previous evening's email published -- rather than being recomputed,
+    so the residual checks what was reported. The short-leg carry is not stored, so
+    the conservative fallback is the negative part of the stored carry: a long payout
+    needs no add-back because paper already paid it.
+    """
+    base = {
+        "session": prior_date,
+        "reconciliation": None,
+        "reason": None,
+        "book_total": None,
+        "execution_total": None,
+        "carry_short": None,
+    }
+    try:
+        from dashboard.supabase_client import fetch_daily_sleeve_pnl
+
+        rows = [
+            row
+            for row in fetch_daily_sleeve_pnl(limit=400, raise_on_error=True)
+            if str(row.get("trade_date")) == prior_date
+        ]
+    except Exception as exc:
+        base["reason"] = (
+            f"sleeve P&L for {prior_date} could not be read: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        log.warning("prior reconciliation unavailable: %s", base["reason"])
+        return base
+    if not rows:
+        base["reason"] = f"no stored sleeve P&L for {prior_date}"
+        log.info("prior reconciliation not computed: %s", base["reason"])
+        return base
+
+    totals = [
+        float(row["book_total"])
+        for row in rows
+        if row.get("book_total") is not None
+    ]
+    if not totals:
+        base["reason"] = f"the stored sleeve P&L for {prior_date} has no book total"
+        log.info("prior reconciliation not computed: %s", base["reason"])
+        return base
+
+    carry_total = sum(float(row.get("carry_pnl") or 0.0) for row in rows)
+    return record_prior_reconciliation(
+        session=prior_date,
+        close=close_prior,
+        sessions=sessions,
+        book_total=totals[0],
+        carry_short=min(carry_total, 0.0),
+        log=log,
+        client=client,
+    )
+
 
 def record_daily_sleeve_pnl(*, as_of_date: str, log=None, client: object | None = None) -> dict:
     """Compute one session's sleeve P&L from the stored snapshot and the local cache.
@@ -346,6 +421,28 @@ def record_daily_sleeve_pnl(*, as_of_date: str, log=None, client: object | None 
             log.info("sleeve P&L not computed: %s", report["reason"])
             return report
 
+        # Tonight's residual belongs to the previous session, and it is attached
+        # before any of today's checks: at 17:30 ET this session has no equity close
+        # yet (it is stamped tomorrow), while the previous session's is stamped today
+        # and is published. Computed first so that refusing TODAY's decomposition --
+        # a stale distribution cache, a missing snapshot -- cannot cost the email its
+        # residual for yesterday.
+        session_list = [str(ts.date()) for ts in close.index]
+        prior_date = session_before(session_list, as_of_date)
+        if prior_date is None:
+            report["status"] = STATUS_UNCOMPARABLE
+            report["reason"] = "the close cache holds a single session, so there is no prior book"
+            log.info("sleeve P&L not computed: %s", report["reason"])
+            return report
+        report["prior_date"] = prior_date
+        report["prior_reconciliation"] = _reconcile_published_prior(
+            prior_date=prior_date,
+            close_prior=close.loc[sessions[prior_date]].dropna().to_dict(),
+            sessions=session_list,
+            log=log,
+            client=client,
+        )
+
         # The cache must be at least as new as the session being measured. Only the
         # recorded refresh date can say so: the data cannot, because a ticker that paid
         # nothing and a ticker that was never fetched are both empty rows, while the
@@ -363,14 +460,6 @@ def record_daily_sleeve_pnl(*, as_of_date: str, log=None, client: object | None 
             )
             log.info("sleeve P&L not computed: %s", report["reason"])
             return report
-
-        prior_date = previous_session(close.index)
-        if prior_date is None:
-            report["status"] = STATUS_UNCOMPARABLE
-            report["reason"] = "the close cache holds a single session, so there is no prior book"
-            log.info("sleeve P&L not computed: %s", report["reason"])
-            return report
-        report["prior_date"] = prior_date
 
         # raise_on_error: an unreadable positions table must not read as "no snapshot
         # for that date". The first is a DB fault, the second is a real absence, and the

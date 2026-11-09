@@ -370,6 +370,107 @@ def short_distribution_note(carry_short: float) -> str | None:
 # ---------------------------------------------------------------- the daily job's hook
 
 
+def record_prior_reconciliation(
+    *,
+    session: str,
+    close: Mapping[str, float],
+    sessions: list[str],
+    book_total: float,
+    carry_short: float,
+    log=None,
+    client: object | None = None,
+) -> dict:
+    """Reconcile the session that ended before the one the run just measured.
+
+    The equity history stamps each close with the FOLLOWING calendar day. At 17:30 ET
+    on session D the point labelled D+1 does not exist, so D's own residual cannot be
+    measured by that run -- but the point labelled D is the close of D-1, and it is
+    there. So tonight's residual belongs to D-1: the last session whose close has been
+    published. That is what makes the number appear daily instead of never.
+
+    The decomposition being reconciled is the one that was PUBLISHED for D-1: its
+    book total is read from the stored sleeve row rather than recomputed, so a later
+    close revision cannot silently change the number being checked. Its traded part is
+    read from the broker's fills and priced at D-1's close, and paper's missing short
+    distributions are added back exactly as on the current session.
+
+    Never raises. Every way it can fail to measure is named in the reason field,
+    because an absent residual must never read as a quiet day.
+    """
+    import logging
+
+    from signals.etf_universe import ASSET_CLASS
+
+    log = log or logging.getLogger("execution_pnl.prior")
+    report: dict = {
+        "session": session,
+        "reconciliation": None,
+        "reason": None,
+        "book_total": float(book_total),
+        "execution_total": None,
+        "fill_count": 0,
+        "carry_short": float(carry_short or 0.0),
+    }
+
+    try:
+        from execution.alpaca_paper import (
+            EquityHistoryReadError,
+            connect,
+            fetch_equity_history,
+            fetch_session_fills,
+        )
+
+        if client is None:
+            client = connect(dry_run=False)
+        if client is None:
+            report["reason"] = "no Alpaca client"
+            return report
+
+        try:
+            fills = fetch_session_fills(client, session)
+        except Exception as exc:
+            # A read failure is not a quiet session; the residual is unavailable.
+            report["reason"] = str(exc)
+            log.warning("prior reconciliation: fills for %s unavailable: %s", session, exc)
+            return report
+
+        pnl = execution_pnl(fills, close, sleeve_of=ASSET_CLASS, session=session)
+        report["execution_total"] = pnl.total
+        report["fill_count"] = pnl.fill_count
+
+        try:
+            equity = fetch_equity_history(client, session)
+        except EquityHistoryReadError as exc:
+            report["reason"] = str(exc)
+            log.warning("prior reconciliation: equity for %s unavailable: %s", session, exc)
+            return report
+
+        change = session_equity_change(equity, list(sessions or []), session)
+        if change is None:
+            report["reason"] = (
+                equity_pair_reason(equity, list(sessions or []), session)
+                or "no end-of-day equity on both sides of this session"
+            )
+            return report
+
+        expected = float(book_total) + pnl.total - float(carry_short or 0.0)
+        report["reconciliation"] = reconcile(expected, change)
+        if report["reconciliation"]["warn"]:
+            log.warning(
+                "prior-session reconciliation for %s does not reconcile: pipeline "
+                "%.2f + execution %.2f + paper add-back %.2f vs equity change %.2f "
+                "(gap %.2f)",
+                session, book_total, pnl.total, -float(carry_short or 0.0), change,
+                report["reconciliation"]["gap"],
+            )
+        return report
+
+    except Exception as exc:  # bookkeeping: name it, never fail the run
+        report["reason"] = f"{type(exc).__name__}: {exc}"
+        log.warning("prior reconciliation unavailable for %s: %s", session, report["reason"])
+        return report
+
+
 def record_execution_component(
     *,
     session: str,

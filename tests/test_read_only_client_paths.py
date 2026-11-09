@@ -36,7 +36,8 @@ SOURCE_DIRS = ("execution", "risk", "scripts", "signals", "dashboard")
 # and the value is how many call sites that file has, so a second one cannot slip in.
 EXPECTED_CALL_SITES: dict[str, int] = {
     "execution/snapshot.py": 2,          # the read-only helper, and its fallback
-    "risk/execution_pnl.py": 1,          # step 8 fallback, when no client was handed in
+    "risk/execution_pnl.py": 2,          # step 8 fallback + the prior-session residual,
+                                         # both when no client was handed in
     "scripts/run_execution.py": 1,       # the execution job (order-placing)
     "scripts/backfill_execution_run.py": 1,  # the crash-recovery replay
     "scripts/sync_positions_from_alpaca.py": 1,  # the manual re-sync

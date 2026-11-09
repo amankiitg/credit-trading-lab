@@ -310,7 +310,9 @@ def test_a_session_with_no_equity_point_is_reported_not_guessed(monkeypatch) -> 
 
     assert report["status"] == "ok"
     assert report["reconciliation"] is None
-    assert "equity" in report["reason"]
+    # The reason lives on its own field now, so the execution total can stay on the
+    # email while only the residual is named unavailable.
+    assert "equity" in report["reconciliation_reason"]
 
 
 def test_step_eight_attaches_the_execution_block(monkeypatch) -> None:
@@ -331,7 +333,10 @@ def test_step_eight_attaches_the_execution_block(monkeypatch) -> None:
         lambda tickers, close_index, **k: pd.DataFrame({"TLT": [0.0, 0.3432]}, index=index),
     )
     monkeypatch.setattr(div_mod, "dividends_as_of", lambda raw_dir=None: trade_date)
-    monkeypatch.setattr(sb, "fetch_position_snapshot", lambda d: [{"ticker": "TLT", "shares": -330.0}])
+    monkeypatch.setattr(
+        sb, "fetch_position_snapshot",
+        lambda d, **k: [{"ticker": "TLT", "shares": -330.0}],
+    )
     monkeypatch.setattr(sb, "write_daily_sleeve_pnl", lambda rows: written.extend(rows) or True)
 
     canned = {"status": "ok", "total": 12.5, "by_sleeve": {"rates": 12.5},
@@ -367,7 +372,10 @@ def _step_eight_fixture(monkeypatch):
         lambda tickers, close_index, **k: pd.DataFrame({"TLT": [0.0, 0.3432]}, index=index),
     )
     monkeypatch.setattr(div_mod, "dividends_as_of", lambda raw_dir=None: trade_date)
-    monkeypatch.setattr(sb, "fetch_position_snapshot", lambda d: [{"ticker": "TLT", "shares": -330.0}])
+    monkeypatch.setattr(
+        sb, "fetch_position_snapshot",
+        lambda d, **k: [{"ticker": "TLT", "shares": -330.0}],
+    )
     monkeypatch.setattr(sb, "write_daily_sleeve_pnl", lambda rows: written.append(rows) or True)
     return sb, written, trade_date
 

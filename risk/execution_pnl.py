@@ -195,6 +195,43 @@ def close_equity(
     return None
 
 
+def equity_pair_reason(
+    equity: Mapping[str, float],
+    sessions: list[str],
+    session: str,
+) -> str | None:
+    """Why the equity change for `session` cannot be measured, or None when it can.
+
+    A bare None from session_equity_change cannot distinguish the three ways a pair is
+    missing, and they are not the same thing in an email:
+
+      - the session is not in the calendar at all (a weekend, a holiday);
+      - the previous close has no stamp (the book has no opening value);
+      - THIS session's close has no stamp yet. That is the normal state of an evening
+        run: the endpoint labels each close with the FOLLOWING calendar day, so a run
+        at 17:30 ET on day D is asking for a point labelled D+1, which the broker has
+        not written yet.
+
+    Naming it is the difference between "the reconciliation has nothing to compare"
+    and "the equity close has not been published yet". The answer to the second is to
+    wait for the next run, not to pair an earlier stamp and call it today's.
+    """
+    if session not in sessions:
+        return f"{session} is not a trading session in the calendar"
+    index = sessions.index(session)
+    if index == 0:
+        return (
+            f"{session} is the first session in the calendar, so there is no prior "
+            "equity close to pair it against"
+        )
+    previous = sessions[index - 1]
+    if close_equity(equity, previous) is None:
+        return f"equity close for the previous session {previous} is not published"
+    if close_equity(equity, session) is None:
+        return "equity close not yet published"
+    return None
+
+
 def session_equity_change(
     equity: Mapping[str, float],
     sessions: list[str],
@@ -384,6 +421,7 @@ def record_execution_component(
 
     try:
         from execution.alpaca_paper import (
+            EquityHistoryReadError,
             connect,
             fetch_equity_history,
             fetch_session_fills,
@@ -413,14 +451,22 @@ def record_execution_component(
         # execution run: a decomposition measured close to close cannot be reconciled
         # against a number taken in the middle of the morning, and the difference between
         # the two clocks was larger than every real discrepancy it was meant to find.
-        equity = fetch_equity_history(client, session)
+        try:
+            equity = fetch_equity_history(client, session)
+        except EquityHistoryReadError as exc:
+            # The read failed; this is not the same as "no stamp for this session yet".
+            # The execution total above is still measured, so it stays on the email and
+            # only the reconciliation is named unavailable.
+            report["reconciliation_reason"] = str(exc)
+            log.warning("equity history unavailable for %s: %s", session, exc)
+            return report
+
         change = session_equity_change(equity, list(sessions or []), session)
         if change is None:
-            report["reason"] = (
-                "no end-of-day equity on both sides of this session, so the "
-                "reconciliation has nothing to compare"
+            report["reconciliation_reason"] = (
+                equity_pair_reason(equity, list(sessions or []), session)
+                or "no end-of-day equity on both sides of this session"
             )
-            report["reconciliation_reason"] = report["reason"]
             return report
 
         # The paper account never books the distributions a short position owes, so its
@@ -440,9 +486,12 @@ def record_execution_component(
         try:
             from dashboard.supabase_client import fetch_daily_sleeve_pnl
 
+            # raise_on_error: a DB read failure used to arrive here as an empty table and
+            # be reported as "not enough sessions to compare", which is a data statement
+            # about the book when it is really a statement about the connection.
             book_by_session = {
                 str(row.get("trade_date")): float(row["book_total"])
-                for row in fetch_daily_sleeve_pnl(limit=400)
+                for row in fetch_daily_sleeve_pnl(limit=400, raise_on_error=True)
                 if row.get("book_total") is not None
             }
             report["convention"] = convention_check(

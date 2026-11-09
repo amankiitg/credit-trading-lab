@@ -372,7 +372,11 @@ def record_daily_sleeve_pnl(*, as_of_date: str, log=None, client: object | None 
             return report
         report["prior_date"] = prior_date
 
-        positions = fetch_position_snapshot(prior_date)
+        # raise_on_error: an unreadable positions table must not read as "no snapshot
+        # for that date". The first is a DB fault, the second is a real absence, and the
+        # email says which -- the outer handler turns the raise into
+        # "Sleeve P&L FAILED (error): Supabase read failed: ...".
+        positions = fetch_position_snapshot(prior_date, raise_on_error=True)
         if not positions:
             report["status"] = STATUS_UNCOMPARABLE
             report["reason"] = (

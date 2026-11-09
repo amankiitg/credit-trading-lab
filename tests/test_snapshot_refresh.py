@@ -66,7 +66,9 @@ def _stub_alpaca(monkeypatch, *, nav=101_000.0, book=None, connect_returns=None)
         return client
 
     monkeypatch.setattr(ap, "connect", _connect)
-    monkeypatch.setattr(ap, "get_live_nav", lambda c: nav)
+    # The refresh reads NAV strictly (read_live_nav raises; get_live_nav keeps the
+    # $100,000 order-sizing fallback), so the stub points at the strict reader.
+    monkeypatch.setattr(ap, "read_live_nav", lambda c: nav)
     monkeypatch.setattr(ap, "get_live_book", lambda c, dry_run=False: dict(book))
     return calls
 

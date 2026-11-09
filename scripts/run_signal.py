@@ -216,7 +216,7 @@ def _run(summary: RunSummary) -> int:
 
     # What the hole repair filled during ingest, if anything. surfacing it here is
     # the point of the daily email: a fill is a silent data change otherwise.
-    from signals.raw_repair import last_report
+    from signals.raw_repair import last_lookup_error, last_report
     _repair = last_report() or {}
     for _f in _repair.get("filled", []):
         summary.gap_fills.append(
@@ -224,6 +224,12 @@ def _run(summary: RunSummary) -> int:
         )
     for _t, _why in sorted((_repair.get("refused") or {}).items()):
         summary.extra.append(f"Gap repair refused: {_t} ({_why})")
+    # A repair that could not read the broker leaves no fills and no refusals, which
+    # is exactly what a repair with nothing to do looks like. Say it was unavailable
+    # instead of leaving the absence unexplained.
+    _lookup_error = last_lookup_error()
+    if _lookup_error:
+        summary.extra.append(f"Gap repair: not available ({_lookup_error})")
 
     # -- 4. Run v8.2 signal
     from signals.trend_signal import (

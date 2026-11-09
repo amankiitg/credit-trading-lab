@@ -258,19 +258,32 @@ def connect(dry_run: bool = DRY_RUN_DEFAULT) -> Optional[object]:
 
 # ---------------------------------------------------------------- live NAV
 
-def get_live_nav(client) -> float:
-    """Read the live account equity from Alpaca and return it as a float.
+def read_live_nav(client) -> float:
+    """Read the live account equity, raising when it cannot be measured.
 
-    Used to anchor the NAV-relative position-size cap to the actual book size.
-    Falls back to PAPER_NAV_DEFAULT on any error so the guard still runs.
+    This is the honest form: a broker read that failed is an error, not a NAV. Use
+    it for anything that reports a number (the snapshot the dashboard sizes from, the
+    email) so a fault cannot be laundered into a value.
+    """
+    account = client.get_account()
+    equity = float(account.equity)
+    if equity <= 0:
+        raise ValueError(f"non-positive equity: {equity}")
+    logger.info("live NAV from Alpaca: %.2f", equity)
+    return equity
+
+
+def get_live_nav(client) -> float:
+    """The live account equity, falling back to PAPER_NAV_DEFAULT when unreadable.
+
+    Used to anchor the NAV-relative position-size cap: the guard still has to run on
+    a broker hiccup, and a cap evaluated against the default is conservative for an
+    incremental rebalance. That is an order-sizing decision, which is why this
+    function keeps the fallback -- a reported number must use read_live_nav() instead,
+    or a failed read would be written down as a $100,000 account.
     """
     try:
-        account = client.get_account()
-        equity = float(account.equity)
-        if equity <= 0:
-            raise ValueError(f"non-positive equity: {equity}")
-        logger.info("live NAV from Alpaca: %.2f", equity)
-        return equity
+        return read_live_nav(client)
     except Exception as exc:
         logger.warning(
             "get_live_nav failed, falling back to PAPER_NAV_DEFAULT=%.0f: %s",
@@ -282,6 +295,16 @@ def get_live_nav(client) -> float:
 
 # ---------------------------------------------------------------- the equity anchor
 
+class EquityHistoryReadError(RuntimeError):
+    """The portfolio history could not be read.
+
+    Distinct from "this session's close is not in the history yet", which is a fact
+    about the calendar: an empty mapping from a failed read used to be reported as
+    "no end-of-day equity on both sides of this session", which reads like a data gap
+    and is really an unread broker. The caller names whichever it is.
+    """
+
+
 def fetch_equity_history(client, session_date: str) -> dict[str, float]:
     """End-of-day account equity per calendar day, from the portfolio history -- a read.
 
@@ -291,6 +314,11 @@ def fetch_equity_history(client, session_date: str) -> dict[str, float]:
     reported was larger than any real discrepancy in the book.
 
     Nothing here reads orders or writes anything: one GET on the portfolio history.
+
+    A failed read RAISES. Returning {} would be indistinguishable from a history that
+    simply has no point for this session yet, and those two need different words in the
+    email: one is a broker fault to investigate, the other is the normal state of a run
+    fired before the close stamp exists.
     """
     from datetime import date as _date, timedelta
 
@@ -307,8 +335,13 @@ def fetch_equity_history(client, session_date: str) -> dict[str, float]:
         stamps = list(history.timestamp or [])
         values = list(history.equity or [])
     except Exception as exc:
-        logger.warning("fetch_equity_history(%s) failed: %s", session_date, exc)
-        return {}
+        logger.error(
+            "fetch_equity_history(%s) could not read the portfolio history: %s",
+            session_date, exc,
+        )
+        raise EquityHistoryReadError(
+            f"equity history read failed: {type(exc).__name__}: {exc}"
+        ) from exc
 
     out: dict[str, float] = {}
     for stamp, value in zip(stamps, values):

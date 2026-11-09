@@ -165,6 +165,12 @@ class RunSummary:
         self.execution_note = report.get("note")
 
         convention = report.get("convention") or {}
+        if convention.get("verdict") == "unknown" and convention.get("reason"):
+            # The self-check could not run (too little history, or a failed DB read).
+            # Left unsaid it is indistinguishable from a check that passed.
+            self.extra.append(
+                f"Convention self-check: not available ({convention['reason']})"
+            )
         if convention.get("warning"):
             # The anchor's assumption, not the book, has changed. Say so every run until
             # someone looks: a wrong convention reads as a permanent gap that nobody can
@@ -190,8 +196,13 @@ class RunSummary:
             # A quiet reconciliation used to be rendered nowhere at all: the residual
             # only reached the email when it crossed the warning threshold, so a healthy
             # day and a missing measurement looked identical. Say which one it is.
+            #
+            # "residual" rather than "reconciliation": the measured line above is
+            # "pipeline + execution X vs equity change Y (residual Z)", so this is the
+            # same word for the same quantity when it cannot be measured -- including
+            # the evening case where today's close has not been published yet.
             self.reconciliation_note = (
-                "Reconciliation: not available "
+                "Reconciliation: residual not available "
                 f"({report.get('reconciliation_reason')})"
             )
 

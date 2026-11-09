@@ -302,7 +302,11 @@ def _stub_session(monkeypatch, *, positions, dividends_as_of_value=TRADE_DATE):
     monkeypatch.setattr(
         div_mod, "dividends_as_of", lambda raw_dir=None: dividends_as_of_value
     )
-    monkeypatch.setattr(sb, "fetch_position_snapshot", lambda d: list(positions))
+    # **k: the sleeve run now asks for raise_on_error=True, so a read failure is
+    # named instead of reading as "no snapshot". The stub keeps the same data.
+    monkeypatch.setattr(
+        sb, "fetch_position_snapshot", lambda d, **k: list(positions)
+    )
     monkeypatch.setattr(
         sb, "write_daily_sleeve_pnl", lambda rows: written.extend(rows) or True
     )
@@ -412,7 +416,7 @@ def test_bookkeeping_failures_never_escape(monkeypatch) -> None:
     # reaches the reader that is meant to raise.
     _stub_session(monkeypatch, positions=POSITIONS)
 
-    def _boom(trade_date):
+    def _boom(trade_date, **kwargs):
         raise ConnectionError("supabase unreachable")
 
     monkeypatch.setattr(sb, "fetch_position_snapshot", _boom)

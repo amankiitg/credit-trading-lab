@@ -204,11 +204,11 @@ def _run_signal_with(
     monkeypatch.setattr(sb, "write_decision", lambda day, decision: True)
     monkeypatch.setattr(sb, "write_positions", lambda rows: True)
     monkeypatch.setattr(sb, "execution_column_exists", lambda: True)
-    monkeypatch.setattr(sb, "fetch_daily_sleeve_pnl", lambda limit=400: [])
+    monkeypatch.setattr(sb, "fetch_daily_sleeve_pnl", lambda limit=400, **k: [])
     monkeypatch.setattr(
         sb,
         "fetch_position_snapshot",
-        lambda day: [{"ticker": t, "shares": SHARES} for t in etf.UNIVERSE],
+        lambda day, **k: [{"ticker": t, "shares": SHARES} for t in etf.UNIVERSE],
     )
     monkeypatch.setattr(
         sb, "write_daily_sleeve_pnl", lambda rows: written.extend(rows) or True

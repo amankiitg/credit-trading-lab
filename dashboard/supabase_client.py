@@ -111,12 +111,24 @@ def fetch_decision_for_date(trade_date: str) -> str | None:
 
 # ---------------------------------------------------------------- positions
 
-def fetch_positions(latest_only: bool = True) -> list[dict]:
+def fetch_positions(
+    latest_only: bool = True, *, raise_on_error: bool = False
+) -> list[dict]:
     """Return position rows. When latest_only=True, returns only the most
     recent trade_date's rows (the current live book state).
+
+    raise_on_error=True makes an unreadable table RAISE instead of returning [].
+    That distinction is what stops the execution job from treating a failed read
+    as an empty book: the two are opposite facts, and one of them means "place the
+    whole target book as orders". The dashboard keeps the default so its existing
+    read paths are unchanged.
     """
     client = get_supabase_client()
     if client is None:
+        if raise_on_error:
+            raise RuntimeError(
+                "Supabase read failed: no client (SUPABASE_URL/SUPABASE_SECRET_KEY unset)"
+            )
         return []
     try:
         if latest_only:
@@ -146,20 +158,37 @@ def fetch_positions(latest_only: bool = True) -> list[dict]:
                 .execute()
             )
         return resp.data or []
-    except Exception:
+    except Exception as exc:
+        _log.error("fetch_positions failed: %s", exc)
+        if raise_on_error:
+            raise RuntimeError(
+                f"Supabase read failed: {type(exc).__name__}: {exc}"
+            ) from exc
         return []
 
 
-def fetch_position_snapshot(trade_date: str) -> list[dict]:
+def fetch_position_snapshot(
+    trade_date: str, *, raise_on_error: bool = False
+) -> list[dict]:
     """Every position row for one trade_date, or [] when there is none.
 
     The sleeve decomposition needs the book as it stood at a specific session's close
     rather than the latest one: the latest snapshot for a session is rewritten by the
     signal run that asks for it, which is that session's closing book, not the book
     that was held into it.
+
+    raise_on_error=True makes an unreadable table RAISE instead of reading as "no
+    snapshot for this date". The two are different facts -- a missing session and a
+    failed query -- and a bookkeeping report that calls a DB fault "no snapshot" is
+    the same conflation as a broker fault called a quiet trading day. Default stays
+    False so the dashboard's read paths keep their existing contract.
     """
     client = get_supabase_client()
     if client is None:
+        if raise_on_error:
+            raise RuntimeError(
+                "Supabase read failed: no client (SUPABASE_URL/SUPABASE_SECRET_KEY unset)"
+            )
         return []
     try:
         resp = (
@@ -172,6 +201,10 @@ def fetch_position_snapshot(trade_date: str) -> list[dict]:
         return resp.data or []
     except Exception as exc:
         _log.error("fetch_position_snapshot(%s) failed: %s", trade_date, exc)
+        if raise_on_error:
+            raise RuntimeError(
+                f"Supabase read failed: {type(exc).__name__}: {exc}"
+            ) from exc
         return []
 
 
@@ -469,15 +502,25 @@ def write_daily_sleeve_pnl(rows: list[dict]) -> bool:
         return False
 
 
-def fetch_daily_sleeve_pnl(limit: int = 2000) -> list[dict]:
+def fetch_daily_sleeve_pnl(
+    limit: int = 2000, *, raise_on_error: bool = False
+) -> list[dict]:
     """Sleeve P&L rows, newest first. Four rows per session.
 
     2000 rows is 500 sessions, which is more than the table will hold for a while; the
     dashboard's chart needs the whole history rather than a window, so the limit is
     only a guard against an unbounded read.
+
+    raise_on_error=True is for the run's own self-checks, which must not report a new
+    install (an empty table) and a database that could not be reached as the same
+    thing. The dashboard keeps the default.
     """
     client = get_supabase_client()
     if client is None:
+        if raise_on_error:
+            raise RuntimeError(
+                "Supabase read failed: no client (SUPABASE_URL/SUPABASE_SECRET_KEY unset)"
+            )
         return []
     try:
         resp = (
@@ -490,4 +533,8 @@ def fetch_daily_sleeve_pnl(limit: int = 2000) -> list[dict]:
         return resp.data or []
     except Exception as exc:
         _log.error("fetch_daily_sleeve_pnl failed: %s", exc)
+        if raise_on_error:
+            raise RuntimeError(
+                f"Supabase read failed: {type(exc).__name__}: {exc}"
+            ) from exc
         return []

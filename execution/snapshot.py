@@ -93,7 +93,7 @@ def refresh_snapshot(
 
     try:
         from dashboard.supabase_client import set_setting, write_positions
-        from execution.alpaca_paper import connect, get_live_book, get_live_nav
+        from execution.alpaca_paper import connect, get_live_book, read_live_nav
 
         # A client passed in is used as it is: the signal job builds one just above and
         # shares it with step 8. Otherwise build one here, with dry_run=False explicitly,
@@ -108,7 +108,20 @@ def refresh_snapshot(
             return report
 
         today = run_date or date.today().isoformat()
-        nav_live = get_live_nav(client)
+        # Strict, not get_live_nav(): that one falls back to a $100,000 default so an
+        # order-sizing guard can still run, which is right for sizing and wrong here.
+        # A failed read written to settings.live_nav becomes the account's stated NAV,
+        # and every weight in this snapshot would be divided by it.
+        try:
+            nav_live = read_live_nav(client)
+        except Exception as exc:
+            report["skipped"] = (
+                f"live NAV unreadable ({type(exc).__name__}: {exc}); "
+                "nothing written, the cached snapshot is unchanged"
+            )
+            report["failed"] = True
+            log.warning("snapshot refresh failed: %s", report["skipped"])
+            return report
         book = get_live_book(client, dry_run=False)
 
         nav_written = set_setting("live_nav", str(round(nav_live, 2)))

@@ -23,6 +23,13 @@ import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Iterable, Mapping
+from zoneinfo import ZoneInfo
+
+# The session boundary is New York's, not UTC's. A US equity session runs 14:30-21:00
+# UTC, so regular-hours fills agree either way -- but the book's timestamps must not be
+# read as if the trading day ended at midnight UTC: an after-hours fill at 20:30 ET is
+# 01:30 UTC the NEXT day, and the UTC read would book it to the wrong session.
+SESSION_TZ = ZoneInfo("America/New_York")
 
 # Alpaca's fill sides. sell_short and buy_to_cover are the short leg's two directions,
 # and they sign the same way as sell and buy respectively: the sign belongs to the
@@ -83,9 +90,12 @@ def signed_shares(fill: Mapping[str, object]) -> float:
 def session_of(fill: Mapping[str, object]) -> str | None:
     """The session a fill belongs to, or None when its timestamp will not parse.
 
-    Alpaca stamps fills in UTC. A US equity session runs 14:30-21:00 UTC, so no session
-    fill lands on a different UTC date from the New York date it traded on; taking the
-    UTC date is therefore correct here and avoids inventing a calendar rule.
+    Alpaca stamps fills in UTC. The session is the New York trading date, so the stamp
+    is converted to America/New_York before the date is taken. For the regular session
+    the UTC date happens to agree (14:30-21:00 UTC), which is what made the old UTC-only
+    reading look right; it disagrees for anything after 19:00 ET, where UTC has already
+    rolled over to the next day and the fill would be credited to a session that has not
+    happened yet.
     """
     stamp = fill.get("transaction_time") or fill.get("date")
     if not stamp:
@@ -101,7 +111,7 @@ def session_of(fill: Mapping[str, object]) -> str | None:
         return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc).date().isoformat()
+    return parsed.astimezone(SESSION_TZ).date().isoformat()
 
 
 def execution_pnl(
@@ -182,6 +192,43 @@ def close_equity(
     for stamp in sorted(equity):
         if date.fromisoformat(str(stamp)) > day:
             return float(equity[stamp])
+    return None
+
+
+def equity_pair_reason(
+    equity: Mapping[str, float],
+    sessions: list[str],
+    session: str,
+) -> str | None:
+    """Why the equity change for `session` cannot be measured, or None when it can.
+
+    A bare None from session_equity_change cannot distinguish the three ways a pair is
+    missing, and they are not the same thing in an email:
+
+      - the session is not in the calendar at all (a weekend, a holiday);
+      - the previous close has no stamp (the book has no opening value);
+      - THIS session's close has no stamp yet. That is the normal state of an evening
+        run: the endpoint labels each close with the FOLLOWING calendar day, so a run
+        at 17:30 ET on day D is asking for a point labelled D+1, which the broker has
+        not written yet.
+
+    Naming it is the difference between "the reconciliation has nothing to compare"
+    and "the equity close has not been published yet". The answer to the second is to
+    wait for the next run, not to pair an earlier stamp and call it today's.
+    """
+    if session not in sessions:
+        return f"{session} is not a trading session in the calendar"
+    index = sessions.index(session)
+    if index == 0:
+        return (
+            f"{session} is the first session in the calendar, so there is no prior "
+            "equity close to pair it against"
+        )
+    previous = sessions[index - 1]
+    if close_equity(equity, previous) is None:
+        return f"equity close for the previous session {previous} is not published"
+    if close_equity(equity, session) is None:
+        return "equity close not yet published"
     return None
 
 
@@ -295,24 +342,133 @@ def reconcile(
     }
 
 
-def short_distribution_note(carry_total: float, carry_paper: float = 0.0) -> str:
+def short_distribution_note(carry_short: float) -> str | None:
     """Why paper equity will not match an economic decomposition on a short book.
 
     The broker does not debit a paper account for the distributions a short position
     owes. The decomposition does, because the short owes them. The difference is not an
     error in either number and has to be named, or every reconciliation on a short book
     reads as a few hundred dollars of unexplained loss.
+
+    Only the SHORT leg diverges: paper credits the long leg's dividends as it should.
+    The argument is therefore the carry on short positions only, and a session with no
+    short distribution has nothing to explain -- it must say nothing. The old signature
+    took the whole book's carry and compared it against a hard-coded zero, so on any
+    non-ex-date (carry 0.00) it printed "paper already carries the distributions", which
+    asserts a fact about the broker that was never measured and is false: on 2026-11-09
+    it said this while there was no distribution in the session at all.
     """
-    divergence = float(carry_total) - float(carry_paper)
-    if abs(divergence) < 0.005:
-        return "paper already carries the distributions: no adjustment"
+    carry_short = float(carry_short or 0.0)
+    if abs(carry_short) < 0.005:
+        return None
     return (
         "paper does not debit short distributions: equity is higher than the "
-        f"economic book by {-divergence:,.2f} dollars"
+        f"economic book by {-carry_short:,.2f} dollars"
     )
 
 
 # ---------------------------------------------------------------- the daily job's hook
+
+
+def record_prior_reconciliation(
+    *,
+    session: str,
+    close: Mapping[str, float],
+    sessions: list[str],
+    book_total: float,
+    carry_short: float,
+    log=None,
+    client: object | None = None,
+) -> dict:
+    """Reconcile the session that ended before the one the run just measured.
+
+    The equity history stamps each close with the FOLLOWING calendar day. At 17:30 ET
+    on session D the point labelled D+1 does not exist, so D's own residual cannot be
+    measured by that run -- but the point labelled D is the close of D-1, and it is
+    there. So tonight's residual belongs to D-1: the last session whose close has been
+    published. That is what makes the number appear daily instead of never.
+
+    The decomposition being reconciled is the one that was PUBLISHED for D-1: its
+    book total is read from the stored sleeve row rather than recomputed, so a later
+    close revision cannot silently change the number being checked. Its traded part is
+    read from the broker's fills and priced at D-1's close, and paper's missing short
+    distributions are added back exactly as on the current session.
+
+    Never raises. Every way it can fail to measure is named in the reason field,
+    because an absent residual must never read as a quiet day.
+    """
+    import logging
+
+    from signals.etf_universe import ASSET_CLASS
+
+    log = log or logging.getLogger("execution_pnl.prior")
+    report: dict = {
+        "session": session,
+        "reconciliation": None,
+        "reason": None,
+        "book_total": float(book_total),
+        "execution_total": None,
+        "fill_count": 0,
+        "carry_short": float(carry_short or 0.0),
+    }
+
+    try:
+        from execution.alpaca_paper import (
+            EquityHistoryReadError,
+            connect,
+            fetch_equity_history,
+            fetch_session_fills,
+        )
+
+        if client is None:
+            client = connect(dry_run=False)
+        if client is None:
+            report["reason"] = "no Alpaca client"
+            return report
+
+        try:
+            fills = fetch_session_fills(client, session)
+        except Exception as exc:
+            # A read failure is not a quiet session; the residual is unavailable.
+            report["reason"] = str(exc)
+            log.warning("prior reconciliation: fills for %s unavailable: %s", session, exc)
+            return report
+
+        pnl = execution_pnl(fills, close, sleeve_of=ASSET_CLASS, session=session)
+        report["execution_total"] = pnl.total
+        report["fill_count"] = pnl.fill_count
+
+        try:
+            equity = fetch_equity_history(client, session)
+        except EquityHistoryReadError as exc:
+            report["reason"] = str(exc)
+            log.warning("prior reconciliation: equity for %s unavailable: %s", session, exc)
+            return report
+
+        change = session_equity_change(equity, list(sessions or []), session)
+        if change is None:
+            report["reason"] = (
+                equity_pair_reason(equity, list(sessions or []), session)
+                or "no end-of-day equity on both sides of this session"
+            )
+            return report
+
+        expected = float(book_total) + pnl.total - float(carry_short or 0.0)
+        report["reconciliation"] = reconcile(expected, change)
+        if report["reconciliation"]["warn"]:
+            log.warning(
+                "prior-session reconciliation for %s does not reconcile: pipeline "
+                "%.2f + execution %.2f + paper add-back %.2f vs equity change %.2f "
+                "(gap %.2f)",
+                session, book_total, pnl.total, -float(carry_short or 0.0), change,
+                report["reconciliation"]["gap"],
+            )
+        return report
+
+    except Exception as exc:  # bookkeeping: name it, never fail the run
+        report["reason"] = f"{type(exc).__name__}: {exc}"
+        log.warning("prior reconciliation unavailable for %s: %s", session, report["reason"])
+        return report
 
 
 def record_execution_component(
@@ -322,6 +478,7 @@ def record_execution_component(
     sessions: list[str] | None = None,
     carry_total: float,
     book_total: float,
+    carry_short: float | None = None,
     log=None,
     client: object | None = None,
 ) -> dict:
@@ -336,6 +493,18 @@ def record_execution_component(
     from signals.etf_universe import ASSET_CLASS
 
     log = log or logging.getLogger("sleeve_pnl.execution")
+
+    # Paper credits a long position's dividends and does not debit a short position's,
+    # so only the short leg needs adding back. The caller measures that leg exactly
+    # (every position in the prior snapshot with negative shares). When it cannot, the
+    # conservative reading is the negative part of the book's carry: a long-only payout
+    # needs no adjustment, because the broker already paid it.
+    short_carry = (
+        float(carry_short)
+        if carry_short is not None
+        else min(float(carry_total or 0.0), 0.0)
+    )
+
     report: dict = {
         "status": "unavailable",
         "reason": None,
@@ -344,13 +513,16 @@ def record_execution_component(
         "fill_count": 0,
         "skipped": [],
         "reconciliation": None,
+        "reconciliation_reason": None,
         "convention": None,
-        "paper_add_back": -float(carry_total or 0.0),
-        "note": short_distribution_note(carry_total),
+        "carry_short": short_carry,
+        "paper_add_back": -short_carry,
+        "note": short_distribution_note(short_carry),
     }
 
     try:
         from execution.alpaca_paper import (
+            EquityHistoryReadError,
             connect,
             fetch_equity_history,
             fetch_session_fills,
@@ -380,20 +552,30 @@ def record_execution_component(
         # execution run: a decomposition measured close to close cannot be reconciled
         # against a number taken in the middle of the morning, and the difference between
         # the two clocks was larger than every real discrepancy it was meant to find.
-        equity = fetch_equity_history(client, session)
+        try:
+            equity = fetch_equity_history(client, session)
+        except EquityHistoryReadError as exc:
+            # The read failed; this is not the same as "no stamp for this session yet".
+            # The execution total above is still measured, so it stays on the email and
+            # only the reconciliation is named unavailable.
+            report["reconciliation_reason"] = str(exc)
+            log.warning("equity history unavailable for %s: %s", session, exc)
+            return report
+
         change = session_equity_change(equity, list(sessions or []), session)
         if change is None:
-            report["reason"] = (
-                "no end-of-day equity on both sides of this session, so the "
-                "reconciliation has nothing to compare"
+            report["reconciliation_reason"] = (
+                equity_pair_reason(equity, list(sessions or []), session)
+                or "no end-of-day equity on both sides of this session"
             )
             return report
 
         # The paper account never books the distributions a short position owes, so its
-        # equity sits above the economic book by exactly that amount. Adding it back is
-        # the only way the two sides describe the same thing; without it every short
-        # month reads as a few hundred dollars nobody can account for.
-        add_back = -float(carry_total or 0.0)
+        # equity sits above the economic book by exactly that amount. Adding back the
+        # short leg is the only way the two sides describe the same thing; without it
+        # every short month reads as a few hundred dollars nobody can account for. The
+        # long leg is NOT added back: paper already paid it.
+        add_back = -short_carry
         report["paper_add_back"] = add_back
         expected = float(book_total) + pnl.total + add_back
         report["reconciliation"] = reconcile(expected, change)
@@ -405,9 +587,12 @@ def record_execution_component(
         try:
             from dashboard.supabase_client import fetch_daily_sleeve_pnl
 
+            # raise_on_error: a DB read failure used to arrive here as an empty table and
+            # be reported as "not enough sessions to compare", which is a data statement
+            # about the book when it is really a statement about the connection.
             book_by_session = {
                 str(row.get("trade_date")): float(row["book_total"])
-                for row in fetch_daily_sleeve_pnl(limit=400)
+                for row in fetch_daily_sleeve_pnl(limit=400, raise_on_error=True)
                 if row.get("book_total") is not None
             }
             report["convention"] = convention_check(

@@ -144,13 +144,22 @@ def test_the_warning_threshold_is_exclusive_at_exactly_the_boundary() -> None:
 
 
 def test_the_short_distribution_adjustment_is_named_not_absorbed() -> None:
-    """Paper never debits a short its distributions; the note has to say so."""
+    """Paper never debits a short its distributions; the note has to say so.
+
+    A session with no short distribution has nothing to explain and must say NOTHING.
+    The old note compared the book's carry against a hard-coded zero and so printed
+    "paper already carries the distributions" on every non-ex-date -- on 2026-11-09,
+    where there was no distribution at all. That sentence claims the broker was
+    measured, which it was not, and contradicts the measured fact that paper does not
+    debit a short's distributions.
+    """
     note = ep.short_distribution_note(-436.18)
 
     assert "does not debit short distributions" in note
     assert "436.18" in note
 
-    assert "no adjustment" in ep.short_distribution_note(0.0)
+    assert ep.short_distribution_note(0.0) is None
+    assert "paper already carries" not in (ep.short_distribution_note(0.0) or "")
 
 
 def test_a_monday_with_no_stamp_of_its_own_still_has_a_close() -> None:
@@ -301,7 +310,9 @@ def test_a_session_with_no_equity_point_is_reported_not_guessed(monkeypatch) -> 
 
     assert report["status"] == "ok"
     assert report["reconciliation"] is None
-    assert "equity" in report["reason"]
+    # The reason lives on its own field now, so the execution total can stay on the
+    # email while only the residual is named unavailable.
+    assert "equity" in report["reconciliation_reason"]
 
 
 def test_step_eight_attaches_the_execution_block(monkeypatch) -> None:
@@ -322,7 +333,10 @@ def test_step_eight_attaches_the_execution_block(monkeypatch) -> None:
         lambda tickers, close_index, **k: pd.DataFrame({"TLT": [0.0, 0.3432]}, index=index),
     )
     monkeypatch.setattr(div_mod, "dividends_as_of", lambda raw_dir=None: trade_date)
-    monkeypatch.setattr(sb, "fetch_position_snapshot", lambda d: [{"ticker": "TLT", "shares": -330.0}])
+    monkeypatch.setattr(
+        sb, "fetch_position_snapshot",
+        lambda d, **k: [{"ticker": "TLT", "shares": -330.0}],
+    )
     monkeypatch.setattr(sb, "write_daily_sleeve_pnl", lambda rows: written.extend(rows) or True)
 
     canned = {"status": "ok", "total": 12.5, "by_sleeve": {"rates": 12.5},
@@ -358,7 +372,10 @@ def _step_eight_fixture(monkeypatch):
         lambda tickers, close_index, **k: pd.DataFrame({"TLT": [0.0, 0.3432]}, index=index),
     )
     monkeypatch.setattr(div_mod, "dividends_as_of", lambda raw_dir=None: trade_date)
-    monkeypatch.setattr(sb, "fetch_position_snapshot", lambda d: [{"ticker": "TLT", "shares": -330.0}])
+    monkeypatch.setattr(
+        sb, "fetch_position_snapshot",
+        lambda d, **k: [{"ticker": "TLT", "shares": -330.0}],
+    )
     monkeypatch.setattr(sb, "write_daily_sleeve_pnl", lambda rows: written.append(rows) or True)
     return sb, written, trade_date
 

@@ -1,3 +1,9 @@
+# alpaca-py is PINNED, and pinned identically in pyproject.toml. The cron jobs talk to
+# the trading API through this SDK, so a resolver picking a newer release is a change
+# to production behaviour at build time. 0.45.0 is the version Render resolves today
+# (pyproject's old floor >=0.8 + newest on PyPI) and the version the contract test in
+# tests/test_alpaca_sdk_contract.py checks the code against.
+alpaca-py==0.45.0
 anyio==4.12.1
 appnope==0.1.4
 argon2-cffi==25.1.0

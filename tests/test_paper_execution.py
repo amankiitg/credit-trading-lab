@@ -1686,7 +1686,13 @@ def _run_execution_with_stub(
     )
     monkeypatch.setattr(sb_mod, "get_auto_approve", lambda: True)
     monkeypatch.setattr(sb_mod, "fetch_decision_for_date", lambda d: decision)
-    monkeypatch.setattr(sb_mod, "fetch_positions", lambda latest_only=True: [])
+    # Every run in this harness starts from an empty snapshot and reads the book live
+    # from Alpaca. That is a first run, and the job now requires it to be declared:
+    # an empty snapshot alone is no longer evidence of one.
+    monkeypatch.setenv("EXECUTION_FIRST_RUN", "1")
+    monkeypatch.setattr(
+        sb_mod, "fetch_positions", lambda latest_only=True, **k: []
+    )
 
     written: dict[str, list] = {"positions": [], "pnl": [], "rejections": [], "attribution": []}
     monkeypatch.setattr(

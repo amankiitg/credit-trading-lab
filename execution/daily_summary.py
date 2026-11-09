@@ -54,6 +54,10 @@ class RunSummary:
     exit_code: int = 0
     status: str | None = None       # explicit mark; None means derive from exit_code
     reason: str | None = None
+    # A fail-closed refusal that stopped the job before it could act. Rendered with
+    # the [FAILED] prefix so the single most important fact of that run is in the
+    # body even when the subject line is only the generic [FAIL] job date.
+    failure: str | None = None
     signal_as_of: str | None = None
     nav_frozen: float | None = None
     nav_live: float | None = None
@@ -84,6 +88,7 @@ class RunSummary:
     execution_pnl: dict | None = None
     execution_note: str | None = None
     reconciliation: dict | None = None
+    reconciliation_note: str | None = None
     extra: list[str] = field(default_factory=list)
 
     def mark_skip(self, reason: str) -> None:
@@ -120,6 +125,11 @@ class RunSummary:
         # the session either way, and the reconciliation it drives is the only thing that
         # would notice the two disagreeing.
         self.record_execution_pnl(report.get("execution"))
+        # The residual the email carries is the PREVIOUS session's. At 17:30 ET the
+        # session being measured has no equity close yet (it is stamped tomorrow);
+        # the previous session's close is stamped today and is published. Step 8
+        # supplies that block whenever it could attempt the measurement.
+        self.record_prior_reconciliation(report.get("prior_reconciliation"))
 
         if report.get("written"):
             self.sleeve_pnl = {
@@ -164,6 +174,12 @@ class RunSummary:
         self.execution_note = report.get("note")
 
         convention = report.get("convention") or {}
+        if convention.get("verdict") == "unknown" and convention.get("reason"):
+            # The self-check could not run (too little history, or a failed DB read).
+            # Left unsaid it is indistinguishable from a check that passed.
+            self.extra.append(
+                f"Convention self-check: not available ({convention['reason']})"
+            )
         if convention.get("warning"):
             # The anchor's assumption, not the book, has changed. Say so every run until
             # someone looks: a wrong convention reads as a permanent gap that nobody can
@@ -185,6 +201,42 @@ class RunSummary:
                     f"{reconciliation['nav_change']:+,.2f}, a gap of "
                     f"{reconciliation['gap']:+,.2f} dollars. {report.get('note') or ''}"
                 ).strip()
+        elif report.get("reconciliation_reason"):
+            # A quiet reconciliation used to be rendered nowhere at all: the residual
+            # only reached the email when it crossed the warning threshold, so a healthy
+            # day and a missing measurement looked identical. Say which one it is.
+            #
+            # "residual" rather than "reconciliation": the measured line above is
+            # "pipeline + execution X vs equity change Y (residual Z)", so this is the
+            # same word for the same quantity when it cannot be measured -- including
+            # the evening case where today's close has not been published yet.
+            self.reconciliation_note = (
+                "Reconciliation: residual not available "
+                f"({report.get('reconciliation_reason')})"
+            )
+
+    def record_prior_reconciliation(self, report: dict | None) -> None:
+        """The residual for the previous session, which is the one the evening can measure.
+
+        Replaces the current session's "not yet published" note when step 8 attempted
+        the measurement: that note is the expected state of every 17:30 ET run and is
+        not news once the previous session's residual is on the email. A prior block
+        that could not be measured keeps its own named reason, with its date, so a
+        blank line can never be read as a quiet day.
+        """
+        if not report:
+            return
+        session = report.get("session") or "previous session"
+        reconciliation = report.get("reconciliation")
+        if reconciliation:
+            self.reconciliation = {**reconciliation, "session": session}
+            self.reconciliation_note = None
+            return
+        reason = report.get("reason") or "no reason recorded"
+        self.reconciliation = None
+        self.reconciliation_note = (
+            f"Reconciliation ({session}): residual not available ({reason})"
+        )
 
 
 # Severity order for the subject line. A failed basis refresh lifts a clean run to
@@ -234,6 +286,9 @@ def body_for(summary: RunSummary, last_step: str | None = None) -> str:
     ]
     if summary.reason:
         lines.append(f"Reason: {summary.reason}")
+    if summary.failure:
+        # The fail-closed refusal, stated in the words the operator acts on.
+        lines.append(f"[FAILED] {summary.failure}")
     if summary.signal_as_of:
         lines.append(f"Signal as_of_date: {summary.signal_as_of}")
     if summary.data_check:
@@ -309,6 +364,29 @@ def body_for(summary: RunSummary, last_step: str | None = None) -> str:
         )
     if summary.execution_note:
         lines.append(summary.execution_note)
+
+    # The residual is the whole point of the reconciliation: it is the only number that
+    # says whether the decomposition explains the account. Print it on every healthy
+    # run, not only when it is large enough to warn -- a residual that is never shown
+    # cannot be watched, and "no line" must never be read as "nothing to report".
+    if summary.reconciliation is not None:
+        session = summary.reconciliation.get("session")
+        if session:
+            # The previous session's residual. One line, dated, every run: the
+            # session it belongs to is not the run date, and an undated number
+            # would read as today's.
+            gap = float(summary.reconciliation["gap"])
+            money = f"-${abs(gap):,.2f}" if gap < 0 else f"${gap:,.2f}"
+            lines.append(f"Reconciliation ({session}): residual {money}")
+        elif not summary.reconciliation.get("warn"):
+            lines.append(
+                "Reconciliation: pipeline + execution "
+                f"{summary.reconciliation['expected']:+,.2f} vs equity change "
+                f"{summary.reconciliation['nav_change']:+,.2f} "
+                f"(residual {summary.reconciliation['gap']:+,.2f})"
+            )
+    elif summary.reconciliation_note:
+        lines.append(summary.reconciliation_note)
 
     lines.append(
         f"Orders: {len(summary.filled)} filled, {len(summary.skipped)} skipped, "

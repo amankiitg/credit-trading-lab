@@ -39,10 +39,21 @@ SOURCE_TAG: str = "alpaca_iex"
 # complete by the time the caller reads it.
 LAST_REPORT: dict | None = None
 
+# Why the last bar lookup could not run, or None when it did. A repair that returned
+# no bars used to be indistinguishable from a session with no holes: both leave the
+# report with nothing filled, so the email said nothing. This is the reason the run
+# can print instead of silence.
+LAST_LOOKUP_ERROR: str | None = None
+
 
 def last_report() -> dict | None:
     """The most recent repair report, or None if no repair has run yet."""
     return LAST_REPORT
+
+
+def last_lookup_error() -> str | None:
+    """Why the last Alpaca bar lookup could not run, or None when it did."""
+    return LAST_LOOKUP_ERROR
 
 
 def close_matrix(frames: dict[str, pd.DataFrame]) -> pd.DataFrame:
@@ -111,11 +122,18 @@ def _default_bar_lookup(tickers: list[str], dates: list[pd.Timestamp]) -> dict:
     """Daily bars from Alpaca IEX. Returns {} on any failure, never raises.
 
     A repair that cannot run must not break the ingest that called it: the
-    data-quality gate downstream is the backstop.
+    data-quality gate downstream is the backstop. The failure is recorded in
+    LAST_LOOKUP_ERROR so the run can say the repair was unavailable instead of
+    reporting an empty fill list, which is what a repair with nothing to do also
+    looks like.
     """
     import os
 
+    global LAST_LOOKUP_ERROR
+    LAST_LOOKUP_ERROR = None
+
     if not (os.environ.get("ALPACA_PAPER_API_KEY") and os.environ.get("ALPACA_PAPER_SECRET_KEY")):
+        LAST_LOOKUP_ERROR = "ALPACA_PAPER_API_KEY/ALPACA_PAPER_SECRET_KEY not set"
         logger.warning("hole repair: ALPACA credentials absent, skipping")
         return {}
     try:
@@ -150,6 +168,7 @@ def _default_bar_lookup(tickers: list[str], dates: list[pd.Timestamp]) -> dict:
             for bar in series
         }
     except Exception as exc:
+        LAST_LOOKUP_ERROR = f"Alpaca IEX lookup failed: {type(exc).__name__}: {exc}"
         logger.warning(
             "hole repair: Alpaca IEX lookup failed (%s: %s), skipping repair",
             type(exc).__name__, exc,

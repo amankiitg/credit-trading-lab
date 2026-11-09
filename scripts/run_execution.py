@@ -36,6 +36,10 @@ Env vars required:
   SUPABASE_URL, SUPABASE_SECRET_KEY
   ALPACA_PAPER_API_KEY, ALPACA_PAPER_SECRET_KEY
 
+Env var for an intentional cold start:
+  EXECUTION_FIRST_RUN=1 -- the only way this job will trade when the stored position
+  snapshot is empty. A failed snapshot read is never treated as an empty book.
+
 The dashboard service must NOT have the Alpaca keys. This script is the
 only path to the paper account.
 """
@@ -47,7 +51,7 @@ import os
 import sys
 from datetime import date
 
-from execution.daily_summary import RunSummary
+from execution.daily_summary import FAIL, RunSummary
 
 logging.basicConfig(
     level=logging.INFO,
@@ -68,6 +72,36 @@ EXECUTION_JOB_MAX_SECS: float = float(
 # 2026-09-24 the stored signal was two sessions stale and the book was still
 # traded against it. Override with MAX_STALE_SESSIONS.
 MAX_STALE_SESSIONS: int = int(os.environ.get("MAX_STALE_SESSIONS", "2"))
+
+# The one explicit way to run against an empty position snapshot.
+#
+# The cached snapshot is the sizing basis, so an empty read is not "a flat book" --
+# it is either a first run with nothing stored yet or a failed read. The two used to
+# be the same code path: fetch_positions returned [] on any error and step 6 read that
+# as a first run, which would then size the whole target book as orders. A read
+# failure can therefore never be inferred as an empty book; only this flag may.
+FIRST_RUN_ENV: str = "EXECUTION_FIRST_RUN"
+
+
+def _first_run_requested() -> bool:
+    """True only when the operator explicitly asked for a first run."""
+    return os.environ.get(FIRST_RUN_ENV, "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _refuse_orders(summary: RunSummary, detail: str) -> int:
+    """Fail closed before any order can be computed or submitted.
+
+    The reason is on the summary, so the one email this run sends carries it, and
+    the exit code is non-zero so the scheduler records a failure instead of a quiet
+    successful day. cron_runs is deliberately not written: the next tick retries.
+    """
+    summary.status = FAIL
+    summary.failure = f"positions read failed: no orders placed ({detail})"
+    summary.reason = "execution refused before computing any order"
+    logger.error("REFUSING to trade: %s", summary.failure)
+    return 1
 
 
 def _refresh_basis(summary: RunSummary, *, dry_run: bool) -> None:
@@ -330,7 +364,17 @@ def _run(summary: RunSummary) -> int:
         logger.info("nav=%.2f (frozen Supabase; live Alpaca=%.2f)", nav, nav_live)
 
         from dashboard.supabase_client import fetch_positions as _fetch_positions
-        _pos_rows = _fetch_positions(latest_only=True)
+
+        # Fail closed on the sizing basis. raise_on_error=True is the whole point:
+        # the old read returned [] on a DB error, and [] is also what a first run
+        # looks like -- so a failed read sized the entire target book as orders
+        # against a phantom empty account. A read failure now stops the run here,
+        # before any order is computed, and only EXECUTION_FIRST_RUN can turn an
+        # empty snapshot into a flat book.
+        try:
+            _pos_rows = _fetch_positions(latest_only=True, raise_on_error=True)
+        except Exception as exc:
+            return _refuse_orders(summary, f"{type(exc).__name__}: {exc}")
         current_notionals: dict[str, float] = {
             r["ticker"]: float(r["signed_notional"]) for r in _pos_rows
         }
@@ -351,9 +395,24 @@ def _run(summary: RunSummary) -> int:
                 len(_uncomparable), _uncomparable,
             )
         if not current_notionals:
-            # First ever run -- no Supabase snapshot yet; read live from Alpaca
-            logger.info("no Supabase positions found -- reading live from Alpaca (first run)")
-            current_notionals = get_current_positions(client, dry_run=dry_run)
+            if not _first_run_requested():
+                return _refuse_orders(
+                    summary,
+                    "no stored position snapshot was returned and "
+                    f"{FIRST_RUN_ENV} is not set; an empty snapshot is not a flat book",
+                )
+            # Explicit first run -- no Supabase snapshot yet; read live from Alpaca.
+            # A failure here is still a read failure, not an empty book.
+            logger.info(
+                "%s is set -- no stored positions, reading live from Alpaca (first run)",
+                FIRST_RUN_ENV,
+            )
+            try:
+                current_notionals = get_current_positions(client, dry_run=dry_run)
+            except Exception as exc:
+                return _refuse_orders(
+                    summary, f"live position read failed: {type(exc).__name__}: {exc}"
+                )
         logger.info("current positions: %s", current_notionals)
 
     # -- 6b. Drift check: does the frozen Supabase snapshot above still match

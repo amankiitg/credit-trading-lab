@@ -26,7 +26,10 @@ execution cron fires.
 
 Env vars required:
   SUPABASE_URL, SUPABASE_SECRET_KEY -- for writing decisions and cron_runs.
-  ALPACA_* vars are NOT needed here; this script never touches Alpaca.
+  ALPACA_PAPER_API_KEY, ALPACA_PAPER_SECRET_KEY -- for the post-close reads in steps 7
+    and 8. Both are READ-ONLY: positions, NAV, the session's fills and the equity
+    history. No order is ever placed from this job, and it must never be given a client
+    that could place one.
 """
 
 from __future__ import annotations
@@ -370,10 +373,16 @@ def _run(summary: RunSummary) -> int:
     #        from that snapshot, on purpose, so it has to be refreshed after the
     #        close or the basis ages for as long as nobody trades. Bookkeeping only:
     #        it must never fail a run whose signal is already written.
+    alpaca = None
     with step("7 refresh position snapshot and live_nav from Alpaca", logger):
-        from execution.snapshot import refresh_snapshot
+        from execution.snapshot import open_paper_client, refresh_snapshot
 
-        refresh = refresh_snapshot(run_date=today, log=logger)
+        # One read-only client for steps 7 and 8. Both read the same paper account, and
+        # step 8 used to build its own with a bare connect() -- which returns no client at
+        # all while DRY_RUN_DEFAULT is true, so every evening reported "Execution P&L:
+        # not available (no Alpaca client)" for a read that was never gated by dry run.
+        alpaca = open_paper_client(log=logger)
+        refresh = refresh_snapshot(run_date=today, log=logger, client=alpaca)
 
     # Recorded on the summary rather than logged only, so the email carries the
     # outcome and a failure lifts the subject to [SKIP]. Never changes the exit code.
@@ -390,7 +399,9 @@ def _run(summary: RunSummary) -> int:
 
     with step("8 daily sleeve P&L (carry vs price)", logger):
         with step_budget(SLEEVE_PNL_MAX_SECS, logger):
-            sleeve_report = record_daily_sleeve_pnl(as_of_date=as_of_date, log=logger)
+            sleeve_report = record_daily_sleeve_pnl(
+                as_of_date=as_of_date, log=logger, client=alpaca
+            )
     summary.record_sleeve_pnl(sleeve_report)
     logger.info("run_signal complete for %s", today)
     return 0

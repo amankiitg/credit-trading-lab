@@ -323,6 +323,7 @@ def record_execution_component(
     carry_total: float,
     book_total: float,
     log=None,
+    client: object | None = None,
 ) -> dict:
     """Read the session's fills, price them, and reconcile the total against equity.
 
@@ -355,7 +356,13 @@ def record_execution_component(
             fetch_session_fills,
         )
 
-        client = connect()
+        # The caller's client when it has one: run_signal builds a single client for
+        # step 7 and hands the same object down here. Otherwise build one, and ask for
+        # dry_run=False explicitly -- DRY_RUN_DEFAULT is true on the cron, so a bare
+        # connect() returned None and every evening reported "no Alpaca client" for a
+        # read that never places an order. Step 7 had always done it the other way.
+        if client is None:
+            client = connect(dry_run=False)
         if client is None:
             report["reason"] = "no Alpaca client"
             return report

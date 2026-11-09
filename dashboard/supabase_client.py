@@ -111,12 +111,24 @@ def fetch_decision_for_date(trade_date: str) -> str | None:
 
 # ---------------------------------------------------------------- positions
 
-def fetch_positions(latest_only: bool = True) -> list[dict]:
+def fetch_positions(
+    latest_only: bool = True, *, raise_on_error: bool = False
+) -> list[dict]:
     """Return position rows. When latest_only=True, returns only the most
     recent trade_date's rows (the current live book state).
+
+    raise_on_error=True makes an unreadable table RAISE instead of returning [].
+    That distinction is what stops the execution job from treating a failed read
+    as an empty book: the two are opposite facts, and one of them means "place the
+    whole target book as orders". The dashboard keeps the default so its existing
+    read paths are unchanged.
     """
     client = get_supabase_client()
     if client is None:
+        if raise_on_error:
+            raise RuntimeError(
+                "Supabase read failed: no client (SUPABASE_URL/SUPABASE_SECRET_KEY unset)"
+            )
         return []
     try:
         if latest_only:
@@ -146,7 +158,12 @@ def fetch_positions(latest_only: bool = True) -> list[dict]:
                 .execute()
             )
         return resp.data or []
-    except Exception:
+    except Exception as exc:
+        _log.error("fetch_positions failed: %s", exc)
+        if raise_on_error:
+            raise RuntimeError(
+                f"Supabase read failed: {type(exc).__name__}: {exc}"
+            ) from exc
         return []
 
 

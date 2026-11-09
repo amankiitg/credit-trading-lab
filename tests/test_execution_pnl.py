@@ -144,13 +144,22 @@ def test_the_warning_threshold_is_exclusive_at_exactly_the_boundary() -> None:
 
 
 def test_the_short_distribution_adjustment_is_named_not_absorbed() -> None:
-    """Paper never debits a short its distributions; the note has to say so."""
+    """Paper never debits a short its distributions; the note has to say so.
+
+    A session with no short distribution has nothing to explain and must say NOTHING.
+    The old note compared the book's carry against a hard-coded zero and so printed
+    "paper already carries the distributions" on every non-ex-date -- on 2026-11-09,
+    where there was no distribution at all. That sentence claims the broker was
+    measured, which it was not, and contradicts the measured fact that paper does not
+    debit a short's distributions.
+    """
     note = ep.short_distribution_note(-436.18)
 
     assert "does not debit short distributions" in note
     assert "436.18" in note
 
-    assert "no adjustment" in ep.short_distribution_note(0.0)
+    assert ep.short_distribution_note(0.0) is None
+    assert "paper already carries" not in (ep.short_distribution_note(0.0) or "")
 
 
 def test_a_monday_with_no_stamp_of_its_own_still_has_a_close() -> None:

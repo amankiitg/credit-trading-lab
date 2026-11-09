@@ -84,6 +84,7 @@ class RunSummary:
     execution_pnl: dict | None = None
     execution_note: str | None = None
     reconciliation: dict | None = None
+    reconciliation_note: str | None = None
     extra: list[str] = field(default_factory=list)
 
     def mark_skip(self, reason: str) -> None:
@@ -185,6 +186,14 @@ class RunSummary:
                     f"{reconciliation['nav_change']:+,.2f}, a gap of "
                     f"{reconciliation['gap']:+,.2f} dollars. {report.get('note') or ''}"
                 ).strip()
+        elif report.get("reconciliation_reason"):
+            # A quiet reconciliation used to be rendered nowhere at all: the residual
+            # only reached the email when it crossed the warning threshold, so a healthy
+            # day and a missing measurement looked identical. Say which one it is.
+            self.reconciliation_note = (
+                "Reconciliation: not available "
+                f"({report.get('reconciliation_reason')})"
+            )
 
 
 # Severity order for the subject line. A failed basis refresh lifts a clean run to
@@ -309,6 +318,21 @@ def body_for(summary: RunSummary, last_step: str | None = None) -> str:
         )
     if summary.execution_note:
         lines.append(summary.execution_note)
+
+    # The residual is the whole point of the reconciliation: it is the only number that
+    # says whether the decomposition explains the account. Print it on every healthy
+    # run, not only when it is large enough to warn -- a residual that is never shown
+    # cannot be watched, and "no line" must never be read as "nothing to report".
+    if summary.reconciliation is not None:
+        if not summary.reconciliation.get("warn"):
+            lines.append(
+                "Reconciliation: pipeline + execution "
+                f"{summary.reconciliation['expected']:+,.2f} vs equity change "
+                f"{summary.reconciliation['nav_change']:+,.2f} "
+                f"(residual {summary.reconciliation['gap']:+,.2f})"
+            )
+    elif summary.reconciliation_note:
+        lines.append(summary.reconciliation_note)
 
     lines.append(
         f"Orders: {len(summary.filled)} filled, {len(summary.skipped)} skipped, "

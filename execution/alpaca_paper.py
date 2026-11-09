@@ -324,6 +324,16 @@ def fetch_equity_history(client, session_date: str) -> dict[str, float]:
 
 # ---------------------------------------------------------------- session fills
 
+
+class ActivitiesReadError(RuntimeError):
+    """The broker's activity history could not be read.
+
+    Deliberately distinct from "the session had no fills": an empty list is a fact about
+    the trading day, while this is a fact about the read. Collapsing the two is how the
+    2026-11-09 run reported "0 fills" for four real orders -- the read never happened.
+    """
+
+
 def fetch_session_fills(client, session_date: str) -> list[dict]:
     """The session's fills from the account activity history -- a read, never an order.
 
@@ -332,33 +342,77 @@ def fetch_session_fills(client, session_date: str) -> list[dict]:
     changing the snapshot it started from. The broker has the record, so it is read
     rather than inferred.
 
-    The window is deliberately a day wide on either side and the caller filters by
-    session: the account's activity timestamps are UTC, and asking for exactly one date
-    would silently drop a fill that crossed midnight UTC.
+    This goes through the client's raw GET, at /v2/account/activities. It does NOT go
+    through an alpaca-py request class: the SDK's TradingClient has no activity method
+    and no GetActivitiesRequest at all (checked against alpaca-py 0.45.0), so the import
+    this used to do raised ImportError on every run and the broad except below turned
+    that into an empty list -- four real fills reported as "0 fills".
+
+    The window is deliberately wider than the session on either side and the caller
+    filters by session: after/until are UTC instants, and a New York session can run
+    past midnight UTC. Asking for exactly one UTC date would drop that fill. Crucially,
+    a failure here RAISES.
+    Returning [] would make an unreadable broker indistinguishable from a quiet day.
     """
     from datetime import date as _date, timedelta
 
-    try:
-        from alpaca.trading.requests import GetActivitiesRequest
+    day = _date.fromisoformat(session_date)
 
-        day = _date.fromisoformat(session_date)
-        request = GetActivitiesRequest(
-            activity_types=["FILL"],
-            after=day - timedelta(days=1),
-            until=day + timedelta(days=1),
-            page_size=100,
-        )
-        activities = client.get_activities(request)
-    except Exception as exc:
-        logger.warning("fetch_session_fills(%s) failed: %s", session_date, exc)
-        return []
+    # after/until are UTC datetimes on the endpoint. The window is deliberately wider
+    # than the session on both sides: it must start before the New York morning and end
+    # after midnight UTC, because 2026-11-09 in New York runs to 05:00 UTC on 11-10.
+    # The session filter in execution_pnl is what decides which fills count; this only
+    # has to make sure the broker is asked for all of them.
+    params = {
+        "activity_types": "FILL",
+        "after": f"{(day - timedelta(days=1)).isoformat()}T00:00:00Z",
+        "until": f"{(day + timedelta(days=2)).isoformat()}T00:00:00Z",
+        "direction": "asc",
+        "page_size": 100,
+    }
 
     fills: list[dict] = []
-    for item in activities or []:
+    for _page in range(20):
         try:
-            fills.append(item.model_dump())
-        except AttributeError:
-            fills.append(dict(item))
+            activities = client.get("/account/activities", data=params)
+        except Exception as exc:
+            logger.error(
+                "fetch_session_fills(%s) could not read the activity history: %s",
+                session_date, exc,
+            )
+            raise ActivitiesReadError(
+                f"activity history read failed: {type(exc).__name__}: {exc}"
+            ) from exc
+
+        if not isinstance(activities, list):
+            raise ActivitiesReadError(
+                "activity history read returned "
+                f"{type(activities).__name__}, not a list"
+            )
+
+        for item in activities:
+            if isinstance(item, dict):
+                fills.append(item)
+                continue
+            dump = getattr(item, "model_dump", None)
+            if callable(dump):
+                fills.append(dump())
+            else:
+                fills.append(dict(item))
+
+        # Ascending order, so the last id is the cursor for the next page. Stop when a
+        # short page proves there is nothing after it.
+        if len(activities) < params["page_size"]:
+            break
+        last_id = activities[-1].get("id") if isinstance(activities[-1], dict) else None
+        if not last_id:
+            logger.warning(
+                "fetch_session_fills(%s): a full page with no id to page from; "
+                "%d fill(s) may be missing", session_date, len(activities),
+            )
+            break
+        params = {**params, "page_token": last_id}
+
     return fills
 
 

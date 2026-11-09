@@ -312,6 +312,7 @@ def record_daily_sleeve_pnl(*, as_of_date: str, log=None, client: object | None 
         "residual": None,
         "tolerance": None,
         "carry_total": None,
+        "carry_short": None,
         "price_total": None,
         "sleeves": None,
     }
@@ -413,6 +414,15 @@ def record_daily_sleeve_pnl(*, as_of_date: str, log=None, client: object | None 
         report["sleeves"] = {r["sleeve"]: r["total"] for r in result.rows}
         report["carry_total"] = sum(r["carry_pnl"] for r in result.rows)
         report["price_total"] = sum(r["price_pnl"] for r in result.rows)
+        # Only the short leg diverges between the economic book and paper: the broker
+        # pays a long position's distribution and does not charge a short one's. Measured
+        # per position rather than inferred from the sign of the total, because a book
+        # can be long and short on an ex-date at the same time.
+        report["carry_short"] = sum(
+            float(row["carry_pnl"])
+            for row in result.per_ticker
+            if float(row["shares"]) < 0.0
+        )
 
         # The residual is logged whether or not it passes, so a growing residual is
         # visible in the run log long before it ever blocks a write.
@@ -437,6 +447,7 @@ def record_daily_sleeve_pnl(*, as_of_date: str, log=None, client: object | None 
             close_now=close_now,
             sessions=[str(ts.date()) for ts in close.index],
             carry_total=report["carry_total"],
+            carry_short=report["carry_short"],
             book_total=result.book_gross_pnl,
             log=log,
             client=client,

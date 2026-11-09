@@ -23,6 +23,13 @@ import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Iterable, Mapping
+from zoneinfo import ZoneInfo
+
+# The session boundary is New York's, not UTC's. A US equity session runs 14:30-21:00
+# UTC, so regular-hours fills agree either way -- but the book's timestamps must not be
+# read as if the trading day ended at midnight UTC: an after-hours fill at 20:30 ET is
+# 01:30 UTC the NEXT day, and the UTC read would book it to the wrong session.
+SESSION_TZ = ZoneInfo("America/New_York")
 
 # Alpaca's fill sides. sell_short and buy_to_cover are the short leg's two directions,
 # and they sign the same way as sell and buy respectively: the sign belongs to the
@@ -83,9 +90,12 @@ def signed_shares(fill: Mapping[str, object]) -> float:
 def session_of(fill: Mapping[str, object]) -> str | None:
     """The session a fill belongs to, or None when its timestamp will not parse.
 
-    Alpaca stamps fills in UTC. A US equity session runs 14:30-21:00 UTC, so no session
-    fill lands on a different UTC date from the New York date it traded on; taking the
-    UTC date is therefore correct here and avoids inventing a calendar rule.
+    Alpaca stamps fills in UTC. The session is the New York trading date, so the stamp
+    is converted to America/New_York before the date is taken. For the regular session
+    the UTC date happens to agree (14:30-21:00 UTC), which is what made the old UTC-only
+    reading look right; it disagrees for anything after 19:00 ET, where UTC has already
+    rolled over to the next day and the fill would be credited to a session that has not
+    happened yet.
     """
     stamp = fill.get("transaction_time") or fill.get("date")
     if not stamp:
@@ -101,7 +111,7 @@ def session_of(fill: Mapping[str, object]) -> str | None:
         return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc).date().isoformat()
+    return parsed.astimezone(SESSION_TZ).date().isoformat()
 
 
 def execution_pnl(
@@ -295,20 +305,28 @@ def reconcile(
     }
 
 
-def short_distribution_note(carry_total: float, carry_paper: float = 0.0) -> str:
+def short_distribution_note(carry_short: float) -> str | None:
     """Why paper equity will not match an economic decomposition on a short book.
 
     The broker does not debit a paper account for the distributions a short position
     owes. The decomposition does, because the short owes them. The difference is not an
     error in either number and has to be named, or every reconciliation on a short book
     reads as a few hundred dollars of unexplained loss.
+
+    Only the SHORT leg diverges: paper credits the long leg's dividends as it should.
+    The argument is therefore the carry on short positions only, and a session with no
+    short distribution has nothing to explain -- it must say nothing. The old signature
+    took the whole book's carry and compared it against a hard-coded zero, so on any
+    non-ex-date (carry 0.00) it printed "paper already carries the distributions", which
+    asserts a fact about the broker that was never measured and is false: on 2026-11-09
+    it said this while there was no distribution in the session at all.
     """
-    divergence = float(carry_total) - float(carry_paper)
-    if abs(divergence) < 0.005:
-        return "paper already carries the distributions: no adjustment"
+    carry_short = float(carry_short or 0.0)
+    if abs(carry_short) < 0.005:
+        return None
     return (
         "paper does not debit short distributions: equity is higher than the "
-        f"economic book by {-divergence:,.2f} dollars"
+        f"economic book by {-carry_short:,.2f} dollars"
     )
 
 
@@ -322,6 +340,7 @@ def record_execution_component(
     sessions: list[str] | None = None,
     carry_total: float,
     book_total: float,
+    carry_short: float | None = None,
     log=None,
     client: object | None = None,
 ) -> dict:
@@ -336,6 +355,18 @@ def record_execution_component(
     from signals.etf_universe import ASSET_CLASS
 
     log = log or logging.getLogger("sleeve_pnl.execution")
+
+    # Paper credits a long position's dividends and does not debit a short position's,
+    # so only the short leg needs adding back. The caller measures that leg exactly
+    # (every position in the prior snapshot with negative shares). When it cannot, the
+    # conservative reading is the negative part of the book's carry: a long-only payout
+    # needs no adjustment, because the broker already paid it.
+    short_carry = (
+        float(carry_short)
+        if carry_short is not None
+        else min(float(carry_total or 0.0), 0.0)
+    )
+
     report: dict = {
         "status": "unavailable",
         "reason": None,
@@ -344,9 +375,11 @@ def record_execution_component(
         "fill_count": 0,
         "skipped": [],
         "reconciliation": None,
+        "reconciliation_reason": None,
         "convention": None,
-        "paper_add_back": -float(carry_total or 0.0),
-        "note": short_distribution_note(carry_total),
+        "carry_short": short_carry,
+        "paper_add_back": -short_carry,
+        "note": short_distribution_note(short_carry),
     }
 
     try:
@@ -387,13 +420,15 @@ def record_execution_component(
                 "no end-of-day equity on both sides of this session, so the "
                 "reconciliation has nothing to compare"
             )
+            report["reconciliation_reason"] = report["reason"]
             return report
 
         # The paper account never books the distributions a short position owes, so its
-        # equity sits above the economic book by exactly that amount. Adding it back is
-        # the only way the two sides describe the same thing; without it every short
-        # month reads as a few hundred dollars nobody can account for.
-        add_back = -float(carry_total or 0.0)
+        # equity sits above the economic book by exactly that amount. Adding back the
+        # short leg is the only way the two sides describe the same thing; without it
+        # every short month reads as a few hundred dollars nobody can account for. The
+        # long leg is NOT added back: paper already paid it.
+        add_back = -short_carry
         report["paper_add_back"] = add_back
         expected = float(book_total) + pnl.total + add_back
         report["reconciliation"] = reconcile(expected, change)

@@ -110,6 +110,12 @@ logger = logging.getLogger(__name__)
 # durable evidence that the leg was ever intended.
 
 REASON_QTY_ZERO: str = "QTY_ROUNDS_TO_ZERO"
+# Plain-language label for that case. A short whose delta is under one whole
+# share is not a rejection -- nothing was wrong with the order, it was simply
+# too small to express in whole shares, and paper cannot sell fractional shorts.
+# The daily summary uses this wording so the email does not read as a broker
+# problem that needs investigating.
+LABEL_BELOW_ONE_SHARE: str = "below 1 share"
 GUARD_SKIPPED_NOT_SHORTABLE: str = "SKIPPED_NOT_SHORTABLE"  # blocked before submit
 GUARD_CROSSING_FLAT_NOT_SHORTABLE: str = "CROSSING_FLAT_NOT_SHORTABLE"  # open leg of a crossing
 REASON_NOT_SHORTABLE_AT_SUBMIT: str = "ASSET_NOT_SHORTABLE_AT_SUBMIT"
@@ -1207,7 +1213,10 @@ def _submit_one(
                 requested_notional=spec.notional,
                 status="SKIPPED",
                 reason_code=REASON_QTY_ZERO,
-                detail=f"floor({spec.notional:.2f}/{price:.2f}) = 0 whole shares",
+                detail=(
+                    f"skipped: {LABEL_BELOW_ONE_SHARE} "
+                    f"(floor({spec.notional:.2f}/{price:.2f}) = 0 whole shares)"
+                ),
             )
         req = MarketOrderRequest(
             symbol=spec.ticker,

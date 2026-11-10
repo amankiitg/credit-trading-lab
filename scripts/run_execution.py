@@ -317,6 +317,8 @@ def _run(summary: RunSummary) -> int:
     # -- 5. Connect to Alpaca
     from execution.alpaca_paper import (
         DRY_RUN_DEFAULT,
+        LABEL_BELOW_ONE_SHARE,
+        REASON_QTY_ZERO,
         apply_shortable_filter,
         build_fill_records,
         build_rejection_rows,
@@ -561,12 +563,20 @@ def _run(summary: RunSummary) -> int:
     # happened rather than only a count. Buckets come from the fill records, which
     # cover guard-rejected legs too (those never became SubmitOutcomes):
     #   filled   -- executed
-    #   rejected -- carries a reason code, or the broker poll timed out
-    #   skipped  -- blocked by a guard before submission (notional cap, dry run)
+    #   rejected -- carries a reason code (other than the below-one-share skip),
+    #               or the broker poll timed out
+    #   skipped  -- blocked by a guard before submission (notional cap, dry run),
+    #               or a short whose delta is smaller than one whole share
     for _f in fills:
         _label = f"{_f.ticker} {_f.position_intent}"
         if _f.status == "FILLED":
             summary.filled.append(f"{_label} ${_f.filled_notional:,.2f}")
+        elif _f.reason_code == REASON_QTY_ZERO:
+            # Too small to express in whole shares, so it was never submitted.
+            # That is a skip, not a rejection: nothing needs investigating, and
+            # reporting it under "rejected" makes the daily email read like a
+            # broker problem on a run that traded exactly as intended.
+            summary.skipped.append(f"{_label} {LABEL_BELOW_ONE_SHARE}")
         elif _f.reason_code:
             summary.rejected.append(f"{_label} {_f.reason_code}")
         elif _f.status == "TIMEOUT":

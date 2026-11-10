@@ -35,8 +35,10 @@ services:
     # build. Everything else on the branch is ignored by this service.
     #
     # signals/** and risk/** are here because the remaining Trade Approval tab
-    # imports them at runtime: signals.etf_universe (directly and via
-    # dashboard.loader.load_close_matrix) and risk.live_risk, for the MCTR panel.
+    # imports them at runtime: signals.etf_universe, signals.load (the yfinance
+    # boundary the MCTR panel fetches current closes through, in
+    # dashboard/live_prices.py) and risk.live_risk, for the MCTR panel. That fetch
+    # needs no keys, which is why it is allowed here while Alpaca is not.
     # execution/** is deliberately NOT here. The dashboard never calls Alpaca, and
     # keeping it out is what keeps the Alpaca keys off this service.
     #

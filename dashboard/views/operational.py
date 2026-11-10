@@ -413,13 +413,17 @@ def _get_proposed_trade() -> tuple[list[dict], str, float]:
 def _render_mctr_pctr(nav: float, positions_data: list[dict]) -> None:
     """Emit the plain-English header and the sleeve-coloured risk contribution view.
 
-    Weights are the live book. The covariance is the last 63 sessions of the committed
-    price cache, which ends well before the live book's date, so the panel states its
-    window and says indicative only: a risk share measured against a window that does
-    not cover the book is a shape, not a current number. The dashboard deliberately has
-    no Alpaca keys (render.yaml), so it cannot refresh the prices itself.
+    Weights are the live book; the covariance is built from current closes fetched
+    through the signal's own yfinance boundary (`dashboard/live_prices`), over the
+    rolling window that ends at the latest session. The committed `data/raw` snapshot
+    is never read: it is a build-time artefact that stopped months ago, and a
+    covariance measured on it describes a book that no longer exists.
+
+    A ticker without a complete return history in the window is excluded and named.
+    It is never priced at zero and never zero-filled in the covariance.
     """
-    from dashboard.loader import load_close_matrix
+    from dashboard.live_prices import load_live_returns
+    from risk.live_risk import COV_WINDOW_SESSIONS, risk_contributions
     from signals.etf_universe import UNIVERSE
 
     # Build live weight vector
@@ -437,22 +441,34 @@ def _render_mctr_pctr(nav: float, positions_data: list[dict]) -> None:
     weights = pd.Series({t: w_dict[t] for t in live_tickers})
 
     try:
-        close = load_close_matrix()
-    except Exception:
-        st.info("Close data not available -- risk contribution skipped.")
+        rets = load_live_returns(tickers=tuple(live_tickers))
+    except Exception as exc:
+        # Deliberately no fallback to the committed snapshot. A stale covariance is
+        # worse than none: it renders as a current number.
+        st.info(
+            "Live closes are unavailable right now, so the risk view is skipped. "
+            "It is not drawn from the committed price snapshot, which ends months "
+            f"before this book ({type(exc).__name__}: {exc})."
+        )
         return
 
-    rets = close[live_tickers].pct_change().dropna(how="all").tail(63)
-    if len(rets) < 20:
-        st.info(f"Only {len(rets)} days of returns -- need >=20 for a covariance.")
+    if len(rets) < 2:
+        st.info("Fewer than two sessions of live returns -- cannot estimate a covariance.")
         return
 
-    from risk.live_risk import mctr_pctr
     try:
-        risk_df = mctr_pctr(weights, rets)
+        risk_df, excluded = risk_contributions(weights, rets)
+    except ValueError as exc:
+        st.info(f"Risk contribution unavailable: {exc}")
+        return
     except Exception as exc:
         st.warning(f"MCTR/PCTR failed: {exc}")
         return
+
+    # Name every position the covariance could not include, before the numbers it
+    # did produce, so a missing name is never read as a zero-risk position.
+    for ticker in sorted(excluded):
+        st.warning(f"Risk not available for {ticker} (insufficient history).")
 
     # Euler additivity holds for CTR (it sums to portfolio sigma), so a sleeve's share
     # of total risk is its summed CTR over that sigma. Summing MCTR would be wrong.
@@ -471,7 +487,8 @@ def _render_mctr_pctr(nav: float, positions_data: list[dict]) -> None:
         st.info("No sleeve could be attributed -- risk view skipped.")
         return
 
-    window = f"{rets.index[0].date()} to {rets.index[-1].date()}"
+    window_start = rets.index[0].date()
+    window_end = rets.index[-1].date()
     book_date = str(positions_data[0].get("trade_date", "—")) if positions_data else "—"
 
     ranked = sleeve_tbl["pctr"].sort_values(ascending=False)
@@ -489,10 +506,11 @@ def _render_mctr_pctr(nav: float, positions_data: list[dict]) -> None:
         line += f", with the {parts} sleeves offsetting it (they are the short side)"
     st.markdown(line + ".")
     st.caption(
-        f"63-session covariance, {window}. **Indicative only**: the window ends "
-        f"{rets.index[-1].date()} and the book is {book_date}, so this is the risk shape "
-        f"of today's weights measured against a window that does not cover them. "
-        f"Weights are the live book; the covariance is not."
+        f"{COV_WINDOW_SESSIONS}-session covariance, **{window_start} to {window_end}** "
+        f"of live closes, ending at the latest session the signal source has. "
+        f"Weights are the book at {book_date}; the covariance is current, not a "
+        f"snapshot. Sleeves cover the {len(risk_df)} position(s) with a complete "
+        f"return history."
     )
 
     ticker_flag = float(risk_df["pctr"].max())

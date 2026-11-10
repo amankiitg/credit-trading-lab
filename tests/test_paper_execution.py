@@ -753,6 +753,9 @@ def test_qty_zero_skipped() -> None:
     assert result[0].status == "SKIPPED"
     assert result[0].reason_code == REASON_QTY_ZERO
     assert result[0].order_id == ""
+    assert result[0].detail.startswith("skipped: below 1 share"), (
+        "the audit detail must read as a skip, not as a rejection"
+    )
     mock_client.submit_order.assert_not_called()
 
 
@@ -1560,6 +1563,7 @@ def _run_execution_with_stub(
     decision: str = "approve",
     live_equity: str = "100000",
     stored_live_nav: str | None = "100000",
+    target_weights: dict[str, float] | None = None,
 ) -> dict:
     """Drive scripts.run_execution.main() with Alpaca and Supabase stubbed.
 
@@ -1577,6 +1581,8 @@ def _run_execution_with_stub(
     reports, and `stored_live_nav` is the previous run's reading in settings; the
     two together are what the book's P&L is measured from, and `stored_live_nav=None`
     is the first-ever-run case where there is nothing to compare against.
+    `target_weights` overrides the stored signal's weights, which is how a leg can
+    be sized below one whole share without changing the close prices.
     """
     import json as _json
     from datetime import date as _date
@@ -1675,7 +1681,11 @@ def _run_execution_with_stub(
 
     settings = {
         "signal_as_of_date": signal_as_of or today,
-        "signal_target_weights": _json.dumps({"SPY": 0.05, "LQD": -0.06, "GLD": -0.02}),
+        "signal_target_weights": _json.dumps(
+            target_weights
+            if target_weights is not None
+            else {"SPY": 0.05, "LQD": -0.06, "GLD": -0.02}
+        ),
         "signal_close_prices": _json.dumps({"SPY": 500.0, "LQD": 100.0, "GLD": 400.0}),
     }
     if stored_live_nav is not None:
@@ -1903,6 +1913,63 @@ def test_ok_run_sends_exactly_one_ok_summary(tmp_path, monkeypatch) -> None:
         "the book's P&L belongs in the email"
     )
     assert "Turnover cost today:" in body, "cost is reported separately, not as the P&L"
+
+
+def test_run_skips_a_short_delta_below_one_share(tmp_path, monkeypatch) -> None:
+    """A short sized under one whole share is skipped, not rejected.
+
+    GLD at -0.003 * $100k is a $300 delta: above DELTA_MIN_NOTIONAL, so it is a
+    real order, but at $400/share it floors to 0 whole shares and paper cannot
+    sell fractional shorts. There is nothing to submit, and nothing is wrong
+    with the order -- so the run must finish, trade the other legs, and report
+    the leg as "skipped: below 1 share". Counting it as "rejected" sends someone
+    looking for a broker problem that does not exist.
+    """
+    result = _run_execution_with_stub(
+        tmp_path, monkeypatch,
+        shortable_map={"SPY": True, "LQD": True, "GLD": True},
+        target_weights={"SPY": 0.05, "LQD": -0.06, "GLD": -0.003},
+    )
+
+    assert result["exit_code"] == 0, "a below-one-share leg must not fail the run"
+    assert result["submit_calls"] == 2, "only SPY and LQD reached the broker"
+    assert "GLD" not in result["book"], "a zero-share short must not be submitted"
+
+    body = result["emails"][0]["body"]
+    assert "Orders: 2 filled, 1 skipped, 0 rejected" in body
+    assert "  skipped: GLD sell_to_open below 1 share" in body
+    assert "rejected: GLD" not in body, "a below-one-share leg is not a rejection"
+    assert "QTY_ROUNDS_TO_ZERO" not in body
+
+    # The durable audit row still records the leg and its stable reason code --
+    # it is the only evidence the leg was ever intended -- but its status and
+    # detail both say this was a skip.
+    audit = [r for r in result["written"]["rejections"] if r["ticker"] == "GLD"]
+    assert len(audit) == 1, "the skipped leg must still be audited"
+    assert audit[0]["status"] == "SKIPPED"
+    assert audit[0]["reason_code"] == REASON_QTY_ZERO
+    assert audit[0]["detail"].startswith("skipped: below 1 share")
+
+
+def test_run_still_submits_a_short_leg_that_rounds_to_whole_shares(tmp_path, monkeypatch) -> None:
+    """Negative control: an ordinary short is still submitted, and not skipped.
+
+    Without this, routing a zero-rounded quantity to "skipped" could hide a
+    change that stopped submitting short legs altogether.
+    """
+    result = _run_execution_with_stub(
+        tmp_path, monkeypatch,
+        shortable_map={"SPY": True, "LQD": True, "GLD": True},
+    )
+
+    assert result["exit_code"] == 0
+    assert result["submit_calls"] == 3, "all three legs were submitted"
+    assert result["book"]["GLD"] == -2_000.0, "$2,000 / $400 = 5 whole shares"
+
+    body = result["emails"][0]["body"]
+    assert "Orders: 3 filled, 0 skipped, 0 rejected" in body
+    assert "filled: GLD sell_to_open" in body
+    assert "below 1 share" not in body
 
 
 # ------------------------------------------------- v9.7: the pnl_log row carries the book

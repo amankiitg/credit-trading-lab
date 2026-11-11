@@ -143,29 +143,56 @@ class TestNoZeroPadding:
     """Requirement 2: no padded prices, no zero-filled covariance."""
 
     def test_gap_is_left_missing_not_padded_to_zero(self):
-        """A price series that stops early yields NaN returns, not a run of 0.0.
+        """A hole inside the window yields NaN returns, not zeros.
 
-        This is the exact shape of the stale cache: seven of eight columns ended in
-        April/June while the calendar ran on. `pct_change()` with the default
-        `fill_method='pad'` reported every following session as a 0.0% move.
+        This is the shape of the stale cache: a column that did not trade while the
+        calendar ran on. `pct_change()` with the default `fill_method='pad'`
+        reported the missing sessions as a 0.0% move, which a covariance reads as a
+        real quiet day.
         """
         dates = pd.bdate_range("2026-01-02", periods=130)
         closes = pd.DataFrame(
             {
                 "A": np.linspace(100, 120, len(dates)),
                 "B": np.linspace(50, 55, len(dates)),
-                "STALE": np.nan,
+                "GAPPED": np.linspace(10, 11, len(dates)),
             },
             index=dates,
         )
-        # STALE last trades 25 sessions before the end, then the price is absent.
-        closes.loc[: dates[-26], "STALE"] = np.linspace(10, 11, 105)
+        # GAPPED has no close for five sessions inside the 120-return window.
+        closes.loc[dates[70]:dates[74], "GAPPED"] = np.nan
 
         rets = window_returns(closes, sessions=120)
 
-        tail = rets["STALE"].tail(25)
-        assert tail.isna().all(), f"padded to {tail.tolist()[:3]} instead of NaN"
-        assert not (tail.dropna() == 0.0).any()
+        assert len(rets) == 120
+        hole = rets["GAPPED"].isna()
+        # Five missing closes, plus the return that would have divided by the
+        # last of them: all NaN, none 0.0.
+        assert int(hole.sum()) == 6, hole.sum()
+        assert not (rets["GAPPED"].dropna() == 0.0).any()
+        assert select_eligible_returns(rets)[1]["GAPPED"].startswith("incomplete")
+
+    def test_trailing_gap_shortens_the_window_instead_of_padding_it(self):
+        """A ticker whose history stops early anchors the window, it does not emit
+        zeros for the sessions after its last close."""
+        dates = pd.bdate_range("2026-01-02", periods=150)
+        closes = pd.DataFrame(
+            {
+                "A": np.linspace(100, 120, len(dates)),
+                "B": np.linspace(50, 55, len(dates)),
+                "LATE": np.linspace(10, 11, len(dates)),
+            },
+            index=dates,
+        )
+        # LATE stops trading 25 sessions before the others.
+        closes.loc[dates[-25]:, "LATE"] = np.nan
+
+        rets = window_returns(closes, sessions=120)
+
+        assert rets.index[-1] == dates[-26]
+        assert len(rets) == 120
+        assert rets["LATE"].notna().all()
+        assert not (rets["LATE"] == 0.0).any()
 
     def test_missing_ticker_is_excluded_not_zero_filled(self):
         """A ticker short of returns is dropped, and the rest are unchanged.
@@ -307,6 +334,125 @@ class TestWindowIsCurrent:
         assert LIVE_LOOKBACK_DAYS >= COV_WINDOW_SESSIONS * 1.3
 
 
+def _yf_frame(values: pd.Series) -> pd.DataFrame:
+    """One ticker as ``signals.load.fetch`` returns it: an OHLCV frame."""
+    return pd.DataFrame(
+        {
+            "open": values,
+            "high": values,
+            "low": values,
+            "close": values,
+            "adj_close": values,
+            "volume": 1_000_000,
+        },
+        index=values.index,
+    )
+
+
+class TestRealFetchShape:
+    """The shape the panel actually receives, not a tidy frozen matrix.
+
+    ``signals.load.fetch`` returns one OHLCV frame per ticker, and
+    ``close_matrix_from_frames` outer-joins them. The union index can therefore
+    contain a date on which one ticker -- or, before the close, every ticker --
+    has no price. That is the session that produced "119 of 120 returns" on all
+    eight columns and excluded the whole book.
+    """
+
+    DATES = pd.bdate_range("2026-02-02", "2026-11-10")
+
+    def _frames(
+        self,
+        *,
+        phantom_today: bool = False,
+        missing_today: tuple[str, ...] = (),
+    ) -> dict[str, pd.DataFrame]:
+        """Per-ticker frames; today's row is either NaN or absent for a ticker."""
+        rng = np.random.default_rng(17)
+        frames: dict[str, pd.DataFrame] = {}
+        for ticker in UNIVERSE:
+            closes = pd.Series(
+                100.0 * np.exp(np.cumsum(rng.normal(0.0002, 0.01, len(self.DATES)))),
+                index=self.DATES,
+            )
+            if phantom_today or ticker in missing_today:
+                closes.iloc[-1] = np.nan
+            frame = _yf_frame(closes)
+            if missing_today and ticker in missing_today and not phantom_today:
+                frame = frame.iloc[:-1]          # today's row has not arrived at all
+            frames[ticker] = frame
+        return frames
+
+    def test_phantom_today_row_is_not_a_session(self):
+        """The regression: today listed with no close yet used to exclude all 8.
+
+        With the fetch shape below the panel reported every column as "119 of 120
+        returns", because the last row of the 120-return window was today's
+        not-yet-priced row rather than the last session that has a close.
+        """
+        close = live_prices.close_matrix_from_frames(self._frames(phantom_today=True))
+        assert close.index[-1] == self.DATES[-1]
+        assert close.iloc[-1].isna().all(), "the row the old window was reading"
+
+        rets = window_returns(close, sessions=COV_WINDOW_SESSIONS)
+
+        assert len(rets) == COV_WINDOW_SESSIONS == 120
+        assert rets.index[-1] == self.DATES[-2]
+        assert rets.index[0] == self.DATES[-1 - COV_WINDOW_SESSIONS]
+        assert int(rets.notna().sum().min()) == COV_WINDOW_SESSIONS, "119 of 120 again"
+
+        eligible, excluded = select_eligible_returns(rets)
+        assert excluded == {}
+        assert list(eligible.columns) == list(UNIVERSE)
+
+    def test_one_tickers_missing_close_shortens_the_window_for_all(self, monkeypatch):
+        """A close that has not arrived for one ticker must not exclude the book."""
+        live_prices.load_live_closes.clear()
+        frames = self._frames(missing_today=("EFA",))
+        monkeypatch.setattr("signals.load.fetch", lambda tickers, start, end: frames)
+
+        rets = live_prices.load_live_returns(tickers=tuple(UNIVERSE))
+
+        assert len(rets) == COV_WINDOW_SESSIONS
+        assert rets.index[-1] == self.DATES[-2], "window is anchored to today"
+        assert not rets.isna().any().any()
+        assert int(rets.notna().sum().min()) == COV_WINDOW_SESSIONS
+
+    def test_the_whole_book_is_estimated_on_the_real_fetch_shape(self):
+        """All 8 names enter the covariance; PCTR still sums to 1."""
+        close = live_prices.close_matrix_from_frames(self._frames(phantom_today=True))
+        rets = window_returns(close, sessions=COV_WINDOW_SESSIONS)
+        weights = pd.Series(
+            {t: (1.0 if i % 2 else -1.0) for i, t in enumerate(UNIVERSE)}
+        )
+
+        contrib, excluded = risk_contributions(weights, rets)
+
+        assert excluded == {}
+        assert set(contrib.index) == set(UNIVERSE)
+        assert abs(float(contrib["pctr"].sum()) - 1.0) <= 1e-6
+
+    def test_a_120_return_window_needs_121_closes(self):
+        dates = pd.bdate_range("2026-01-02", periods=COV_WINDOW_SESSIONS)
+        close = pd.DataFrame(
+            {t: np.linspace(100.0, 110.0, len(dates)) for t in UNIVERSE},
+            index=dates,
+        )
+        with pytest.raises(ValueError, match="121 closes needed"):
+            window_returns(close, sessions=COV_WINDOW_SESSIONS)
+
+    def test_121_closes_build_120_returns_without_a_nan_row(self):
+        dates = pd.bdate_range("2026-01-02", periods=COV_WINDOW_SESSIONS + 1)
+        close = pd.DataFrame(
+            {t: np.linspace(100.0, 110.0, len(dates)) for t in UNIVERSE},
+            index=dates,
+        )
+        rets = window_returns(close, sessions=COV_WINDOW_SESSIONS)
+        assert len(rets) == 120
+        assert rets.index[0] == dates[1]
+        assert not rets.isna().any().any()
+
+
 class TestPanelCopy:
     """Requirements 2 and 3 as the panel renders them."""
 
@@ -337,12 +483,14 @@ class TestPanelCopy:
         at = self._render(tmp_path, monkeypatch, rets)
 
         warnings = " ".join(w.value for w in at.warning)
-        assert "Risk not available for GLD (insufficient history)." in warnings
+        assert "Risk not available for GLD" in warnings
+        assert "incomplete history" in warnings
 
         captions = " ".join(c.value for c in at.caption)
         start, end = rets.index[0].date(), rets.index[-1].date()
         assert f"{start} to {end}" in captions
         assert "120-session covariance" in captions
+        assert "121 aligned closes" in captions
 
         # The excluded name is not silently priced at zero inside the numbers.
         assert "risk not available" not in " ".join(m.value for m in at.markdown).lower()

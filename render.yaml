@@ -6,7 +6,7 @@
 #   3. credit-lab-execution: morning cron, fires after approval window
 #
 # UTC cron schedules and DST:
-#   Signal cron  "30 21 * * 1-5" = 17:30 EDT / 16:30 EST (both after 16:00 ET close)
+#   Signal cron  "30 22 * * 1-5" = 18:30 EDT / 17:30 EST (both safely after the 16:00 ET close)
 #   Exec cron    "31 14,15 * * 1-5" = two firings a day, because UTC cannot express
 #                "10:31 in New York": 14:31 UTC is 10:31 EDT but 09:31 EST, and 15:31
 #                UTC is 11:31 EDT but 10:31 EST. run_execution.py keeps the firing that
@@ -75,7 +75,9 @@ services:
     name: credit-lab-signal
     runtime: python
     buildCommand: pip install -e .
-    schedule: "30 21 * * 1-5"
+    # 22:30 UTC = 5:30 PM EST / 6:30 PM EDT, safely after final closes in both
+    # seasons. The old 21:30 UTC left only a 30-minute buffer once EST returned.
+    schedule: "30 22 * * 1-5"
     startCommand: python scripts/run_signal.py
     envVars:
       - key: SUPABASE_URL

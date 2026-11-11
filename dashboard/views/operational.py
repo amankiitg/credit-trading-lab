@@ -468,7 +468,7 @@ def _render_mctr_pctr(nav: float, positions_data: list[dict]) -> None:
     # Name every position the covariance could not include, before the numbers it
     # did produce, so a missing name is never read as a zero-risk position.
     for ticker in sorted(excluded):
-        st.warning(f"Risk not available for {ticker} (insufficient history).")
+        st.warning(f"Risk not available for {ticker}: {excluded[ticker]}.")
 
     # Euler additivity holds for CTR (it sums to portfolio sigma), so a sleeve's share
     # of total risk is its summed CTR over that sigma. Summing MCTR would be wrong.
@@ -507,7 +507,8 @@ def _render_mctr_pctr(nav: float, positions_data: list[dict]) -> None:
     st.markdown(line + ".")
     st.caption(
         f"{COV_WINDOW_SESSIONS}-session covariance, **{window_start} to {window_end}** "
-        f"of live closes, ending at the latest session the signal source has. "
+        f"of live closes ({COV_WINDOW_SESSIONS + 1} aligned closes), ending at the "
+        f"latest session every ticker has a close for -- not today's calendar date. "
         f"Weights are the book at {book_date}; the covariance is current, not a "
         f"snapshot. Sleeves cover the {len(risk_df)} position(s) with a complete "
         f"return history."

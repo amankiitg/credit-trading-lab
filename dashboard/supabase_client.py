@@ -26,6 +26,13 @@ Tables (created by the user in the Supabase dashboard):
              -- book held at the previous close, and is not necessarily the run date.
              -- The four rows of a session sum to book_total, which is the gate.
 
+  close_equity (session_date date PK, equity numeric, source text,
+              fetched_at timestamptz)
+             -- one row per session: the account equity at that session's close, as
+             -- published by the portfolio history and stored by the evening job.
+             -- The dashboard's evening NAV series reads this instead of holding a
+             -- broker credential of its own.
+
 Reads SUPABASE_URL and SUPABASE_SECRET_KEY from the environment (.env).
 The URL stored in .env includes the /rest/v1/ suffix; this module strips it
 before constructing the client (create_client needs the project root URL).
@@ -538,3 +545,48 @@ def fetch_daily_sleeve_pnl(
                 f"Supabase read failed: {type(exc).__name__}: {exc}"
             ) from exc
         return []
+
+
+# ---------------------------------------------------------------- close equity (v9.9)
+
+def fetch_close_equity(
+    limit: int = 5000, *, raise_on_error: bool = False
+) -> dict[str, float]:
+    """{session: close equity} from close_equity, the whole stored series.
+
+    One row per session, so 5000 rows is about twenty years; the limit is only a guard
+    against an unbounded read, not a window the chart should outgrow.
+
+    raise_on_error=True is for the dashboard's chart, which must not draw an empty
+    series when the table could not be read: an install that has not run the migration
+    and a Supabase outage are different things, and the page names whichever it is.
+    """
+    client = get_supabase_client()
+    if client is None:
+        if raise_on_error:
+            raise RuntimeError(
+                "Supabase read failed: no client (SUPABASE_URL/SUPABASE_SECRET_KEY unset)"
+            )
+        return {}
+    try:
+        resp = (
+            client.table("close_equity")
+            .select("session_date,equity")
+            .order("session_date", desc=True)
+            .limit(limit)
+            .execute()
+        )
+    except Exception as exc:
+        _log.error("fetch_close_equity failed: %s", exc)
+        if raise_on_error:
+            raise RuntimeError(
+                f"Supabase read failed: {type(exc).__name__}: {exc}"
+            ) from exc
+        return {}
+
+    out: dict[str, float] = {}
+    for row in resp.data or []:
+        if row.get("equity") is None or row.get("session_date") is None:
+            continue
+        out[str(row["session_date"])[:10]] = float(row["equity"])
+    return out

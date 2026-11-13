@@ -774,8 +774,16 @@ def _section(title: str) -> None:
     st.markdown(f"### {title}")
 
 
-def _plot(fig: go.Figure, *, height: int = 320, legend_below: bool = False) -> None:
-    margin = dict(l=10, r=10, t=40, b=10)
+def _plot(
+    fig: go.Figure,
+    *,
+    height: int = 320,
+    legend_below: bool = False,
+    top: int = 40,
+) -> None:
+    # A figure with subplot titles needs more headroom, or Plotly draws the main
+    # title into the first subplot's title.
+    margin = dict(l=10, r=10, t=top, b=10)
     legend = dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     if legend_below:
         legend = dict(orientation="h", yanchor="top", y=-0.18, xanchor="left", x=0)
@@ -1722,7 +1730,7 @@ def render(
             )
             fig.update_yaxes(title_text="cumulative P&L", row=1, col=1)
             fig.update_yaxes(title_text="$ over the period", row=2, col=1)
-            _plot(fig, height=560, legend_below=True)
+            _plot(fig, height=560, legend_below=True, top=86)
 
             gap = float(
                 cumulative["book_total"].iloc[-1]

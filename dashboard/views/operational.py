@@ -762,17 +762,14 @@ def _render_header(
         pnl_value, pnl_delta = "—", "not recorded yet"
     else:
         pnl_value = "$" + f"{float(book_pnl['value']):+,.2f}"
-        # Same run as the NAV card whenever the two come from the same write;
-        # name the P&L's own run only when they do not.
-        pnl_run_label = (
-            run_label
-            if book_pnl["source"] == nav_snapshot["source"]
-            else f"{book_pnl['source']} {_fmt_utc(book_pnl['timestamp'])}"
-        )
+        # The metric delta is a single ellipsised line at the 1200px window the
+        # header is read at: keep the percentage and the full run timestamp, and
+        # let the caption below the cards name the run and the session.
+        pnl_stamp = _fmt_utc(book_pnl["timestamp"])
         pnl_delta = (
-            f"{book_pnl['pct_of_nav']:+.2f}% of NAV · {pnl_run_label}"
+            f"{book_pnl['pct_of_nav']:+.2f}% · {pnl_stamp}"
             if book_pnl["pct_of_nav"] is not None
-            else pnl_run_label
+            else pnl_stamp
         )
 
     book_vol = risk.get("port_vol") if risk and "error" not in risk else None

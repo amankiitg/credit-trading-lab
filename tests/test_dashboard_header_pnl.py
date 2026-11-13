@@ -110,9 +110,7 @@ def test_the_pnl_card_reads_the_evening_signals_session(monkeypatch) -> None:
     metrics = _metrics(_render(monkeypatch))
 
     assert metrics["1-day P&L"].value == "$+1,605.70"
-    assert metrics["1-day P&L"].delta == (
-        "+1.59% of NAV · evening signal 2026-11-12 22:31 UTC"
-    )
+    assert metrics["1-day P&L"].delta == "+1.59% · 2026-11-12 22:31 UTC"
 
 
 def test_the_pnl_card_is_not_the_morning_execution_row(monkeypatch) -> None:
@@ -124,9 +122,10 @@ def test_the_pnl_card_is_not_the_morning_execution_row(monkeypatch) -> None:
 def test_both_cards_carry_the_same_run_timestamp(monkeypatch) -> None:
     metrics = _metrics(_render(monkeypatch))
 
-    run_label = "evening signal 2026-11-12 22:31 UTC"
-    assert metrics["NAV"].delta == run_label
-    assert metrics["1-day P&L"].delta.endswith(run_label)
+    assert metrics["NAV"].delta == "evening signal 2026-11-12 22:31 UTC"
+    # The card is narrow enough to ellipsise a delta, so the P&L label carries
+    # the timestamp itself; the two cards still name the same run minute.
+    assert metrics["1-day P&L"].delta.endswith("2026-11-12 22:31 UTC")
 
 
 def test_the_caption_names_the_pnl_run_and_session(monkeypatch) -> None:
@@ -143,9 +142,7 @@ def test_pnl_falls_back_to_the_morning_row_when_no_session_is_stored(monkeypatch
     metrics = _metrics(_render(monkeypatch, sleeve_rows=[]))
 
     assert metrics["1-day P&L"].value == "$+1,308.15"
-    assert metrics["1-day P&L"].delta == (
-        "+1.30% of NAV · morning execution 2026-11-12 15:32 UTC"
-    )
+    assert metrics["1-day P&L"].delta == "+1.30% · 2026-11-12 15:32 UTC"
 
 
 def test_the_flags_card_lists_each_flag_as_a_sentence(monkeypatch) -> None:

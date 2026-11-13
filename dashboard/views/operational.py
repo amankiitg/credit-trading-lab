@@ -1568,10 +1568,12 @@ def render(
                     ),
                 ))
         fig.update_layout(
-            title="Account value — official evening NAV, with the morning run as a secondary line",
+            title="Account value — official evening NAV",
             yaxis_title="account equity",
         )
-        _plot(fig, height=340)
+        # The legend names the official and secondary lines; below the plot it
+        # cannot collide with the title at a narrow window.
+        _plot(fig, height=380, legend_below=True)
         st.caption(
             "Official NAV is the evening signal's, "
             + f"last ${stats['last_nav']:,.2f} on {stats['last_date']} "

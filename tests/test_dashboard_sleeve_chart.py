@@ -2,8 +2,9 @@
 
 This pins what the dashboard does with the stored sleeve P&L: the chart appears only
 when there is a stored session, the caption restates the reconciliation instead of
-assuming it, the bands use the two-colour long/short scheme, and an all-zero carry is
-named rather than left to look like a missing band.
+assuming it, every line uses its asset class's colour, the four cumulative sleeve
+lines sum to the cumulative book line at every point, a NaN tail is dropped, and an
+all-zero carry is named rather than left to look like a missing bar.
 """
 
 from __future__ import annotations
@@ -106,8 +107,8 @@ def test_the_chart_is_drawn_when_a_session_is_stored(monkeypatch) -> None:
     assert figures[0].layout.title.text.startswith("Book P&L by sleeve")
     text = _text(at)
     assert "### Book P&L by sleeve" in text
-    assert "each band is one sleeve's contribution" in text
-    assert "Solid band = price move, lighter band = distributions received" in text
+    assert "one cumulative line per sleeve" in text
+    assert "Bars: each sleeve's total over the period" in text
 
 
 def test_no_stored_session_means_no_chart_and_a_reason(monkeypatch) -> None:
@@ -117,7 +118,7 @@ def test_no_stored_session_means_no_chart_and_a_reason(monkeypatch) -> None:
     assert figures == []
     text = _text(at)
     assert "No sleeve P&L recorded yet" in text
-    assert "each band is one sleeve's contribution" not in text
+    assert "one cumulative line per sleeve" not in text
 
 
 def test_the_caption_restates_the_reconciliation_from_the_stored_rows(monkeypatch) -> None:
@@ -148,16 +149,77 @@ def test_the_carry_note_is_absent_when_carry_is_recorded(monkeypatch) -> None:
     assert "Carry is 0.00 in every recorded session" not in _text(at)
 
 
-def test_the_bands_use_the_two_colour_long_short_scheme(monkeypatch) -> None:
+def _pnl_chart(monkeypatch, **kwargs):
     figures = _capture_plots(monkeypatch)
-    _render(monkeypatch, sleeve_rows=ROWS, positions=POSITIONS)
-
-    chart = next(fig for fig in figures if fig.layout.title.text.startswith("Book P&L by sleeve"))
-    bands = [trace for trace in chart.data if trace.stackgroup]
-    colours = {trace.line.color for trace in bands}
-
-    assert len(bands) == 8, "price and carry band for each of four sleeves"
-    assert colours <= {operational.LONG_COLOR, operational.SHORT_COLOR}
-    assert colours == {operational.LONG_COLOR, operational.SHORT_COLOR}, (
-        "the equity sleeve is long and the other three are short, so both colours appear"
+    _render(monkeypatch, **kwargs)
+    return next(
+        fig for fig in figures
+        if fig.layout.title.text.startswith("Book P&L by sleeve")
     )
+
+
+def test_each_sleeve_line_uses_its_asset_class_colour(monkeypatch) -> None:
+    chart = _pnl_chart(monkeypatch, sleeve_rows=ROWS, positions=POSITIONS)
+
+    lines = {
+        trace.name: trace for trace in chart.data
+        if trace.type == "scatter" and trace.name != "Book total"
+    }
+    assert set(lines) == {"Equity", "Rates", "Credit", "Commodity"}
+    for name, trace in lines.items():
+        assert trace.line.color == operational.ASSET_CLASS_COLORS[name.lower()]
+
+    book = next(t for t in chart.data if t.name == "Book total")
+    assert book.line.color == operational.BOOK_TOTAL_COLOR
+    assert book.line.width > max(t.line.width for t in lines.values()), (
+        "the book total is the bold line on the panel"
+    )
+
+
+def test_the_sleeve_lines_sum_to_the_book_line_at_every_point(monkeypatch) -> None:
+    chart = _pnl_chart(monkeypatch, sleeve_rows=ROWS)
+
+    sleeve_lines = [
+        trace for trace in chart.data
+        if trace.type == "scatter" and trace.name != "Book total"
+    ]
+    book = next(t for t in chart.data if t.name == "Book total")
+
+    assert len(sleeve_lines) == 4, "one line per sleeve, not a price and carry pair"
+    xs = list(book.x)
+    for i in range(len(xs)):
+        total = sum(float(trace.y[i]) for trace in sleeve_lines)
+        assert total == pytest.approx(float(book.y[i]), abs=1e-9), (
+            f"at {xs[i]} the sleeves sum to {total}, the book line is {book.y[i]}"
+        )
+
+
+def test_the_second_panel_splits_the_period_into_price_and_carry(monkeypatch) -> None:
+    chart = _pnl_chart(monkeypatch, sleeve_rows=ROWS)
+
+    bars = {trace.name: trace for trace in chart.data if trace.type == "bar"}
+    assert set(bars) == {"Price", "Carry"}
+    # Two sessions: equity price 4+5, rates carry 2+1 over the period.
+    equity = list(bars["Price"].x).index("Equity")
+    rates = list(bars["Carry"].x).index("Rates")
+    assert float(bars["Price"].y[equity]) == pytest.approx(9.0)
+    assert float(bars["Carry"].y[rates]) == pytest.approx(3.0)
+
+
+def test_a_nan_tail_session_is_dropped(monkeypatch) -> None:
+    tail = ROWS + [
+        {
+            "trade_date": "2026-10-05",
+            "sleeve": sleeve,
+            "price_pnl": float("nan"),
+            "carry_pnl": float("nan"),
+            "total": float("nan"),
+            "book_total": float("nan"),
+        }
+        for sleeve in operational.SLEEVE_ORDER
+    ]
+
+    chart = _pnl_chart(monkeypatch, sleeve_rows=tail)
+
+    book = next(t for t in chart.data if t.name == "Book total")
+    assert [str(x)[:10] for x in book.x] == ["2026-10-01", "2026-10-02"]

@@ -195,6 +195,45 @@ def close_equity(
     return None
 
 
+def published_closes(
+    equity: Mapping[str, float],
+    sessions: list[str],
+    *,
+    start: str | None = None,
+    before: str | None = None,
+) -> dict[str, float]:
+    """Session -> close for every session in `sessions` this read actually covers.
+
+    The row-by-row sibling of close_equity(), for storing the series rather than
+    reconciling one session. close_equity() takes the first stamp after a session,
+    which is the tolerant reading the reconciliation needs -- a Monday whose close is
+    labelled Tuesday still has a close. For a stored series that tolerance is wrong at
+    the edge of the read: a session with no stamp of its own near the window's start
+    would be labelled with a point from days later and written as this session's close.
+
+    So the label must be exactly the next calendar day (EQUITY_STAMP_OFFSET_DAYS), and
+    a session the read does not cover is skipped instead of guessed. Where both agree
+    -- every session the nightly read covers -- the values are identical, and
+    tests/test_execution_pnl.py pins that against close_equity().
+
+    `before` is exclusive, so the evening job can ask for "D-1 and earlier" from the
+    same read that includes a stamp for D itself once the broker has published it.
+    """
+    available = {str(stamp)[:10] for stamp in equity}
+    out: dict[str, float] = {}
+    for raw in sorted({str(day)[:10] for day in sessions if day}):
+        if before is not None and raw >= str(before)[:10]:
+            continue
+        if start is not None and raw < str(start)[:10]:
+            continue
+        label = (
+            date.fromisoformat(raw) + timedelta(days=EQUITY_STAMP_OFFSET_DAYS)
+        ).isoformat()
+        if label in available:
+            out[raw] = float(equity[label])
+    return out
+
+
 def equity_pair_reason(
     equity: Mapping[str, float],
     sessions: list[str],
@@ -515,6 +554,7 @@ def record_execution_component(
         "reconciliation": None,
         "reconciliation_reason": None,
         "convention": None,
+        "close_equity": {},
         "carry_short": short_carry,
         "paper_add_back": -short_carry,
         "note": short_distribution_note(short_carry),
@@ -561,6 +601,14 @@ def record_execution_component(
             report["reconciliation_reason"] = str(exc)
             log.warning("equity history unavailable for %s: %s", session, exc)
             return report
+
+        # Every session before the one being measured whose close this read has
+        # published. The caller stores these for the dashboard's evening NAV series;
+        # this module does not write them, because the reconciliation must stay a
+        # read whose only side effect is the sleeve rows it already writes.
+        report["close_equity"] = published_closes(
+            equity, list(sessions or []), before=session
+        )
 
         change = session_equity_change(equity, list(sessions or []), session)
         if change is None:

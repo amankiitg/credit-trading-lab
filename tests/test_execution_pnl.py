@@ -452,3 +452,88 @@ def test_the_email_says_the_gap_out_loud(monkeypatch) -> None:
     assert summary.execution_note.startswith("WARNING")
     assert "378.00" in summary.execution_note
     assert "does not debit short distributions" in summary.execution_note
+
+
+# --------------------------------------------------- the close series, row by row
+#
+# The dashboard plots one close per session, so the read has to be exact about
+# which session each stamp belongs to. close_equity() is deliberately tolerant --
+# it takes the first stamp after a session, which is what a reconciliation of one
+# session needs -- and at the edge of a read that would label a much later point as
+# this session's close.
+
+
+def test_published_closes_agrees_with_close_equity_on_a_covered_window() -> None:
+    """Where the read covers a session, the stored value is the reconciled one.
+
+    2026-10-30 is a Friday whose close is labelled 2026-10-31 (Saturday); Monday
+    2026-11-02's close is labelled 2026-11-03. Both readings must agree.
+    """
+    equity = {"2026-10-31": 900.0, "2026-11-03": 1000.0, "2026-11-04": 1010.0}
+    sessions = ["2026-10-30", "2026-11-02", "2026-11-03", "2026-11-04"]
+
+    closes = ep.published_closes(equity, sessions, before="2026-11-04")
+
+    assert closes == {
+        "2026-10-30": 900.0,
+        "2026-11-02": 1000.0,
+        "2026-11-03": 1010.0,
+    }
+    for session in closes:
+        assert closes[session] == ep.close_equity(equity, session)
+    assert "2026-11-04" not in closes, "before is exclusive: D's own close is not D-1"
+
+
+def test_published_closes_skips_a_session_the_read_does_not_cover() -> None:
+    """A missing label is a missing row, not the next session's close.
+
+    close_equity() would answer 1200.0 for 2026-11-02 here -- the first stamp after
+    it -- because that is the tolerant reading the reconciliation wants. Storing it
+    would put a later session's equity on an earlier date, so the row is skipped.
+    """
+    equity = {"2026-10-30": 900.0, "2026-11-10": 1200.0}
+    sessions = ["2026-10-29", "2026-11-02"]
+
+    assert ep.published_closes(equity, sessions) == {"2026-10-29": 900.0}
+    assert ep.close_equity(equity, "2026-11-02") == pytest.approx(1200.0)
+
+
+def test_published_closes_honours_the_start_of_the_series() -> None:
+    # 2026-10-01 (the label) is the close of 2026-09-30; 2026-10-02 is 10-01's own.
+    equity = {"2026-10-01": 500.0, "2026-10-02": 510.0}
+    sessions = ["2026-09-30", "2026-10-01"]
+
+    assert ep.published_closes(equity, sessions, start="2026-10-01") == {
+        "2026-10-01": 510.0
+    }
+
+
+def test_the_execution_report_carries_the_closes_it_read(monkeypatch) -> None:
+    """The evening job stores D-1 and earlier from the read it already made."""
+    import execution.alpaca_paper as ap
+
+    monkeypatch.setattr(ap, "connect", lambda dry_run=True: object())
+    monkeypatch.setattr(ap, "fetch_session_fills", lambda client, day: [])
+    monkeypatch.setattr(
+        ap,
+        "fetch_equity_history",
+        lambda client, day: {
+            "2026-10-30": 1300.0,
+            "2026-11-03": 1000.0,
+            "2026-11-04": 1005.0,
+        },
+    )
+
+    report = ep.record_execution_component(
+        session="2026-11-03",
+        close_now={"TLT": 81.84},
+        sessions=["2026-10-29", "2026-10-30", "2026-11-02", "2026-11-03"],
+        carry_total=0.0,
+        book_total=0.0,
+    )
+
+    assert report["close_equity"] == {
+        "2026-10-29": 1300.0,
+        "2026-11-02": 1000.0,
+    }
+    assert "2026-11-03" not in report["close_equity"], "D itself is not D-1"

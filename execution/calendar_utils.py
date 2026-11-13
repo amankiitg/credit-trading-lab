@@ -112,6 +112,25 @@ def trading_days_elapsed(from_date: str, to_date: str) -> int:
     return max(0, len(sessions) - 1)
 
 
+def nyse_sessions(start_date: str, end_date: str) -> list[str]:
+    """Every NYSE session in [start_date, end_date], inclusive, as YYYY-MM-DD.
+
+    Enumerating sessions rather than walking calendar days is what keeps a backfill
+    from attaching a Friday close to a holiday: the portfolio history labels each
+    close with the next calendar day, so a session date must come from the calendar
+    and not from arithmetic on dates.
+
+    Raises on a calendar lookup failure. That is the opposite of is_trading_day's
+    fail-open, on purpose: this feeds a one-off write to a stored series, where
+    guessing extra sessions would write wrong values rather than skip a day.
+    """
+    import pandas as pd
+
+    cal = _get_nyse()
+    index = cal.sessions_in_range(pd.Timestamp(start_date), pd.Timestamp(end_date))
+    return [str(ts.date()) for ts in index]
+
+
 def check_already_ran(job_name: str, run_date: str) -> bool:
     """Return True if job_name already completed for run_date (idempotency guard).
 

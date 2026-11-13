@@ -26,6 +26,13 @@ Tables (created by the user in the Supabase dashboard):
              -- book held at the previous close, and is not necessarily the run date.
              -- The four rows of a session sum to book_total, which is the gate.
 
+  close_equity (session_date date PK, equity numeric, source text,
+              fetched_at timestamptz)
+             -- one row per session: the account equity at that session's close, as
+             -- published by the portfolio history and read by the reconciliation.
+             -- The dashboard's evening NAV series reads this instead of holding a
+             -- broker credential of its own.
+
 Reads SUPABASE_URL and SUPABASE_SECRET_KEY from the environment (.env).
 The URL stored in .env includes the /rest/v1/ suffix; this module strips it
 before constructing the client (create_client needs the project root URL).
@@ -35,6 +42,7 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import datetime, timezone
 
 _log = logging.getLogger(__name__)
 _client = None
@@ -538,3 +546,44 @@ def fetch_daily_sleeve_pnl(
                 f"Supabase read failed: {type(exc).__name__}: {exc}"
             ) from exc
         return []
+
+
+# ---------------------------------------------------------------- close equity (v9.9)
+
+def write_close_equity(closes: dict[str, float], *, source: str) -> bool:
+    """Upsert {session: equity} into close_equity. Never raises.
+
+    PK is session_date, so a re-run overwrites a session rather than duplicating it,
+    and a corrected close replaces the old value. `fetched_at` is when this write
+    happened, not when the close did -- the difference is what tells a stale row from
+    an old session.
+
+    Returns False on any failure, including a missing table. The evening job treats
+    this as bookkeeping: it logs the False and carries on, because the table feeds a
+    chart and must never be able to fail a run whose signal is already written.
+    """
+    if not closes:
+        return False
+    client = get_supabase_client()
+    if client is None:
+        return False
+    fetched_at = datetime.now(timezone.utc).isoformat()
+    rows = [
+        {
+            "session_date": str(day)[:10],
+            "equity": float(value),
+            "source": source,
+            "fetched_at": fetched_at,
+        }
+        for day, value in sorted(closes.items())
+    ]
+    try:
+        client.table("close_equity").upsert(rows).execute()
+        return True
+    except Exception as exc:
+        _log.warning(
+            "write_close_equity failed for %d row(s): %s -- the dashboard keeps "
+            "its stored series; nothing else depends on this table",
+            len(rows), exc,
+        )
+        return False

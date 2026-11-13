@@ -95,6 +95,7 @@ def _render(
     # The cached reader has no arguments, so one entry would otherwise leak from the
     # first test into every later one in this process.
     operational._get_last_execution_run.clear()
+    operational._get_last_signal_run.clear()
 
     at = AppTest.from_file(str(APP), default_timeout=600)
     at.run()
@@ -236,7 +237,8 @@ def test_the_panel_asks_cron_runs_for_the_execution_job(
     """
     at, gate_calls = _render(monkeypatch, last_run=last_run)
 
-    assert gate_calls == ["run_execution"]
+    assert gate_calls.count("run_execution") == 1
+    assert "run_signal" in gate_calls, "the header also labels the NAV source"
     assert expected_state_text in _text(at)
 
 
@@ -261,7 +263,7 @@ def test_a_successful_auto_approve_write_reports_the_new_value(monkeypatch) -> N
 
     text = _text(at)
     assert "Auto-approve OFF" in text
-    assert "execute only if `decision = approve`" in text
+    assert "execute only if today's decision is approve" in text
     assert "Could not save" not in text
 
 
@@ -281,6 +283,6 @@ def test_a_failed_auto_approve_write_reports_an_error_not_success(monkeypatch) -
     text = _text(at)
     assert "Could not save the auto-approve setting" in text
     assert "Auto-approve OFF" not in text, "a failed write must not report the new state"
-    assert "execute unless `decision = reject`" in text, (
+    assert "execute unless today's decision is reject" in text, (
         "the cron-logic copy must describe the stored value, which is still ON"
     )

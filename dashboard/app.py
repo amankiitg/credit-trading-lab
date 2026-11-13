@@ -61,7 +61,7 @@ else:
 import streamlit as st  # noqa: E402
 
 st.set_page_config(
-    page_title="Credit Trading Lab",
+    page_title="Credit Lab | Multi-Asset Trend",
     page_icon=":test_tube:",
     layout="wide",
 )

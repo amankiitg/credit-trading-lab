@@ -598,12 +598,17 @@ def _section(title: str) -> None:
     st.markdown(f"### {title}")
 
 
-def _plot(fig: go.Figure, *, height: int = 320) -> None:
+def _plot(fig: go.Figure, *, height: int = 320, legend_below: bool = False) -> None:
+    margin = dict(l=10, r=10, t=40, b=10)
+    legend = dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    if legend_below:
+        legend = dict(orientation="h", yanchor="top", y=-0.18, xanchor="left", x=0)
+        margin["b"] = 80
     fig.update_layout(
         height=height,
-        margin=dict(l=10, r=10, t=40, b=10),
+        margin=margin,
         hovermode="x unified",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        legend=legend,
     )
     st.plotly_chart(fig, width="stretch", config=PLOTLY_CONFIG)
 
@@ -675,34 +680,49 @@ def _render_header(
     if concentration:
         st.warning("**Concentration risk** — " + "; ".join(concentration) + ".")
 
-    columns = st.columns(6)
-    columns[0].metric(
+    # Two rows of three. Six cards in one row truncates the values on a
+    # 1200px-wide window, and a truncated NAV is worse than no card.
+    flag_brief: list[str] = []
+    if concentration:
+        flag_brief.append("concentration")
+    if net_message:
+        flag_brief.append("net off target")
+    if gross_message:
+        flag_brief.append("gross off target")
+    if drift:
+        flag_brief.append("position drift")
+    if non_normal:
+        flag_brief.append(f"{len(non_normal)} stop state(s)")
+
+    row_one = st.columns(3)
+    row_one[0].metric(
         "NAV", "$" + f"{nav_snapshot['value']:,.2f}",
         delta=f"{nav_snapshot['source']} · {_fmt_utc(nav_snapshot['timestamp'])}",
         delta_color="off",
     )
-    columns[1].metric("1-day P&L", pnl_value, delta=pnl_delta, delta_color="off")
-    columns[2].metric(
+    row_one[1].metric("1-day P&L", pnl_value, delta=pnl_delta, delta_color="off")
+    row_one[2].metric(
         "Gross", f"{gross_x:.2f}x NAV",
         delta=f"target {sum(abs(float(r.get('target wt') or 0.0)) for r in proposed_rows):.2f}x",
         delta_color="off",
     )
-    columns[3].metric(
+    row_two = st.columns(3)
+    row_two[0].metric(
         "Net", f"{net_pct:+.1f}%",
         delta="$" + f"{net_usd:+,.0f} · target "
               f"{sum(float(r.get('target wt') or 0.0) for r in proposed_rows) * 100:+.1f}%",
         delta_color="off",
     )
-    columns[4].metric(
+    row_two[1].metric(
         "Book vol", book_vol_value,
         delta="annualized, 120-session covariance",
         delta_color="off",
     )
-    columns[5].metric(
+    row_two[2].metric(
         "Active risk flags", str(len(flags)),
-        delta="; ".join(flags) if flags else "all clear",
+        delta="; ".join(flag_brief) if flag_brief else "all clear",
         delta_color="off",
-        help="Concentration, exposure, position drift and stop states.",
+        help="; ".join(flags) if flags else "Concentration, exposure, position drift and stop states.",
     )
 
     st.caption(
@@ -1310,7 +1330,7 @@ def render(
         ))
         fig.update_layout(title="Book P&L by sleeve: carry and price, stacked",
                           yaxis_title="cumulative P&L")
-        _plot(fig, height=400)
+        _plot(fig, height=400, legend_below=True)
 
         gap = float(book_cum.iloc[-1] - (price_cum.iloc[-1].sum() + carry_cum.iloc[-1].sum()))
         st.caption(

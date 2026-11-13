@@ -8,13 +8,19 @@ broker or a database.
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from datetime import date, timedelta
+from pathlib import Path
 
 import pytest
 
 import execution.alpaca_paper as ap
 import scripts.backfill_close_equity as backfill
 from execution.calendar_utils import nyse_sessions
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _history(skip_session: str | None = None) -> tuple[list[str], dict[str, float]]:
@@ -109,3 +115,66 @@ def test_the_write_path_sends_only_the_close_rows(monkeypatch) -> None:
     assert len(written) == 1
     assert written[0]["source"] == "alpaca_portfolio_history"
     assert "2026-10-01" in written[0]["closes"]
+
+
+def _run_from_the_project_root(*args: str) -> subprocess.CompletedProcess:
+    """Run the script the way its docstring says to: from the root, by path.
+
+    Credentials are stripped, so the run can never leave the process; it stops at the
+    first broker call.
+    """
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("ALPACA_", "SUPABASE_"))
+    }
+    return subprocess.run(
+        [sys.executable, "scripts/backfill_close_equity.py", *args],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+
+def test_the_script_reaches_main_when_run_by_path_from_the_root() -> None:
+    """".venv/bin/python scripts/backfill_close_equity.py" must not die on the import.
+
+    Run by path, the interpreter puts scripts/ -- and only scripts/ -- at sys.path[0],
+    so the first lazy project import ("from execution.alpaca_paper import connect")
+    raised ModuleNotFoundError before the sys.path bootstrap. Getting as far as the
+    missing-credential refusal is the proof that every import resolved.
+    """
+    result = _run_from_the_project_root()
+    output = result.stdout + result.stderr
+
+    assert "ModuleNotFoundError" not in output
+    assert "No module named 'execution'" not in output
+    assert "ALPACA_PAPER_API_KEY and ALPACA_PAPER_SECRET_KEY must be set" in output
+
+
+def test_the_bootstrap_reaches_every_project_module_the_script_imports() -> None:
+    """The script imports project modules lazily, so pin them all under the same path.
+
+    sys.path[0] is set to scripts/ to reproduce exactly what "python scripts/..."
+    does; the script's bootstrap then has to make the root importable.
+    """
+    probe = (
+        "import sys; sys.path[0] = 'scripts';"
+        "import backfill_close_equity;"
+        "import execution.alpaca_paper, execution.calendar_utils,"
+        " risk.execution_pnl, dashboard.supabase_client;"
+        "print('project imports ok')"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "project imports ok" in result.stdout
+

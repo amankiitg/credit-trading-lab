@@ -37,6 +37,17 @@ import argparse
 import logging
 import sys
 from datetime import date, timedelta
+from pathlib import Path
+
+# Runnable as ".venv/bin/python scripts/backfill_close_equity.py" from the repo root
+# without an editable install: the interpreter puts scripts/ -- and only scripts/ -- at
+# sys.path[0], so execution/, risk/ and dashboard/ are not importable from here. The
+# cron jobs never hit that because render.yaml builds them with "pip install -e .";
+# this one-off, documented to run from a checkout, may not be installed. Adding the
+# project root is the bootstrap scripts/measure_dashboard_memory.py already uses.
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 logging.basicConfig(
     level=logging.INFO,

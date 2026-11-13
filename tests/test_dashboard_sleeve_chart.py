@@ -91,7 +91,7 @@ def _text(at) -> str:
 def _capture_plots(monkeypatch):
     figures = []
 
-    def _capture(fig, *, height=320):
+    def _capture(fig, **kwargs):
         figures.append(fig)
 
     monkeypatch.setattr(operational, "_plot", _capture)

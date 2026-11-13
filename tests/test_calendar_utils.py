@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from execution.calendar_utils import is_trading_day, trading_days_elapsed
+from execution.calendar_utils import is_trading_day, nyse_sessions, trading_days_elapsed
 
 
 def test_trading_day_known_weekday() -> None:
@@ -107,3 +107,26 @@ def test_an_unparseable_date_raises() -> None:
     """
     with pytest.raises(Exception):
         trading_days_elapsed("not-a-date", "2026-09-24")
+
+
+# ------------------------------------------------------------ session enumeration
+#
+# The close_equity backfill needs the sessions themselves, not a count: it stores one
+# row per session and must not invent a date for a holiday.
+
+
+def test_nyse_sessions_skips_the_weekend() -> None:
+    assert nyse_sessions("2026-11-05", "2026-11-11") == [
+        "2026-11-05",
+        "2026-11-06",
+        "2026-11-09",
+        "2026-11-10",
+        "2026-11-11",
+    ]
+
+
+def test_nyse_sessions_skips_a_holiday() -> None:
+    sessions = nyse_sessions("2026-12-24", "2026-12-28")
+
+    assert "2026-12-25" not in sessions, "Christmas is not a session"
+    assert sessions[0] == "2026-12-24"

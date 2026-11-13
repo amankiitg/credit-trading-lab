@@ -41,6 +41,10 @@ EXPECTED_CALL_SITES: dict[str, int] = {
     "scripts/run_execution.py": 1,       # the execution job (order-placing)
     "scripts/backfill_execution_run.py": 1,  # the crash-recovery replay
     "scripts/sync_positions_from_alpaca.py": 1,  # the manual re-sync
+    # One-off history fill for close_equity. It asks for the read-only client the
+    # reconciliation uses and makes a single portfolio-history GET per window; it
+    # writes to Supabase, never to the broker.
+    "scripts/backfill_close_equity.py": 1,
 }
 
 

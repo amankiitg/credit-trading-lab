@@ -127,6 +127,7 @@ def _run_signal_with(
     *,
     gap: float = 0.0,
     client_available: bool = True,
+    close_equity_write: str = "ok",
     no_real_email,
 ) -> dict:
     """Drive the real `run_signal.main()` with one fake client where step 7 gets it.
@@ -192,6 +193,15 @@ def _run_signal_with(
 
     written: list[dict] = []
     recorded: list[tuple[str, str]] = []
+    close_writes: list[dict] = []
+
+    def _write_close_equity(closes, *, source):
+        close_writes.append({"closes": dict(closes), "source": source})
+        if close_equity_write == "raises":
+            raise RuntimeError("close_equity is not in the schema cache")
+        return close_equity_write != "false"
+
+    monkeypatch.setattr(sb, "write_close_equity", _write_close_equity)
 
     monkeypatch.setattr(cal, "is_trading_day", lambda day: True)
     monkeypatch.setattr(cal, "check_already_ran", lambda job, day: False)
@@ -251,6 +261,7 @@ def _run_signal_with(
         "expected": expected,
         "gap": gap,
         "recorded": recorded,
+        "close_writes": close_writes,
     }
 
 
@@ -333,3 +344,43 @@ def test_without_a_client_the_day_is_still_written_and_says_so(
     assert "Execution P&L: not available (no Alpaca client)" in body, body
     assert len(out["written"]) == 4, "carry, price and total are still recorded"
     assert all(row["execution_pnl"] is None for row in out["written"])
+
+
+# ------------------------------------------------- the close series, step 8b
+#
+# The dashboard's evening NAV comes from close_equity, which this job fills from the
+# portfolio history it already read for step 8's reconciliation. The two reads are the
+# same one, so the rows must appear without a second broker call -- and a failed write
+# must be a log line, not a failed run.
+
+
+def test_step_eight_b_stores_the_closes_the_reconciliation_read(monkeypatch, no_real_email) -> None:
+    out = _run_signal_with(monkeypatch, no_real_email=no_real_email)
+
+    assert out["close_writes"] == [
+        {
+            "closes": {PRIOR_SESSION: 100_000.0},
+            "source": "alpaca_portfolio_history",
+        }
+    ], "the prior session's published close, and only that one"
+
+
+def test_a_raised_close_equity_write_never_fails_the_run(monkeypatch, no_real_email) -> None:
+    out = _run_signal_with(
+        monkeypatch, close_equity_write="raises", no_real_email=no_real_email
+    )
+
+    assert out["code"] == 0
+    assert out["subject"].startswith("[OK]")
+    assert len(out["written"]) == 4, "the sleeve rows are unaffected"
+    assert f"{out['execution']:+,.2f} total" in out["body"], "the signal's numbers stand"
+
+
+def test_a_rejected_close_equity_write_is_also_non_fatal(monkeypatch, no_real_email) -> None:
+    out = _run_signal_with(
+        monkeypatch, close_equity_write="false", no_real_email=no_real_email
+    )
+
+    assert out["code"] == 0
+    assert out["subject"].startswith("[OK]")
+    assert len(out["written"]) == 4

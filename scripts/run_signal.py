@@ -15,7 +15,11 @@ What it does:
   5. Write decision='proposed' to Supabase decisions table for as_of_date.
   6. Record the completed run in cron_runs.
   7. Refresh the cached position snapshot and live_nav from Alpaca.
-  8. Decompose the session's book P&L by sleeve and into carry vs price.
+  8. Decompose the session's book P&L by sleeve and into carry vs price, and
+     reconcile it against the portfolio history's close equity.
+  8b. Store every close that reconciliation read (D-1 and earlier) in
+     close_equity, so the dashboard's evening NAV series is a table read and the
+     dashboard needs no broker credential of its own.
 
 Every step logs begin and done, and the whole job runs under a hard deadline
 (execution/job_guard.py), so a hang is both locatable in the log and impossible
@@ -73,6 +77,13 @@ OVERLAY_MAX_SECS: float = float(os.environ.get("OVERLAY_MAX_SECS", "120"))
 # signal, so it gets a bound of its own rather than a share of the job's remaining time.
 # Override with SLEEVE_PNL_MAX_SECS.
 SLEEVE_PNL_MAX_SECS: float = float(os.environ.get("SLEEVE_PNL_MAX_SECS", "120"))
+
+# Budget for storing the close series. Bookkeeping with no reader on the trading path:
+# one upsert of at most a couple of dozen rows, and a deadline of its own so a wedged
+# PostgREST call cannot consume the run's remaining time. It is caught like every other
+# bookkeeping step, so a timeout here is a warning in the log, never a failed run.
+# Override with CLOSE_EQUITY_MAX_SECS.
+CLOSE_EQUITY_MAX_SECS: float = float(os.environ.get("CLOSE_EQUITY_MAX_SECS", "30"))
 
 
 def main(max_secs: float | None = None) -> int:
@@ -409,6 +420,47 @@ def _run(summary: RunSummary) -> int:
                 as_of_date=as_of_date, log=logger, client=alpaca
             )
     summary.record_sleeve_pnl(sleeve_report)
+
+    # -- 8b. Store the closes that reconciliation just read. The portfolio history
+    #        labels each close with the FOLLOWING calendar day, so on the evening of
+    #        D this read covers D-1 and earlier; published_closes has already turned
+    #        those labels back into sessions and dropped D. One upsert per evening
+    #        keeps the dashboard's NAV series current without giving the dashboard a
+    #        broker credential or a second ingest path.
+    #
+    #        Bookkeeping, like step 8: a failed or timed-out write is a warning and
+    #        the run still exits 0. The signal and the order file are already written
+    #        by this point, and a chart must never be able to un-write them.
+    closes = (sleeve_report.get("execution") or {}).get("close_equity") or {}
+    if closes:
+        from dashboard.supabase_client import write_close_equity
+
+        with step("8b store close equity", logger):
+            try:
+                with step_budget(CLOSE_EQUITY_MAX_SECS, logger):
+                    stored = write_close_equity(
+                        closes, source="alpaca_portfolio_history"
+                    )
+                if stored:
+                    logger.info(
+                        "stored %d close_equity row(s) (%s..%s)",
+                        len(closes), min(closes), max(closes),
+                    )
+                else:
+                    logger.warning(
+                        "close_equity write returned False (%d row(s)) -- the "
+                        "dashboard keeps its stored series",
+                        len(closes),
+                    )
+            except (Exception, JobTimeout) as exc:
+                # JobTimeout is a BaseException, so a bare `except Exception` would
+                # let a deadline here unwind through step() and fail the whole run.
+                logger.warning(
+                    "close_equity write failed (%s: %s) -- continuing; the signal "
+                    "and the order file are unaffected",
+                    type(exc).__name__, exc,
+                )
+
     logger.info("run_signal complete for %s", today)
     return 0
 

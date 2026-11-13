@@ -30,6 +30,7 @@ Tables (created by the user in the Supabase dashboard):
               fetched_at timestamptz)
              -- one row per session: the account equity at that session's close, as
              -- published by the portfolio history and stored by the evening job.
+             -- The reconciliation reads it too, as a check on its own read.
              -- The dashboard's evening NAV series reads this instead of holding a
              -- broker credential of its own.
 
@@ -42,6 +43,7 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import datetime, timezone
 
 _log = logging.getLogger(__name__)
 _client = None
@@ -590,3 +592,43 @@ def fetch_close_equity(
             continue
         out[str(row["session_date"])[:10]] = float(row["equity"])
     return out
+
+
+def write_close_equity(closes: dict[str, float], *, source: str) -> bool:
+    """Upsert {session: equity} into close_equity. Never raises.
+
+    PK is session_date, so a re-run overwrites a session rather than duplicating it,
+    and a corrected close replaces the old value. `fetched_at` is when this write
+    happened, not when the close did -- the difference is what tells a stale row from
+    an old session.
+
+    Returns False on any failure, including a missing table. The evening job treats
+    this as bookkeeping: it logs the False and carries on, because the table feeds a
+    chart and must never be able to fail a run whose signal is already written.
+    """
+    if not closes:
+        return False
+    client = get_supabase_client()
+    if client is None:
+        return False
+    fetched_at = datetime.now(timezone.utc).isoformat()
+    rows = [
+        {
+            "session_date": str(day)[:10],
+            "equity": float(value),
+            "source": source,
+            "fetched_at": fetched_at,
+        }
+        for day, value in sorted(closes.items())
+    ]
+    try:
+        client.table("close_equity").upsert(rows).execute()
+        return True
+    except Exception as exc:
+        _log.warning(
+            "write_close_equity failed for %d row(s): %s -- the dashboard keeps "
+            "its stored series; nothing else depends on this table",
+            len(rows), exc,
+        )
+        return False
+

@@ -446,6 +446,80 @@ def _nav_basis_line(nav_snapshot: dict) -> str:
     )
 
 
+def _parse_timestamp(value) -> datetime | None:
+    """A stored timestamp as an aware UTC datetime, or None."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        try:
+            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _book_pnl_snapshot(
+    df_sleeve: pd.DataFrame, df_pnl: pd.DataFrame, nav: float
+) -> dict:
+    """The 1-day P&L value, from the same run as the NAV card.
+
+    The evening signal writes daily_sleeve_pnl after the close, one row per sleeve
+    per session, and its book_total is that session's book P&L measured on the book
+    held at the previous close. When that run is the newest P&L on file it is the
+    number that belongs beside a NAV the same run refreshed, so it wins over the
+    morning execution's pnl_log row. pnl_log stays the fallback for mornings where
+    the signal has not recorded a session yet.
+    """
+    sleeve_value = sleeve_session = sleeve_ts = None
+    if not df_sleeve.empty and "book_total" in df_sleeve.columns:
+        dated = df_sleeve.dropna(subset=["book_total"])
+        if not dated.empty:
+            latest = max(str(value) for value in dated["trade_date"].unique())
+            rows = dated[dated["trade_date"].astype(str) == latest]
+            if not rows.empty:
+                sleeve_session = latest
+                sleeve_value = float(rows.iloc[0]["book_total"])
+                sleeve_ts = _parse_timestamp(rows.iloc[0].get("created_at"))
+
+    pnl_value = pnl_session = pnl_ts = None
+    if not df_pnl.empty:
+        last = df_pnl.iloc[-1]
+        if "book_pnl" in df_pnl.columns and pd.notna(last.get("book_pnl")):
+            pnl_value = float(last["book_pnl"])
+            pnl_session = str(last.get("trade_date"))
+            pnl_ts = _parse_timestamp(last.get("created_at"))
+
+    use_sleeve = sleeve_value is not None and (
+        pnl_value is None
+        or (
+            sleeve_ts is not None
+            and pnl_ts is not None
+            and sleeve_ts >= pnl_ts
+        )
+    )
+    value = sleeve_value if use_sleeve else pnl_value
+    if value is None:
+        return {
+            "value": None,
+            "pct_of_nav": None,
+            "session": None,
+            "source": None,
+            "timestamp": None,
+        }
+
+    return {
+        "value": value,
+        "pct_of_nav": value / nav * 100 if nav else None,
+        "session": sleeve_session if use_sleeve else pnl_session,
+        "source": "evening signal" if use_sleeve else "morning execution",
+        "timestamp": sleeve_ts if use_sleeve else pnl_ts,
+    }
+
+
 def _risk_snapshot(nav: float, positions_data: list[dict]) -> dict | None:
     """Live covariance and risk contributions, or a reason they are unavailable.
 
@@ -613,13 +687,51 @@ def _plot(fig: go.Figure, *, height: int = 320, legend_below: bool = False) -> N
     st.plotly_chart(fig, width="stretch", config=PLOTLY_CONFIG)
 
 
+def _active_flags(
+    concentration: list[str],
+    net_message: str | None,
+    gross_message: str | None,
+    drift: dict | None,
+    stop_states: list[dict],
+) -> list[str]:
+    """Every active flag as the sentence an operator can act on.
+
+    The header card lists these in full below the count: a category name such as
+    "net off target" tells nobody which way, by how much, or against what band.
+    """
+    flags: list[str] = list(concentration)
+    if net_message:
+        flags.append(net_message)
+    if gross_message:
+        flags.append(gross_message)
+    if drift:
+        drifted = sorted((drift.get("detail") or {}).keys())
+        flags.append(
+            "position drift: the cached snapshot disagreed with live Alpaca"
+            + (f" on {', '.join(drifted)}" if drifted else "")
+            + (f" (detected {drift['detected_at']})" if drift.get("detected_at") else "")
+        )
+    non_normal = [
+        row for row in stop_states
+        if row.get("state", "NORMAL") not in ("NORMAL", "None", None, "")
+    ]
+    if non_normal:
+        flags.append(
+            f"{len(non_normal)} stop state(s) away from NORMAL: "
+            + ", ".join(
+                f"{row.get('ticker')} {row.get('state')}" for row in non_normal
+            )
+        )
+    return flags
+
+
 def _render_header(
     *,
     proposed_rows: list[dict],
     as_of_date: str,
     nav: float,
     positions_data: list[dict],
-    df_pnl: pd.DataFrame,
+    book_pnl: dict,
     risk: dict | None,
     drift: dict | None,
     stop_states: list[dict],
@@ -627,7 +739,11 @@ def _render_header(
     net_message: str | None,
     gross_message: str | None,
 ) -> None:
-    """Title and the six numbers, each with the run it came from."""
+    """Title and the six numbers, each with the run it came from.
+
+    The NAV and 1-day P&L cards are one run apart in time only if something is
+    wrong: both carry the run timestamp of the NAV the page is showing.
+    """
     st.title("Credit Lab | Multi-Asset Trend")
     st.caption(
         f"Signal as of {as_of_date} · positions snapshot "
@@ -641,63 +757,41 @@ def _render_header(
     net_pct = net_usd / nav * 100 if nav else 0.0
     gross_x = gross_usd / nav if nav else 0.0
 
-    last_run = df_pnl.iloc[-1] if not df_pnl.empty else None
-    book_pnl = last_run.get("book_pnl") if last_run is not None else None
-    pnl_timestamp = last_run.get("created_at") if last_run is not None else None
-    if book_pnl is None or pd.isna(book_pnl):
+    run_label = f"{nav_snapshot['source']} {_fmt_utc(nav_snapshot['timestamp'])}"
+    if book_pnl["value"] is None:
         pnl_value, pnl_delta = "—", "not recorded yet"
     else:
-        pnl_pct = (float(book_pnl) / float(last_run.get("live_nav")) * 100
-                   if last_run is not None and pd.notna(last_run.get("live_nav")) else None)
-        pnl_value = "$" + f"{float(book_pnl):+,.2f}"
+        pnl_value = "$" + f"{float(book_pnl['value']):+,.2f}"
+        # Same run as the NAV card whenever the two come from the same write;
+        # name the P&L's own run only when they do not.
+        pnl_run_label = (
+            run_label
+            if book_pnl["source"] == nav_snapshot["source"]
+            else f"{book_pnl['source']} {_fmt_utc(book_pnl['timestamp'])}"
+        )
         pnl_delta = (
-            f"{pnl_pct:+.2f}% of NAV · morning execution {_fmt_utc(pnl_timestamp)}"
-            if pnl_pct is not None
-            else f"morning execution {_fmt_utc(pnl_timestamp)}"
+            f"{book_pnl['pct_of_nav']:+.2f}% of NAV · {pnl_run_label}"
+            if book_pnl["pct_of_nav"] is not None
+            else pnl_run_label
         )
 
     book_vol = risk.get("port_vol") if risk and "error" not in risk else None
     book_vol_value = f"{book_vol * 100:.1f}%" if book_vol is not None else "—"
 
     concentration = _concentration_messages(risk)
-    flags: list[str] = list(concentration)
-    if net_message:
-        flags.append("net off target")
-    if gross_message:
-        flags.append("gross off target")
-    if drift:
-        flags.append("position drift")
-    non_normal = [
-        r for r in stop_states
-        if r.get("state", "NORMAL") not in ("NORMAL", "None", None, "")
-    ]
-    if non_normal:
-        flags.append(
-            f"{len(non_normal)} stop state(s): "
-            + ", ".join(str(r.get("ticker")) for r in non_normal)
-        )
+    flags = _active_flags(
+        concentration, net_message, gross_message, drift, stop_states
+    )
 
     if concentration:
         st.warning("**Concentration risk** — " + "; ".join(concentration) + ".")
 
     # Two rows of three. Six cards in one row truncates the values on a
     # 1200px-wide window, and a truncated NAV is worse than no card.
-    flag_brief: list[str] = []
-    if concentration:
-        flag_brief.append("concentration")
-    if net_message:
-        flag_brief.append("net off target")
-    if gross_message:
-        flag_brief.append("gross off target")
-    if drift:
-        flag_brief.append("position drift")
-    if non_normal:
-        flag_brief.append(f"{len(non_normal)} stop state(s)")
-
     row_one = st.columns(3)
     row_one[0].metric(
         "NAV", "$" + f"{nav_snapshot['value']:,.2f}",
-        delta=f"{nav_snapshot['source']} · {_fmt_utc(nav_snapshot['timestamp'])}",
+        delta=run_label,
         delta_color="off",
     )
     row_one[1].metric("1-day P&L", pnl_value, delta=pnl_delta, delta_color="off")
@@ -718,15 +812,22 @@ def _render_header(
         delta="annualized, 120-session covariance",
         delta_color="off",
     )
-    row_two[2].metric(
-        "Active risk flags", str(len(flags)),
-        delta="; ".join(flag_brief) if flag_brief else "all clear",
-        delta_color="off",
-        help="; ".join(flags) if flags else "Concentration, exposure, position drift and stop states.",
-    )
+    with row_two[2].container(border=True):
+        st.metric("Active risk flags", str(len(flags)))
+        if flags:
+            st.markdown("\n".join(f"- {flag}" for flag in flags))
+        else:
+            st.caption("All clear: no concentration, exposure, drift or stop flags.")
 
+    pnl_basis = (
+        f"1-day P&L is the {book_pnl['source']}'s book P&L for the "
+        f"{book_pnl['session']} session ({_fmt_utc(book_pnl['timestamp'])})."
+        if book_pnl["value"] is not None
+        else "No book P&L is recorded yet."
+    )
     st.caption(
-        f"NAV source: {nav_snapshot['source']}, {_fmt_utc(nav_snapshot['timestamp'])}. "
+        pnl_basis
+        + f" NAV source: {nav_snapshot['source']}, {_fmt_utc(nav_snapshot['timestamp'])}. "
         + (
             f"Morning execution NAV at {_fmt_utc(nav_snapshot['morning_timestamp'])}: "
             + f"${nav_snapshot['morning_nav']:,.2f}."
@@ -846,9 +947,15 @@ def render(
     positions_data = _get_positions()
     pnl_rows = _get_pnl_log()
     df_pnl = pd.DataFrame(pnl_rows).sort_values("trade_date") if pnl_rows else pd.DataFrame()
+    sleeve_rows = _get_daily_sleeve_pnl()
     stop_states_raw = _get_stop_states()
     drift = _get_drift_alert()
     nav_snapshot = _nav_snapshot(nav, df_pnl)
+    book_pnl = _book_pnl_snapshot(
+        pd.DataFrame(sleeve_rows) if sleeve_rows else pd.DataFrame(),
+        df_pnl,
+        nav_snapshot["value"],
+    )
     risk = _risk_snapshot(nav, positions_data)
 
     notionals = [float(p.get("signed_notional") or 0.0) for p in positions_data]
@@ -865,7 +972,7 @@ def render(
         as_of_date=as_of_date,
         nav=nav,
         positions_data=positions_data,
-        df_pnl=df_pnl,
+        book_pnl=book_pnl,
         risk=risk,
         drift=drift,
         stop_states=stop_states_raw,
@@ -1264,7 +1371,6 @@ def render(
     # ---------------------------------------------------------------- Book P&L by sleeve
     _section("Book P&L by sleeve")
 
-    sleeve_rows = _get_daily_sleeve_pnl()
     if sleeve_rows:
         df_sleeve = pd.DataFrame(sleeve_rows)
         df_sleeve = df_sleeve[df_sleeve["sleeve"].isin(SLEEVE_ORDER)]

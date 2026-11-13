@@ -25,7 +25,9 @@ Visual system:
   - Every history chart on the page reads the one period set in Performance, and
     no chart accepts scroll zoom: the axes are fixed.
 
-No live Alpaca calls are made from this module (U6 gate from the v8.5 PRD).
+No broker call is made from this page. The one series that is not built from stored
+runs -- the account's close equity -- is read from Supabase (dashboard.equity_history),
+where the evening job stores the close it already reconciles against.
 """
 
 from __future__ import annotations
@@ -480,68 +482,102 @@ def _official_nav_frame(
     df_pnl: pd.DataFrame,
     df_sleeve: pd.DataFrame,
     nav_snapshot: dict,
-) -> pd.DataFrame:
-    """One row per session: the NAV the evening signal wrote that evening.
+    *,
+    start: date | None = None,
+    close_navs: dict[str, float] | None = None,
+) -> tuple[pd.DataFrame, str | None]:
+    """One row per session: the account's equity at that session's close.
 
-    The evening signal refreshes settings.live_nav after the close, and the next
-    morning's execution records both its own NAV and `book_pnl`, defined as that
-    NAV minus the stored setting it read. So for every pair of consecutive
-    execution runs the previous evening's official NAV is exactly
+    The close is read from the close_equity table -- the series the evening job stores
+    from the portfolio history -- not reconstructed from the next morning's rows. The
+    reconstruction this replaces was
 
         evening_nav(t) = live_nav(t+1) - book_pnl(t+1)
 
-    and the last point is the stored setting itself, dated and stamped by the run
-    that wrote it. That reconstructs the evening series without inventing a value:
-    every point is arithmetic on two recorded numbers. Sessions where either side
-    is missing are skipped, not zero-filled.
+    and it mixed two clocks: live_nav is the equity measured at 10:32 the next
+    morning, while book_pnl is close-to-close. Every point therefore carried the next
+    day's 10:32-to-close move -- exactly the gap this series is supposed to show.
+
+    The last point is still the stored evening setting, dated and stamped by the run
+    that wrote it: a session's close is stored only after that session, so on the
+    evening of a session the setting is the number that run measured. Sessions with
+    no stored close are skipped, never zero-filled. The second value is why the
+    history could not be read, or None.
+
+    `close_navs` injects a {session: close equity} mapping for tests; when it is None
+    the table is read here.
     """
+    from dashboard.equity_history import (
+        CloseEquityUnavailable,
+        cached_close_equity_by_session,
+    )
+
     timestamps: dict[str, object] = {}
     if not df_sleeve.empty and "created_at" in df_sleeve.columns:
         dated = df_sleeve.dropna(subset=["created_at"])
         for session, group in dated.groupby("trade_date"):
             timestamps[str(session)] = group["created_at"].iloc[0]
 
-    rows: list[dict] = []
-    if not df_pnl.empty and {"trade_date", "live_nav", "book_pnl"} <= set(df_pnl.columns):
-        pnl = df_pnl.dropna(subset=["trade_date"]).copy()
-        pnl["trade_date"] = pd.to_datetime(pnl["trade_date"], errors="coerce")
-        pnl = pnl.dropna(subset=["trade_date"]).sort_values("trade_date")
-        pnl = pnl.drop_duplicates("trade_date", keep="last")
-        records = list(pnl.to_dict("records"))
-        for previous, current in zip(records, records[1:]):
-            try:
-                nav_now = float(current["live_nav"])
-                moved = float(current["book_pnl"])
-            except (TypeError, ValueError):
-                continue
-            if nav_now != nav_now or moved != moved:
-                continue
-            session = previous["trade_date"]
-            key = session.date().isoformat()
-            rows.append({
-                "trade_date": session,
-                "nav": nav_now - moved,
-                "timestamp": timestamps.get(key),
-                "source": "evening signal",
-            })
+    sessions: set[str] = set()
+    if not df_pnl.empty and "trade_date" in df_pnl.columns:
+        dated_runs = pd.to_datetime(df_pnl["trade_date"], errors="coerce").dropna()
+        sessions |= {stamp.date().isoformat() for stamp in dated_runs}
 
+    snapshot_session: str | None = None
     if nav_snapshot.get("session"):
-        session = pd.to_datetime(nav_snapshot["session"], errors="coerce")
-        if pd.notna(session):
-            rows.append({
-                "trade_date": session,
-                "nav": float(nav_snapshot["value"]),
-                "timestamp": nav_snapshot.get("timestamp"),
-                "source": nav_snapshot.get("source"),
-            })
+        stamped = pd.to_datetime(nav_snapshot["session"], errors="coerce")
+        if pd.notna(stamped):
+            snapshot_session = stamped.date().isoformat()
+            sessions.add(snapshot_session)
+
+    ordered = sorted(
+        session
+        for session in sessions
+        if start is None or date.fromisoformat(session) >= start
+    )
+    if snapshot_session is not None and snapshot_session not in ordered:
+        ordered.append(snapshot_session)
+        ordered.sort()
+
+    reason: str | None = None
+    if close_navs is None:
+        try:
+            close_navs = cached_close_equity_by_session(tuple(ordered))
+        except CloseEquityUnavailable as exc:
+            close_navs = {}
+            reason = str(exc)
+
+    rows: list[dict] = []
+    for session in ordered:
+        value = (close_navs or {}).get(session)
+        if value is None:
+            continue
+        rows.append({
+            "trade_date": pd.Timestamp(session),
+            "nav": float(value),
+            "timestamp": timestamps.get(session),
+            "source": "close_equity",
+        })
+
+    if snapshot_session is not None:
+        rows.append({
+            "trade_date": pd.Timestamp(snapshot_session),
+            "nav": float(nav_snapshot["value"]),
+            "timestamp": nav_snapshot.get("timestamp"),
+            "source": nav_snapshot.get("source"),
+        })
 
     if not rows:
-        return pd.DataFrame(columns=["trade_date", "nav", "timestamp", "source"])
+        return (
+            pd.DataFrame(columns=["trade_date", "nav", "timestamp", "source"]),
+            reason,
+        )
     frame = pd.DataFrame(rows).dropna(subset=["nav"])
     return (
         frame.sort_values("trade_date")
         .drop_duplicates("trade_date", keep="last")
-        .reset_index(drop=True)
+        .reset_index(drop=True),
+        reason,
     )
 
 
@@ -716,7 +752,7 @@ def _concentration_messages(risk: dict | None) -> list[str]:
 def _performance_stats(nav_frame: pd.DataFrame) -> dict:
     """MTD return, annualized vol, Sharpe, and max drawdown from official NAVs.
 
-    `nav_frame` is the evening-signal series built by _official_nav_frame, already
+    `nav_frame` is the evening-close series built by _official_nav_frame, already
     cut to the period the page is showing, so every statistic and the chart beside
     it describe the same sessions.
     """
@@ -1464,17 +1500,16 @@ def render(
     # ---------------------------------------------------------------- Performance
     _section("Performance")
 
-    # One official NAV series, and one period shared with every chart below.
-    official_nav = _official_nav_frame(
-        df_pnl,
-        pd.DataFrame(sleeve_rows) if sleeve_rows else pd.DataFrame(),
-        nav_snapshot,
-    )
+    # One official NAV series, and one period shared with every chart below. The
+    # period is chosen from the stored sessions first: the close read only has to
+    # cover the window the page is about to draw.
     date_parts = []
-    if not official_nav.empty:
-        date_parts.append(official_nav["trade_date"])
     if not df_pnl.empty and "trade_date" in df_pnl.columns:
         date_parts.append(pd.to_datetime(df_pnl["trade_date"], errors="coerce").dropna())
+    if nav_snapshot.get("session"):
+        snapshot_date = pd.to_datetime(nav_snapshot["session"], errors="coerce")
+        if pd.notna(snapshot_date):
+            date_parts.append(pd.Series([snapshot_date]))
     if sleeve_rows:
         sleeve_dates = pd.to_datetime(
             pd.DataFrame(sleeve_rows)["trade_date"], errors="coerce"
@@ -1487,6 +1522,13 @@ def render(
         )
     else:
         history_start = None
+
+    official_nav, nav_history_error = _official_nav_frame(
+        df_pnl,
+        pd.DataFrame(sleeve_rows) if sleeve_rows else pd.DataFrame(),
+        nav_snapshot,
+        start=history_start,
+    )
 
     window_nav = official_nav
     if history_start is not None and not official_nav.empty:
@@ -1521,15 +1563,20 @@ def render(
         delta_color="off",
     )
 
+    if nav_history_error:
+        st.warning(
+            "Account equity history is unavailable, so the chart shows only the "
+            f"latest stored NAV. {nav_history_error}"
+        )
     if stats["n_navs"]:
         st.caption(
-            f"From {stats['n_navs']} evening-signal NAVs, "
+            f"From {stats['n_navs']} evening close NAVs, "
             f"{stats['first_date']} to {stats['last_date']} — the same official "
             f"NAV the header shows, over the period set above."
         )
     else:
         st.caption(
-            "No evening-signal NAV history in this period yet — these fill from "
+            "No evening close NAV history in this period yet — these fill from "
             "the next signal run."
         )
 
@@ -1541,7 +1588,7 @@ def render(
             mode="lines+markers",
             line=dict(color=BOOK_TOTAL_COLOR, width=2),
             marker=dict(size=4),
-            name="Evening signal NAV (official)",
+            name="Evening close NAV (official)",
             customdata=[[_fmt_utc(ts)] for ts in window_nav["timestamp"]],
             hovertemplate=(
                 "%{x|%Y-%m-%d}<br>official NAV %{y:,.2f}<br>"
@@ -1575,7 +1622,8 @@ def render(
         # cannot collide with the title at a narrow window.
         _plot(fig, height=380, legend_below=True)
         st.caption(
-            "Official NAV is the evening signal's, "
+            "Official NAV is the last stored close, or the evening run's own NAV "
+            "until that close is published: "
             + f"last ${stats['last_nav']:,.2f} on {stats['last_date']} "
             + f"({_fmt_utc(stats['last_timestamp'])}). "
             + "The dotted line is the morning execution NAV, shown only as a "
@@ -1583,7 +1631,7 @@ def render(
         )
     elif not official_nav.empty:
         st.info(
-            "Only one evening-signal NAV is recorded in this period. The next run "
+            "Only one evening close NAV is recorded in this period. The next run "
             "starts the account-value line."
         )
     else:

@@ -1,9 +1,9 @@
 """The dashboard's chart contract: fixed axes, one official NAV, one period.
 
 These are unit tests around the helpers the page uses, so they stay fast and pin
-the rules rather than the pixels: no scroll zoom, the evening-signal NAV is the
-one official series (with the morning NAV only a secondary line), and every
-history chart shares the period control whose default is 1 October.
+the rules rather than the pixels: no scroll zoom, the stored close is the one
+official series (with the morning NAV only a secondary line), and every history
+chart shares the period control whose default is 1 October.
 """
 
 from __future__ import annotations
@@ -71,18 +71,90 @@ def test_plot_fixes_both_axes(monkeypatch) -> None:
     assert fig.layout.dragmode is False
 
 
-def test_the_official_nav_series_is_the_evening_signal(monkeypatch) -> None:
-    frame = operational._official_nav_frame(PNL, SLEEVE, SNAPSHOT)
+def test_the_official_nav_series_is_the_evening_close() -> None:
+    frame, reason = operational._official_nav_frame(
+        PNL,
+        SLEEVE,
+        SNAPSHOT,
+        close_navs={"2026-10-01": 100_400.0, "2026-10-02": 100_700.0},
+    )
 
+    assert reason is None
     assert [d.strftime("%Y-%m-%d") for d in frame["trade_date"]] == [
         "2026-10-01",
         "2026-10-02",
     ]
-    # The previous evening's NAV is the next morning's NAV minus the move that
-    # morning recorded; the last point is the stored setting itself.
-    assert frame["nav"].tolist() == [100_500.0 - 200.0, 100_900.0]
-    assert set(frame["source"]) == {"evening signal"}
+    # 10-01 is the stored close. 10-02 is the stored setting of the run that
+    # measured it: its own close is stored only after the session.
+    assert frame["nav"].tolist() == [100_400.0, 100_900.0]
+    assert set(frame["source"]) == {"close_equity", "evening signal"}
     assert frame["timestamp"].iloc[0] == "2026-10-01T21:30:00+00:00"
+
+
+def test_the_close_series_is_a_table_read_and_needs_no_broker() -> None:
+    """The dashboard holds no Alpaca credential: the close comes from Supabase."""
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[1] / "dashboard" / "equity_history.py")
+    text = source.read_text().lower()
+
+    # The word may appear in the explanation; the import and the client must not.
+    assert "alpaca_paper" not in text
+    assert "execution.alpaca" not in text
+    assert "connect(" not in text
+
+
+def test_the_close_series_maps_only_the_sessions_asked_for(monkeypatch) -> None:
+    from dashboard import equity_history
+    import dashboard.supabase_client as sb
+
+    equity_history.cached_close_equity_by_session.clear()
+    monkeypatch.setattr(
+        sb,
+        "fetch_close_equity",
+        lambda **kwargs: {
+            "2026-10-01": 100_400.0,
+            "2026-10-02": 100_700.0,
+            "2026-10-05": 100_950.0,
+        },
+        raising=True,
+    )
+
+    assert equity_history.close_equity_by_session(
+        ["2026-09-30", "2026-10-01", "2026-10-02"]
+    ) == {"2026-10-01": 100_400.0, "2026-10-02": 100_700.0}
+
+
+def test_an_unreadable_close_table_shows_only_the_stored_nav(monkeypatch) -> None:
+    from dashboard import equity_history
+    import dashboard.supabase_client as sb
+
+    equity_history.cached_close_equity_by_session.clear()
+
+    def _broken(**kwargs):
+        raise RuntimeError("relation public.close_equity does not exist")
+
+    monkeypatch.setattr(sb, "fetch_close_equity", _broken)
+
+    frame, reason = operational._official_nav_frame(PNL, pd.DataFrame(), SNAPSHOT)
+
+    assert reason is not None and "close_equity" in reason
+    assert frame["nav"].tolist() == [100_900.0]
+    assert frame["source"].tolist() == ["evening signal"]
+
+
+def test_an_empty_table_is_not_an_error(monkeypatch) -> None:
+    """Before the first evening run the table is empty, not broken."""
+    from dashboard import equity_history
+    import dashboard.supabase_client as sb
+
+    equity_history.cached_close_equity_by_session.clear()
+    monkeypatch.setattr(sb, "fetch_close_equity", lambda **kwargs: {})
+
+    frame, reason = operational._official_nav_frame(PNL, pd.DataFrame(), SNAPSHOT)
+
+    assert reason is None
+    assert frame["nav"].tolist() == [100_900.0]
 
 
 def test_nav_snapshot_calls_the_evening_signal_official(monkeypatch) -> None:

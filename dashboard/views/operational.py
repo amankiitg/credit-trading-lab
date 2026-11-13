@@ -14,13 +14,16 @@ number with no reference point cannot be read.
 
 Visual system:
 
-  - Long and short are the only two colours used for signed quantities:
-    LONG_COLOR for a long position, SHORT_COLOR for a short. Nothing else is
-    coloured by direction.
-  - Green means good or on target; red means a flag or a breach, and nothing else.
-    Neither ever encodes position sign.
-  - Neutral grey is for series that carry no direction: the NAV line and turnover
+  - Colour carries the asset class and nothing else: navy for equity, green for
+    rates, violet for credit, amber for commodity. A signed quantity shows its
+    sign by the direction of the bar or the sign in the tooltip, never by a
+    second palette.
+  - Green as a status colour (good, on target) appears only in the status
+    messages, never on a chart.
+  - Neutral grey is for series that carry no sleeve: the book's NAV and turnover
     cost.
+  - Every history chart on the page reads the one period set in Performance, and
+    no chart accepts scroll zoom: the axes are fixed.
 
 No live Alpaca calls are made from this module (U6 gate from the v8.5 PRD).
 """
@@ -28,10 +31,11 @@ No live Alpaca calls are made from this module (U6 gate from the v8.5 PRD).
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 
 from dashboard.supabase_client import (
@@ -50,25 +54,24 @@ from dashboard.supabase_client import (
 
 # ---------------------------------------------------------------- visual system
 #
-# Two colours, one meaning each: long is blue, short is orange. Sleeve identity
-# stays in the label and the hover, never in a third and fourth colour.
-LONG_COLOR = "#2f6db3"
-SHORT_COLOR = "#d9822b"
-NEUTRAL_COLOR = "#8a8a8a"
-
-# Kept for older callers that still import the shared palette; charts below use
-# the two-colour long/short scheme instead.
-SLEEVE_COLORS: dict[str, str] = {
-    "equity":    "#4c78a8",
-    "rates":     "#f2a93b",
-    "credit":    "#8e6cae",
-    "commodity": "#5fa8a0",
+# One colour per asset class, used on every chart that draws a sleeve. The sign
+# of a position is the direction of its bar (or the sign in the tooltip); colour
+# never encodes it, so a sleeve reads the same whether it is long or short.
+ASSET_CLASS_COLORS: dict[str, str] = {
+    "equity":    "#1d4ed8",
+    "rates":     "#047857",
+    "credit":    "#7c3aed",
+    "commodity": "#d97706",
 }
+# Archived name for the same palette, for callers outside this module.
+SLEEVE_COLORS: dict[str, str] = ASSET_CLASS_COLORS
 SLEEVE_ORDER: tuple[str, ...] = ("equity", "rates", "credit", "commodity")
 
-# One long/short treatment everywhere a signed position is drawn.
-SHORT_HATCH = "//"
-LONG_SHORT_NOTE = "blue = long, orange = short"
+NEUTRAL_COLOR = "#8a8a8a"
+BOOK_TOTAL_COLOR = "#111111"
+
+# Caption fragment wherever a sleeve bar can point either way.
+SIGN_NOTE = "colour is the asset class, the sign of the bar shows direction"
 
 # Reference points, from the spec. Display thresholds only, not enforced limits:
 # the execution layer's own limits are G_MAX_DEFAULT (gross) and the delta band.
@@ -80,7 +83,10 @@ RISK_SLEEVE_FLAG_PCT = 60.0   # one sleeve above 60% of book risk is concentrati
 
 PLOTLY_CONFIG = {
     "displayModeBar": True,
-    "scrollZoom": True,
+    # Scrolling the page must never zoom a chart: the axes are fixedrange below
+    # and the wheel never reaches Plotly.
+    "scrollZoom": False,
+    "doubleClick": False,
     "displaylogo": False,
 }
 
@@ -131,9 +137,9 @@ def _rgba(hex_colour: str, alpha: float) -> str:
     return f"rgba({r},{g},{b},{alpha})"
 
 
-def _side_colour(signed_value: float) -> str:
-    """The one long/short encoding: blue for long, orange for short."""
-    return LONG_COLOR if float(signed_value) >= 0 else SHORT_COLOR
+def _sleeve_colour(sleeve: str) -> str:
+    """The asset class's colour; unknown sleeves fall back to neutral grey."""
+    return ASSET_CLASS_COLORS.get(sleeve, NEUTRAL_COLOR)
 
 
 def _side_word(signed_value: float) -> str:
@@ -224,12 +230,6 @@ def _sleeve_of(ticker: str) -> str:
     from signals.etf_universe import ASSET_CLASS
 
     return ASSET_CLASS.get(ticker, "unknown")
-
-
-def _fill_for(signed: float | None) -> str | None:
-    if signed is None:
-        return None
-    return SHORT_HATCH if float(signed) < 0 else None
 
 
 def net_flag(net_pct: float, target_net_pct: float) -> str | None:
@@ -400,32 +400,45 @@ def _get_proposed_trade() -> tuple[list[dict], str, float]:
 
 
 def _nav_snapshot(nav: float, df_pnl: pd.DataFrame) -> dict:
-    """Where the NAV on the page came from, and when it was written.
+    """The one official NAV, its source and timestamp.
 
-    Both crons refresh settings.live_nav: the morning execution run after it trades,
-    and the evening signal run after the close. The later completion in cron_runs is
-    the write that produced the stored value, so that is the source and timestamp
-    shown next to every NAV. The morning execution NAV is read separately from the
-    last pnl_log row, because that is the snapshot the day's P&L is measured from.
+    settings.live_nav is written by both crons. The evening signal writes it after
+    the close, so that is the run the page treats as official: its value, its run
+    date and its completion time are the ones shown in the header, in the
+    performance stats and on the account-value chart. When the last signal run is
+    older than the last execution run (the evening job failed, or has not run yet)
+    the stored value is the morning execution's, and it is labelled as such rather
+    than passed off as an evening number.
+
+    The morning execution NAV from the last pnl_log row stays available as the
+    labelled secondary line on the account-value chart and in the header caption.
     """
-    candidates: list[tuple[str, str]] = []
-    for source, run in (
-        ("morning execution", _get_last_execution_run()),
-        ("evening signal", _get_last_signal_run()),
-    ):
-        if run and run.get("completed_at"):
-            candidates.append((str(run["completed_at"]), source))
+    signal = _get_last_signal_run()
+    execution = _get_last_execution_run()
 
-    if candidates:
-        timestamp, source = max(candidates)
+    signal_ts = str(signal["completed_at"]) if signal and signal.get("completed_at") else None
+    execution_ts = (
+        str(execution["completed_at"])
+        if execution and execution.get("completed_at") else None
+    )
+
+    if signal_ts and (not execution_ts or signal_ts >= execution_ts):
+        source = "evening signal"
+        timestamp = signal.get("completed_at")
+        session = str(signal.get("run_date") or "") or None
+    elif execution_ts:
+        source = "morning execution"
+        timestamp = execution.get("completed_at")
+        session = str(execution.get("run_date") or "") or None
     else:
-        timestamp, source = None, "stored NAV"
+        source, timestamp, session = "stored NAV", None, None
 
     morning_nav = None
     morning_timestamp = None
-    if not df_pnl.empty:
-        last = df_pnl.iloc[-1]
-        if "live_nav" in df_pnl.columns and pd.notna(last.get("live_nav")):
+    if not df_pnl.empty and "live_nav" in df_pnl.columns:
+        valid = df_pnl.dropna(subset=["live_nav"])
+        if not valid.empty:
+            last = valid.iloc[-1]
             morning_nav = float(last["live_nav"])
             morning_timestamp = last.get("created_at")
 
@@ -433,6 +446,7 @@ def _nav_snapshot(nav: float, df_pnl: pd.DataFrame) -> dict:
         "value": float(nav),
         "source": source,
         "timestamp": timestamp,
+        "session": session,
         "morning_nav": morning_nav,
         "morning_timestamp": morning_timestamp,
     }
@@ -462,17 +476,91 @@ def _parse_timestamp(value) -> datetime | None:
     return dt.astimezone(timezone.utc)
 
 
+def _official_nav_frame(
+    df_pnl: pd.DataFrame,
+    df_sleeve: pd.DataFrame,
+    nav_snapshot: dict,
+) -> pd.DataFrame:
+    """One row per session: the NAV the evening signal wrote that evening.
+
+    The evening signal refreshes settings.live_nav after the close, and the next
+    morning's execution records both its own NAV and `book_pnl`, defined as that
+    NAV minus the stored setting it read. So for every pair of consecutive
+    execution runs the previous evening's official NAV is exactly
+
+        evening_nav(t) = live_nav(t+1) - book_pnl(t+1)
+
+    and the last point is the stored setting itself, dated and stamped by the run
+    that wrote it. That reconstructs the evening series without inventing a value:
+    every point is arithmetic on two recorded numbers. Sessions where either side
+    is missing are skipped, not zero-filled.
+    """
+    timestamps: dict[str, object] = {}
+    if not df_sleeve.empty and "created_at" in df_sleeve.columns:
+        dated = df_sleeve.dropna(subset=["created_at"])
+        for session, group in dated.groupby("trade_date"):
+            timestamps[str(session)] = group["created_at"].iloc[0]
+
+    rows: list[dict] = []
+    if not df_pnl.empty and {"trade_date", "live_nav", "book_pnl"} <= set(df_pnl.columns):
+        pnl = df_pnl.dropna(subset=["trade_date"]).copy()
+        pnl["trade_date"] = pd.to_datetime(pnl["trade_date"], errors="coerce")
+        pnl = pnl.dropna(subset=["trade_date"]).sort_values("trade_date")
+        pnl = pnl.drop_duplicates("trade_date", keep="last")
+        records = list(pnl.to_dict("records"))
+        for previous, current in zip(records, records[1:]):
+            try:
+                nav_now = float(current["live_nav"])
+                moved = float(current["book_pnl"])
+            except (TypeError, ValueError):
+                continue
+            if nav_now != nav_now or moved != moved:
+                continue
+            session = previous["trade_date"]
+            key = session.date().isoformat()
+            rows.append({
+                "trade_date": session,
+                "nav": nav_now - moved,
+                "timestamp": timestamps.get(key),
+                "source": "evening signal",
+            })
+
+    if nav_snapshot.get("session"):
+        session = pd.to_datetime(nav_snapshot["session"], errors="coerce")
+        if pd.notna(session):
+            rows.append({
+                "trade_date": session,
+                "nav": float(nav_snapshot["value"]),
+                "timestamp": nav_snapshot.get("timestamp"),
+                "source": nav_snapshot.get("source"),
+            })
+
+    if not rows:
+        return pd.DataFrame(columns=["trade_date", "nav", "timestamp", "source"])
+    frame = pd.DataFrame(rows).dropna(subset=["nav"])
+    return (
+        frame.sort_values("trade_date")
+        .drop_duplicates("trade_date", keep="last")
+        .reset_index(drop=True)
+    )
+
+
 def _book_pnl_snapshot(
-    df_sleeve: pd.DataFrame, df_pnl: pd.DataFrame, nav: float
+    df_sleeve: pd.DataFrame,
+    df_pnl: pd.DataFrame,
+    nav: float,
+    *,
+    nav_source: str | None = None,
+    nav_session: str | None = None,
 ) -> dict:
     """The 1-day P&L value, from the same run as the NAV card.
 
     The evening signal writes daily_sleeve_pnl after the close, one row per sleeve
     per session, and its book_total is that session's book P&L measured on the book
-    held at the previous close. When that run is the newest P&L on file it is the
-    number that belongs beside a NAV the same run refreshed, so it wins over the
-    morning execution's pnl_log row. pnl_log stays the fallback for mornings where
-    the signal has not recorded a session yet.
+    held at the previous close. When the NAV card is showing that same evening run,
+    the sleeve row for the same session is the number that belongs beside it, so it
+    wins over the morning execution's pnl_log row. pnl_log stays the fallback for
+    mornings where the signal has not recorded a session yet.
     """
     sleeve_value = sleeve_session = sleeve_ts = None
     if not df_sleeve.empty and "book_total" in df_sleeve.columns:
@@ -493,8 +581,17 @@ def _book_pnl_snapshot(
             pnl_session = str(last.get("trade_date"))
             pnl_ts = _parse_timestamp(last.get("created_at"))
 
+    # Same run as the NAV card: the sleeve row wins when the official NAV came
+    # from the evening signal and this is that session's row.
+    same_run = (
+        nav_source == "evening signal"
+        and sleeve_session is not None
+        and nav_session is not None
+        and str(sleeve_session) == str(nav_session)
+    )
     use_sleeve = sleeve_value is not None and (
         pnl_value is None
+        or same_run
         or (
             sleeve_ts is not None
             and pnl_ts is not None
@@ -616,22 +713,27 @@ def _concentration_messages(risk: dict | None) -> list[str]:
     return messages
 
 
-def _performance_stats(df_pnl: pd.DataFrame) -> dict:
-    """MTD return, annualized vol, Sharpe, and max drawdown from stored NAVs."""
+def _performance_stats(nav_frame: pd.DataFrame) -> dict:
+    """MTD return, annualized vol, Sharpe, and max drawdown from official NAVs.
+
+    `nav_frame` is the evening-signal series built by _official_nav_frame, already
+    cut to the period the page is showing, so every statistic and the chart beside
+    it describe the same sessions.
+    """
     empty = {
         "mtd_pct": None, "ann_vol_pct": None, "sharpe": None,
         "max_dd_pct": None, "n_navs": 0, "first_date": None, "last_date": None,
         "last_nav": None, "last_timestamp": None,
     }
-    if df_pnl.empty or "live_nav" not in df_pnl.columns:
+    if nav_frame.empty:
         return empty
 
-    navs = df_pnl[df_pnl["live_nav"].notna()].copy()
+    navs = nav_frame.dropna(subset=["nav"]).copy()
     if navs.empty:
         return empty
     navs["trade_date"] = pd.to_datetime(navs["trade_date"])
     navs = navs.sort_values("trade_date").set_index("trade_date")
-    values = navs["live_nav"].astype(float)
+    values = navs["nav"].astype(float)
 
     returns = values.pct_change().dropna()
     mtd_pct = ann_vol_pct = sharpe = None
@@ -660,7 +762,7 @@ def _performance_stats(df_pnl: pd.DataFrame) -> dict:
         "first_date": values.index[0].date().isoformat(),
         "last_date": values.index[-1].date().isoformat(),
         "last_nav": float(values.iloc[-1]),
-        "last_timestamp": last.get("created_at"),
+        "last_timestamp": last.get("timestamp"),
     }
 
 
@@ -678,13 +780,86 @@ def _plot(fig: go.Figure, *, height: int = 320, legend_below: bool = False) -> N
     if legend_below:
         legend = dict(orientation="h", yanchor="top", y=-0.18, xanchor="left", x=0)
         margin["b"] = 80
+    # Fixed axes: the wheel never zooms and a drag never pans, whatever the page
+    # does around the chart. Pair this with scrollZoom=False in PLOTLY_CONFIG.
+    fig.update_xaxes(fixedrange=True)
+    fig.update_yaxes(fixedrange=True)
     fig.update_layout(
         height=height,
         margin=margin,
         hovermode="x unified",
         legend=legend,
+        dragmode=False,
     )
     st.plotly_chart(fig, width="stretch", config=PLOTLY_CONFIG)
+
+
+def _history_period_control(
+    first_date: date | None, last_date: date | None
+) -> date | None:
+    """The one history window every chart on the page reads.
+
+    Default is 1 October of the latest session's year, clamped to the data on
+    file. A single control means the account-value, turnover and book P&L charts
+    can never disagree about which sessions they are showing.
+    """
+    if first_date is None or last_date is None:
+        return None
+    default = date(last_date.year, 10, 1)
+    default = max(first_date, min(default, last_date))
+    return st.date_input(
+        "History from",
+        value=default,
+        min_value=first_date,
+        max_value=last_date,
+        key="history_start",
+        help=(
+            "One period for the account-value, turnover and book P&L charts. "
+            "The default is 1 October."
+        ),
+    )
+
+
+def _cumulative_sleeve_pnl(
+    df_sleeve: pd.DataFrame, *, start: date | None = None
+) -> pd.DataFrame:
+    """Cumulative P&L per sleeve plus the book's cumulative total per session.
+
+    The book line is cumsum(book_total); each sleeve line is cumsum(total). The
+    four sleeves reconcile to book_total every session, so the four cumulative
+    lines sum to the book line at every point -- that is the invariant the chart
+    test pins.
+
+    A session with a missing book_total or a missing sleeve row is dropped whole
+    rather than zero-filled: it cannot be drawn consistently, and a NaN tail at
+    the end of the series (a session recorded before its P&L was) must not extend
+    the chart past the last real point.
+    """
+    if df_sleeve.empty or "sleeve" not in df_sleeve.columns:
+        return pd.DataFrame()
+    frame = df_sleeve[df_sleeve["sleeve"].isin(SLEEVE_ORDER)].copy()
+    if frame.empty:
+        return pd.DataFrame()
+    frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce")
+    frame = frame.dropna(subset=["trade_date"])
+    if start is not None:
+        frame = frame[frame["trade_date"] >= pd.Timestamp(start)]
+    if frame.empty:
+        return pd.DataFrame()
+
+    wide = frame.pivot_table(
+        index="trade_date", columns="sleeve", values="total", aggfunc="sum"
+    ).reindex(columns=list(SLEEVE_ORDER))
+    book = frame.groupby("trade_date")["book_total"].first()
+    combined = pd.concat([wide, book.rename("book_total")], axis=1).sort_index()
+    combined = combined.dropna(subset=list(SLEEVE_ORDER) + ["book_total"])
+    if combined.empty:
+        return pd.DataFrame()
+
+    cumulative = combined[list(SLEEVE_ORDER)].cumsum()
+    cumulative["book_total"] = combined["book_total"].cumsum()
+    cumulative.index.name = "trade_date"
+    return cumulative
 
 
 def _active_flags(
@@ -818,15 +993,18 @@ def _render_header(
 
     pnl_basis = (
         f"1-day P&L is the {book_pnl['source']}'s book P&L for the "
-        f"{book_pnl['session']} session ({_fmt_utc(book_pnl['timestamp'])})."
+        f"{book_pnl['session']} session ({_fmt_utc(book_pnl['timestamp'])}), the "
+        f"same run as the NAV card."
         if book_pnl["value"] is not None
         else "No book P&L is recorded yet."
     )
     st.caption(
         pnl_basis
-        + f" NAV source: {nav_snapshot['source']}, {_fmt_utc(nav_snapshot['timestamp'])}. "
+        + f" Official NAV: {nav_snapshot['source']}, "
+        + f"{_fmt_utc(nav_snapshot['timestamp'])}. "
         + (
-            f"Morning execution NAV at {_fmt_utc(nav_snapshot['morning_timestamp'])}: "
+            "Secondary line only — morning execution NAV at "
+            f"{_fmt_utc(nav_snapshot['morning_timestamp'])}: "
             + f"${nav_snapshot['morning_nav']:,.2f}."
             if nav_snapshot.get("morning_nav") is not None
             else "No morning execution NAV is recorded."
@@ -877,7 +1055,7 @@ def _render_mctr_pctr(nav: float, positions_data: list[dict]) -> None:
     )
 
     sleeve_y = [float(sleeve_tbl.loc[s, "pctr"]) * 100 for s in sleeve_tbl.index]
-    sleeve_colors = [_side_colour(float(sleeve_tbl.loc[s, "weight"])) for s in sleeve_tbl.index]
+    sleeve_colors = [_sleeve_colour(str(s)) for s in sleeve_tbl.index]
     fig = go.Figure(
         go.Bar(
             x=[s.capitalize() for s in sleeve_tbl.index],
@@ -896,13 +1074,13 @@ def _render_mctr_pctr(nav: float, positions_data: list[dict]) -> None:
     _plot(fig, height=340)
     st.caption(
         "Sleeve shares sum to 100%; a negative bar is a sleeve that reduces the "
-        f"book's risk. {LONG_SHORT_NOTE}."
+        f"book's risk. {SIGN_NOTE}."
     )
 
     with st.expander("Per-ticker detail (weight, marginal risk, contribution)"):
         by_ticker = risk_df.sort_values("pctr", ascending=False)
         ticker_y = [float(v) * 100 for v in by_ticker["pctr"]]
-        ticker_colors = [_side_colour(float(w)) for w in by_ticker["weight"]]
+        ticker_colors = [_sleeve_colour(_sleeve_of(str(t))) for t in by_ticker.index]
         fig = go.Figure(
             go.Bar(
                 x=list(by_ticker.index),
@@ -927,7 +1105,7 @@ def _render_mctr_pctr(nav: float, positions_data: list[dict]) -> None:
         )
         st.caption(
             f"Shares sum to {risk_df['pctr'].sum():.4f}. Contribution is annualized "
-            f"risk; the share is its fraction of the book's total. {LONG_SHORT_NOTE}."
+            f"risk; the share is its fraction of the book's total. {SIGN_NOTE}."
         )
 
 
@@ -952,6 +1130,8 @@ def render(
         pd.DataFrame(sleeve_rows) if sleeve_rows else pd.DataFrame(),
         df_pnl,
         nav_snapshot["value"],
+        nav_source=nav_snapshot["source"],
+        nav_session=nav_snapshot["session"],
     )
     risk = _risk_snapshot(nav, positions_data)
 
@@ -1249,14 +1429,14 @@ def render(
             name="Current",
             x=[s.capitalize() for s in SLEEVE_ORDER],
             y=current_pct,
-            marker_color=[_side_colour(v) for v in current_pct],
+            marker_color=[_sleeve_colour(s) for s in SLEEVE_ORDER],
             hovertemplate="%{x}<br>current %{y:+.1f}% of NAV<extra></extra>",
         ))
         fig.add_trace(go.Bar(
             name="Target",
             x=[s.capitalize() for s in SLEEVE_ORDER],
             y=target_pct,
-            marker_color=[_side_colour(v) for v in target_pct],
+            marker_color=[_sleeve_colour(s) for s in SLEEVE_ORDER],
             marker_opacity=0.35,
             hovertemplate="%{x}<br>target %{y:+.1f}% of NAV<extra></extra>",
         ))
@@ -1268,7 +1448,7 @@ def render(
         _plot(fig, height=340)
         st.caption(
             f"Full bar = the sleeve's current net exposure; pale bar = the signal's "
-            f"target for {as_of_date}. {LONG_SHORT_NOTE}."
+            f"target for {as_of_date}. {SIGN_NOTE}."
         )
     else:
         st.info("No positions yet -- the sleeve view appears after the first execution run.")
@@ -1276,7 +1456,37 @@ def render(
     # ---------------------------------------------------------------- Performance
     _section("Performance")
 
-    stats = _performance_stats(df_pnl)
+    # One official NAV series, and one period shared with every chart below.
+    official_nav = _official_nav_frame(
+        df_pnl,
+        pd.DataFrame(sleeve_rows) if sleeve_rows else pd.DataFrame(),
+        nav_snapshot,
+    )
+    date_parts = []
+    if not official_nav.empty:
+        date_parts.append(official_nav["trade_date"])
+    if not df_pnl.empty and "trade_date" in df_pnl.columns:
+        date_parts.append(pd.to_datetime(df_pnl["trade_date"], errors="coerce").dropna())
+    if sleeve_rows:
+        sleeve_dates = pd.to_datetime(
+            pd.DataFrame(sleeve_rows)["trade_date"], errors="coerce"
+        ).dropna()
+        date_parts.append(sleeve_dates)
+    if date_parts:
+        all_dates = pd.concat(date_parts)
+        history_start = _history_period_control(
+            all_dates.min().date(), all_dates.max().date()
+        )
+    else:
+        history_start = None
+
+    window_nav = official_nav
+    if history_start is not None and not official_nav.empty:
+        window_nav = official_nav[
+            official_nav["trade_date"] >= pd.Timestamp(history_start)
+        ]
+
+    stats = _performance_stats(window_nav)
     perf_cols = st.columns(4)
     perf_cols[0].metric(
         "MTD return",
@@ -1305,63 +1515,103 @@ def render(
 
     if stats["n_navs"]:
         st.caption(
-            f"From {stats['n_navs']} stored morning-execution NAVs, "
-            f"{stats['first_date']} to {stats['last_date']}."
+            f"From {stats['n_navs']} evening-signal NAVs, "
+            f"{stats['first_date']} to {stats['last_date']} — the same official "
+            f"NAV the header shows, over the period set above."
         )
     else:
-        st.caption("No stored NAV history yet -- these fill from the next execution run.")
+        st.caption(
+            "No evening-signal NAV history in this period yet — these fill from "
+            "the next signal run."
+        )
 
     if stats["n_navs"] >= 2:
-        navs = df_pnl[df_pnl["live_nav"].notna()].copy()
-        navs["trade_date"] = pd.to_datetime(navs["trade_date"])
-        navs = navs.sort_values("trade_date")
-        fig = go.Figure(go.Scatter(
-            x=navs["trade_date"],
-            y=navs["live_nav"].astype(float),
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=window_nav["trade_date"],
+            y=window_nav["nav"].astype(float),
             mode="lines+markers",
-            line=dict(color=NEUTRAL_COLOR, width=2),
+            line=dict(color=BOOK_TOTAL_COLOR, width=2),
             marker=dict(size=4),
+            name="Evening signal NAV (official)",
+            customdata=[[_fmt_utc(ts)] for ts in window_nav["timestamp"]],
             hovertemplate=(
-                "%{x|%Y-%m-%d}<br>NAV %{y:,.2f}<br>"
-                "morning execution<extra></extra>"
+                "%{x|%Y-%m-%d}<br>official NAV %{y:,.2f}<br>"
+                "%{customdata[0]}<extra></extra>"
             ),
-            name="Morning execution NAV",
         ))
-        fig.update_layout(title="Account value over time", yaxis_title="account equity")
+        if not df_pnl.empty and "live_nav" in df_pnl.columns:
+            morning = df_pnl.dropna(subset=["live_nav"]).copy()
+            morning["trade_date"] = pd.to_datetime(morning["trade_date"], errors="coerce")
+            morning = morning.dropna(subset=["trade_date"]).sort_values("trade_date")
+            if history_start is not None:
+                morning = morning[morning["trade_date"] >= pd.Timestamp(history_start)]
+            if not morning.empty:
+                fig.add_trace(go.Scatter(
+                    x=morning["trade_date"],
+                    y=morning["live_nav"].astype(float),
+                    mode="lines+markers",
+                    line=dict(color=NEUTRAL_COLOR, width=1.5, dash="dot"),
+                    marker=dict(size=3),
+                    name="Morning execution NAV (secondary)",
+                    hovertemplate=(
+                        "%{x|%Y-%m-%d}<br>morning NAV %{y:,.2f}"
+                        "<extra></extra>"
+                    ),
+                ))
+        fig.update_layout(
+            title="Account value — official evening NAV, with the morning run as a secondary line",
+            yaxis_title="account equity",
+        )
         _plot(fig, height=340)
         st.caption(
-            "Last " + f"${stats['last_nav']:,.2f}" + f" on {stats['last_date']} "
-            f"(morning execution, {_fmt_utc(stats['last_timestamp'])}). "
-            f"{stats['n_navs']} recorded run(s)."
+            "Official NAV is the evening signal's, "
+            + f"last ${stats['last_nav']:,.2f} on {stats['last_date']} "
+            + f"({_fmt_utc(stats['last_timestamp'])}). "
+            + "The dotted line is the morning execution NAV, shown only as a "
+            + "secondary reference."
         )
-    elif pnl_rows:
+    elif not official_nav.empty:
         st.info(
-            "No account equity recorded yet. The next execution run starts the NAV "
-            "history, and this chart then shows the account's real equity."
+            "Only one evening-signal NAV is recorded in this period. The next run "
+            "starts the account-value line."
         )
     else:
         st.info("No account equity recorded yet -- the chart appears after the first run.")
 
     if not df_pnl.empty and "turnover_cost" in df_pnl.columns:
-        costs = df_pnl["turnover_cost"].fillna(0.0).astype(float)
-        total_cost = float(costs.sum())
-        st.markdown(
-            "**Turnover cost per run.** Total to date " + f"${total_cost:,.2f}"
-            + f" over {len(df_pnl)} runs."
-        )
-        fig = go.Figure(go.Bar(
-            x=pd.to_datetime(df_pnl["trade_date"]),
-            y=costs,
-            marker_color=NEUTRAL_COLOR,
-            hovertemplate="%{x|%Y-%m-%d}<br>cost %{y:,.2f}<extra></extra>",
-            name="Turnover cost",
-        ))
-        fig.update_layout(title="Turnover cost per run", yaxis_title="", showlegend=False)
-        _plot(fig, height=260)
-        st.caption(
-            "Cost is a drag on account value, not the result: a single-digit dollar "
-            "run (0 to 3, 0.00-0.02% of NAV) is normal."
-        )
+        runs = df_pnl.copy()
+        runs["trade_date"] = pd.to_datetime(runs["trade_date"], errors="coerce")
+        runs = runs.dropna(subset=["trade_date"]).sort_values("trade_date")
+        if history_start is not None:
+            runs = runs[runs["trade_date"] >= pd.Timestamp(history_start)]
+        if runs.empty:
+            st.info("No turnover-cost rows in this period.")
+        else:
+            costs = runs["turnover_cost"].fillna(0.0).astype(float)
+            total_cost = float(costs.sum())
+            st.markdown(
+                "**Turnover cost per run.** Total over the period "
+                + f"${total_cost:,.2f} over {len(runs)} runs."
+            )
+            fig = go.Figure(go.Bar(
+                x=runs["trade_date"],
+                y=costs,
+                marker_color=NEUTRAL_COLOR,
+                hovertemplate="%{x|%Y-%m-%d}<br>cost %{y:,.2f}<extra></extra>",
+                name="Turnover cost",
+            ))
+            fig.update_layout(
+                title="Turnover cost per run (same period)",
+                yaxis_title="",
+                showlegend=False,
+            )
+            _plot(fig, height=260)
+            st.caption(
+                "Cost is a drag on account value, not the result: a single-digit "
+                "dollar run (0 to 3, 0.00-0.02% of NAV) is normal. Aligned to the "
+                "same period as the other history charts."
+            )
     else:
         st.info("No turnover-cost rows yet -- the cost chart appears after the first run.")
 
@@ -1370,80 +1620,132 @@ def render(
 
     if sleeve_rows:
         df_sleeve = pd.DataFrame(sleeve_rows)
-        df_sleeve = df_sleeve[df_sleeve["sleeve"].isin(SLEEVE_ORDER)]
-        sessions = sorted(df_sleeve["trade_date"].unique())
+        df_sleeve = df_sleeve[df_sleeve["sleeve"].isin(SLEEVE_ORDER)].copy()
+        cumulative = _cumulative_sleeve_pnl(df_sleeve, start=history_start)
 
-        def _band(column: str) -> pd.DataFrame:
-            wide = df_sleeve.pivot_table(
-                index="trade_date", columns="sleeve", values=column, aggfunc="sum"
+        if cumulative.empty:
+            st.info(
+                "No complete sleeve P&L session in this period: every session needs "
+                "all four sleeve rows and its book total before it can be drawn."
             )
-            return wide.reindex(index=sessions, columns=list(SLEEVE_ORDER)).fillna(0.0)
+        else:
+            sessions = list(cumulative.index)
+            st.markdown(
+                "**Book P&L by sleeve.** Where the account's result came from: one "
+                "cumulative line per sleeve and the bold line for the book's total, "
+                "so a sleeve that gave back its early gain turns down instead of "
+                "shrinking a band. The bars below split the period's total per sleeve "
+                "into price and carry."
+            )
 
-        price_cum = _band("price_pnl").cumsum()
-        carry_cum = _band("carry_pnl").cumsum()
-        book_cum = (
-            df_sleeve.groupby("trade_date")["book_total"].first()
-            .reindex(sessions)
-            .fillna(0.0)
-            .cumsum()
-        )
+            xs = pd.to_datetime(sessions)
+            period = df_sleeve.copy()
+            period["trade_date"] = pd.to_datetime(period["trade_date"], errors="coerce")
+            period = period[period["trade_date"].isin(xs)]
 
-        st.markdown(
-            "**Book P&L by sleeve.** Where the account's result came from: each band is "
-            "one sleeve's contribution to the book's P&L since the first recorded "
-            "session, stacked, and the line is the book's total."
-        )
+            fig = make_subplots(
+                rows=2,
+                cols=1,
+                shared_xaxes=True,
+                row_heights=[0.66, 0.34],
+                vertical_spacing=0.16,
+                subplot_titles=(
+                    "Cumulative P&L: one line per sleeve, bold book total",
+                    "Total-period P&L: price vs carry",
+                ),
+            )
+            for sleeve in SLEEVE_ORDER:
+                fig.add_trace(
+                    go.Scatter(
+                        x=xs,
+                        y=cumulative[sleeve].values,
+                        name=sleeve.capitalize(),
+                        mode="lines",
+                        line=dict(color=_sleeve_colour(sleeve), width=2),
+                        hovertemplate=(
+                            "%{x|%Y-%m-%d}<br>" + sleeve
+                            + " %{y:+,.2f}<extra></extra>"
+                        ),
+                    ),
+                    row=1,
+                    col=1,
+                )
+            fig.add_trace(
+                go.Scatter(
+                    x=xs,
+                    y=cumulative["book_total"].values,
+                    name="Book total",
+                    mode="lines",
+                    line=dict(color=BOOK_TOTAL_COLOR, width=4),
+                    hovertemplate=(
+                        "%{x|%Y-%m-%d}<br>book total %{y:+,.2f}<extra></extra>"
+                    ),
+                ),
+                row=1,
+                col=1,
+            )
 
-        xs = pd.to_datetime(list(price_cum.index))
-        side = {
-            s: "long" if sum(
-                float(p.get("signed_notional") or 0.0)
-                for p in positions_data if _sleeve_of(str(p.get("ticker", ""))) == s
-            ) >= 0 else "short"
-            for s in SLEEVE_ORDER
-        }
+            price = (
+                period.groupby("sleeve")["price_pnl"].sum()
+                .reindex(list(SLEEVE_ORDER)).fillna(0.0)
+            )
+            carry = (
+                period.groupby("sleeve")["carry_pnl"].sum()
+                .reindex(list(SLEEVE_ORDER)).fillna(0.0)
+            )
+            labels = [sleeve.capitalize() for sleeve in SLEEVE_ORDER]
+            fig.add_trace(
+                go.Bar(
+                    x=labels,
+                    y=price.values,
+                    name="Price",
+                    marker_color=[_sleeve_colour(s) for s in SLEEVE_ORDER],
+                    hovertemplate="%{x}<br>price %{y:+,.2f}<extra></extra>",
+                ),
+                row=2,
+                col=1,
+            )
+            fig.add_trace(
+                go.Bar(
+                    x=labels,
+                    y=carry.values,
+                    name="Carry",
+                    marker_color=[_rgba(_sleeve_colour(s), 0.45) for s in SLEEVE_ORDER],
+                    hovertemplate="%{x}<br>carry %{y:+,.2f}<extra></extra>",
+                ),
+                row=2,
+                col=1,
+            )
+            fig.update_layout(
+                title="Book P&L by sleeve: cumulative lines, and the period split",
+                barmode="group",
+            )
+            fig.update_yaxes(title_text="cumulative P&L", row=1, col=1)
+            fig.update_yaxes(title_text="$ over the period", row=2, col=1)
+            _plot(fig, height=560, legend_below=True)
 
-        fig = go.Figure()
-        for sleeve in SLEEVE_ORDER:
-            colour = LONG_COLOR if side[sleeve] == "long" else SHORT_COLOR
-            price_inc = price_cum[sleeve].diff()
-            price_inc.iloc[0] = price_cum[sleeve].iloc[0]
-            fig.add_trace(go.Scatter(
-                x=xs, y=price_inc.values,
-                name=f"{sleeve.capitalize()} price ({side[sleeve]})",
-                stackgroup="one", mode="lines",
-                line=dict(width=0.5, color=colour),
-                fillcolor=_rgba(colour, 0.80),
-                hovertemplate="%{x|%Y-%m-%d}<br>%{y:+,.2f}<extra></extra>",
-            ))
-            carry_inc = carry_cum[sleeve].diff()
-            carry_inc.iloc[0] = carry_cum[sleeve].iloc[0]
-            fig.add_trace(go.Scatter(
-                x=xs, y=carry_inc.values,
-                name=f"{sleeve.capitalize()} carry ({side[sleeve]})",
-                stackgroup="one", mode="lines",
-                line=dict(width=0.5, color=colour),
-                fillcolor=_rgba(colour, 0.40),
-                hovertemplate="%{x|%Y-%m-%d}<br>%{y:+,.2f}<extra></extra>",
-            ))
-        fig.add_trace(go.Scatter(
-            x=xs, y=book_cum.values, name="Book total", mode="lines",
-            line=dict(color="#111111", width=2),
-            hovertemplate="%{x|%Y-%m-%d}<br>book total %{y:+,.2f}<extra></extra>",
-        ))
-        fig.update_layout(title="Book P&L by sleeve: carry and price, stacked",
-                          yaxis_title="cumulative P&L")
-        _plot(fig, height=400, legend_below=True)
-
-        gap = float(book_cum.iloc[-1] - (price_cum.iloc[-1].sum() + carry_cum.iloc[-1].sum()))
-        st.caption(
-            "Solid band = price move, lighter band = distributions received (carry). "
-            "Measured on the book held at the previous close, so a trade contributes "
-            f"from the session after it. The four sleeves sum to the book total to "
-            f"within " + f"${abs(gap):,.6f}" + f" over {len(sessions)} session(s)."
-        )
-        if float(df_sleeve["carry_pnl"].abs().sum()) == 0.0:
-            st.caption("Carry is 0.00 in every recorded session: no distribution is recorded for those dates.")
+            gap = float(
+                cumulative["book_total"].iloc[-1]
+                - cumulative[list(SLEEVE_ORDER)].iloc[-1].sum()
+            )
+            st.caption(
+                "Lines are cumulative P&L from the first session in the period. "
+                "Colour is the asset class; the bold black line is the book total. "
+                "Measured on the book held at the previous close, so a trade "
+                f"contributes from the session after it. The four sleeves sum to the "
+                f"book total to within ${abs(gap):,.6f} at every point over "
+                f"{len(sessions)} session(s)."
+            )
+            st.caption(
+                "Bars: each sleeve's total over the period, solid for the price move "
+                "and lighter for distributions received (carry). Colour is the asset "
+                "class; the sign of the bar is its direction."
+            )
+            if float(period["carry_pnl"].abs().sum()) == 0.0:
+                st.caption(
+                    "Carry is 0.00 in every recorded session: no distribution is "
+                    "recorded for those dates."
+                )
     else:
         st.info(
             "No sleeve P&L recorded yet. The signal cron writes one row per sleeve per "
@@ -1506,12 +1808,7 @@ def render(
             )
             mark_colors = []
             for sleeve in mark.index:
-                sleeve_net = sum(
-                    float(p.get("signed_notional") or 0.0)
-                    for p in positions_data
-                    if _sleeve_of(str(p.get("ticker", ""))) == sleeve
-                )
-                mark_colors.append(_side_colour(sleeve_net))
+                mark_colors.append(_sleeve_colour(str(sleeve)))
             fig = go.Figure(go.Bar(
                 x=[s.capitalize() for s in mark.index],
                 y=mark.values,

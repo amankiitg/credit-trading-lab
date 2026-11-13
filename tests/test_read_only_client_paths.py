@@ -41,13 +41,6 @@ EXPECTED_CALL_SITES: dict[str, int] = {
     "scripts/run_execution.py": 1,       # the execution job (order-placing)
     "scripts/backfill_execution_run.py": 1,  # the crash-recovery replay
     "scripts/sync_positions_from_alpaca.py": 1,  # the manual re-sync
-    # Reviewed 2026-11-12: the dashboard's one broker read. It is the evening NAV
-    # close, a GET on the portfolio history through the reconciliation's own
-    # fetch_equity_history -- no order endpoint, no account mutation. The dashboard
-    # service therefore needs read-only paper credentials when the close series is
-    # to be drawn; without them the page names the history unavailable instead of
-    # reconstructing it from the morning NAV (see dashboard/equity_history.py).
-    "dashboard/equity_history.py": 1,
 }
 
 

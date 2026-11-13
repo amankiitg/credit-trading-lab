@@ -8,7 +8,7 @@ history chart shares the period control whose default is 1 October.
 
 from __future__ import annotations
 
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date
 
 import pandas as pd
 import pytest
@@ -71,153 +71,18 @@ def test_plot_fixes_both_axes(monkeypatch) -> None:
     assert fig.layout.dragmode is False
 
 
-def test_the_official_nav_series_is_the_evening_close() -> None:
-    frame, reason = operational._official_nav_frame(
-        PNL,
-        SLEEVE,
-        SNAPSHOT,
-        close_navs={"2026-10-01": 100_400.0, "2026-10-02": 100_700.0},
-    )
+def test_the_official_nav_series_is_the_evening_signal(monkeypatch) -> None:
+    frame = operational._official_nav_frame(PNL, SLEEVE, SNAPSHOT)
 
-    assert reason is None
     assert [d.strftime("%Y-%m-%d") for d in frame["trade_date"]] == [
         "2026-10-01",
         "2026-10-02",
     ]
-    # 10-01 is the published close. 10-02 is the stored setting of the run that
-    # measured it: its own close is not published until the next calendar day.
-    assert frame["nav"].tolist() == [100_400.0, 100_900.0]
-    assert set(frame["source"]) == {"portfolio history", "evening signal"}
+    # The previous evening's NAV is the next morning's NAV minus the move that
+    # morning recorded; the last point is the stored setting itself.
+    assert frame["nav"].tolist() == [100_500.0 - 200.0, 100_900.0]
+    assert set(frame["source"]) == {"evening signal"}
     assert frame["timestamp"].iloc[0] == "2026-10-01T21:30:00+00:00"
-
-
-# --------------------------------------------------- close NAV, read from the broker
-#
-# The three shapes below are what the portfolio-history endpoint returns: one
-# end-of-day point per session, stamped 01:00 UTC on the FOLLOWING calendar day.
-# The values are the real closes around 2026-11-09; the morning NAV is set to a
-# nonsense number so any arithmetic on it would be obvious.
-
-CLOSES = {
-    "2026-11-05": 98_181.21,
-    "2026-11-06": 97_813.04,
-    "2026-11-09": 98_003.56,
-    "2026-11-10": 99_348.84,
-    "2026-11-11": 99_359.37,
-}
-RECENT_SESSIONS = ["2026-11-05", "2026-11-06", "2026-11-09",
-                   "2026-11-10", "2026-11-11", "2026-11-12"]
-PNL_RECENT = pd.DataFrame([
-    {
-        "trade_date": session,
-        "live_nav": 1_000_000.0,
-        "book_pnl": 123_456.0,
-        "turnover_cost": 0.0,
-        "created_at": f"{session}T15:32:00+00:00",
-    }
-    for session in RECENT_SESSIONS
-])
-
-
-class _PortfolioHistory:
-    def __init__(self, timestamps, equity):
-        self.timestamp = timestamps
-        self.equity = equity
-
-
-class _HistoryClient:
-    """A stand-in for TradingClient that answers portfolio-history GETs."""
-
-    def __init__(self, closes: dict[str, float]):
-        self.calls = 0
-        self._rows = [
-            (
-                int(
-                    datetime.combine(
-                        date.fromisoformat(session) + timedelta(days=1),
-                        time(1, 0),
-                        tzinfo=timezone.utc,
-                    ).timestamp()
-                ),
-                value,
-            )
-            for session, value in sorted(closes.items())
-        ]
-
-    def get_portfolio_history(self, request):  # noqa: ANN001 - the SDK request
-        self.calls += 1
-        return _PortfolioHistory(
-            [row[0] for row in self._rows], [row[1] for row in self._rows]
-        )
-
-
-def _stamped_equity(closes: dict[str, float]) -> dict[str, float]:
-    """The endpoint's labelling: a close is stamped with the next calendar day."""
-    return {
-        (date.fromisoformat(session) + timedelta(days=1)).isoformat(): value
-        for session, value in closes.items()
-    }
-
-
-def test_the_close_nav_is_the_reconciliations_close_equity(monkeypatch) -> None:
-    """For the last three sessions the dashboard plots exactly the close the
-    reconciliation measures, not an arithmetic reconstruction of it."""
-    from dashboard import equity_history
-    from execution import alpaca_paper as ap
-    from risk.execution_pnl import close_equity
-
-    closes = dict(CLOSES)
-    client = _HistoryClient(closes)
-    monkeypatch.setattr(ap, "connect", lambda dry_run=False: client)
-
-    sessions = sorted(closes)
-    equity = _stamped_equity(closes)
-
-    dashboard_values = equity_history.close_equity_by_session(sessions)
-
-    assert dashboard_values == {s: close_equity(equity, s) for s in sessions}
-    for session in sessions[-3:]:
-        assert dashboard_values[session] == closes[session]
-
-    frame, reason = operational._official_nav_frame(
-        PNL_RECENT,
-        pd.DataFrame(),
-        {
-            "value": 100_964.45,
-            "source": "evening signal",
-            "session": "2026-11-12",
-            "timestamp": "2026-11-12T22:31:00+00:00",
-        },
-        close_navs=dashboard_values,
-    )
-
-    assert reason is None
-    plotted = {
-        stamp.date().isoformat(): value
-        for stamp, value in zip(frame["trade_date"], frame["nav"])
-    }
-    for session in sessions[-3:]:
-        assert plotted[session] == close_equity(equity, session)
-    # The session whose close is not published yet keeps the stored setting.
-    assert plotted["2026-11-12"] == 100_964.45
-
-
-def test_an_unreadable_history_shows_only_the_stored_nav(monkeypatch) -> None:
-    from dashboard import equity_history
-    from execution import alpaca_paper as ap
-
-    equity_history.cached_close_equity_by_session.clear()
-
-    def _no_client(dry_run=False):  # noqa: ANN001
-        raise EnvironmentError("ALPACA_PAPER_API_KEY must be set")
-
-    monkeypatch.setattr(ap, "connect", _no_client)
-
-    frame, reason = operational._official_nav_frame(PNL, pd.DataFrame(), SNAPSHOT)
-
-    assert reason is not None and "ALPACA_PAPER_API_KEY" in reason
-    assert frame["nav"].tolist() == [100_900.0]
-    assert frame["source"].tolist() == ["evening signal"]
 
 
 def test_nav_snapshot_calls_the_evening_signal_official(monkeypatch) -> None:

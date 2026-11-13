@@ -155,10 +155,12 @@ def _render(monkeypatch, *, positions=POSITIONS, weights=TARGET_WEIGHTS, nav=NAV
     )
     monkeypatch.setattr(operational, "fetch_decision_for_date", lambda d: None)
     monkeypatch.setattr(operational, "fetch_last_cron_run", lambda job: None)
-    # The risk panel is a different panel and reads the local price cache; stubbed so
-    # this file tests the exposure block and nothing else.
+    # The risk panel and the header book-vol metric read live closes; stubbed so this
+    # file tests the exposure block and nothing else.
+    monkeypatch.setattr(operational, "_risk_snapshot", lambda nav, positions: None)
     monkeypatch.setattr(operational, "_render_mctr_pctr", lambda nav, positions: None)
     operational._get_last_execution_run.clear()
+    operational._get_last_signal_run.clear()
 
     at = AppTest.from_file(str(APP), default_timeout=600)
     at.run()

@@ -102,16 +102,41 @@ def _capture_plots(monkeypatch):
     return figures
 
 
-def test_the_chart_is_drawn_when_a_session_is_stored(monkeypatch) -> None:
+def test_the_block_draws_two_charts(monkeypatch) -> None:
+    """The timeline and the period bars are separate figures, not two subplots.
+
+    They used to share an x-axis, and the categorical bars made the date labels
+    disappear from the timeline.
+    """
     figures = _capture_plots(monkeypatch)
     at = _render(monkeypatch, sleeve_rows=ROWS)
 
-    assert len(figures) == 1
-    assert figures[0].layout.title.text.startswith("Book P&L by sleeve")
+    assert len(figures) == 2
+    assert [fig.layout.title.text for fig in figures] == [
+        "Cumulative P&L by sleeve (timeline)",
+        "Period P&L by sleeve: price vs carry",
+    ]
     text = _text(at)
     assert "### Book P&L by sleeve" in text
     assert "one cumulative line per sleeve" in text
     assert "Bars: each sleeve's total over the period" in text
+
+
+def test_the_timeline_has_a_visible_date_axis_and_the_bars_do_not(monkeypatch) -> None:
+    figures = _capture_plots(monkeypatch)
+    _render(monkeypatch, sleeve_rows=ROWS)
+
+    timeline, bars = figures
+    # A real date axis with its own tick format: categorical x data is what hid
+    # the labels when this shared an axis with the bars.
+    assert timeline.layout.xaxis.type == "date"
+    assert timeline.layout.xaxis.tickformat == "%b %d"
+    assert timeline.layout.xaxis.title.text == "session"
+    assert timeline.layout.yaxis.title.text == "cumulative P&L"
+
+    assert bars.layout.xaxis.type != "date"
+    assert bars.layout.xaxis.title.text == "sleeve"
+    assert bars.layout.yaxis.title.text == "$ over the period"
 
 
 def test_no_stored_session_means_no_chart_and_a_reason(monkeypatch) -> None:
@@ -152,17 +177,26 @@ def test_the_carry_note_is_absent_when_carry_is_recorded(monkeypatch) -> None:
     assert "Carry is 0.00 in every recorded session" not in _text(at)
 
 
-def _pnl_chart(monkeypatch, **kwargs):
+def _timeline_chart(monkeypatch, **kwargs):
     figures = _capture_plots(monkeypatch)
     _render(monkeypatch, **kwargs)
     return next(
         fig for fig in figures
-        if fig.layout.title.text.startswith("Book P&L by sleeve")
+        if fig.layout.title.text.startswith("Cumulative P&L by sleeve")
+    )
+
+
+def _bars_chart(monkeypatch, **kwargs):
+    figures = _capture_plots(monkeypatch)
+    _render(monkeypatch, **kwargs)
+    return next(
+        fig for fig in figures
+        if fig.layout.title.text.startswith("Period P&L by sleeve")
     )
 
 
 def test_each_sleeve_line_uses_its_asset_class_colour(monkeypatch) -> None:
-    chart = _pnl_chart(monkeypatch, sleeve_rows=ROWS, positions=POSITIONS)
+    chart = _timeline_chart(monkeypatch, sleeve_rows=ROWS, positions=POSITIONS)
 
     lines = {
         trace.name: trace for trace in chart.data
@@ -180,7 +214,7 @@ def test_each_sleeve_line_uses_its_asset_class_colour(monkeypatch) -> None:
 
 
 def test_the_sleeve_lines_sum_to_the_book_line_at_every_point(monkeypatch) -> None:
-    chart = _pnl_chart(monkeypatch, sleeve_rows=ROWS)
+    chart = _timeline_chart(monkeypatch, sleeve_rows=ROWS)
 
     sleeve_lines = [
         trace for trace in chart.data
@@ -198,7 +232,7 @@ def test_the_sleeve_lines_sum_to_the_book_line_at_every_point(monkeypatch) -> No
 
 
 def test_the_second_panel_splits_the_period_into_price_and_carry(monkeypatch) -> None:
-    chart = _pnl_chart(monkeypatch, sleeve_rows=ROWS)
+    chart = _bars_chart(monkeypatch, sleeve_rows=ROWS)
 
     bars = {trace.name: trace for trace in chart.data if trace.type == "bar"}
     assert set(bars) == {"Price", "Carry"}
@@ -222,7 +256,7 @@ def test_a_nan_tail_session_is_dropped(monkeypatch) -> None:
         for sleeve in operational.SLEEVE_ORDER
     ]
 
-    chart = _pnl_chart(monkeypatch, sleeve_rows=tail)
+    chart = _timeline_chart(monkeypatch, sleeve_rows=tail)
 
     book = next(t for t in chart.data if t.name == "Book total")
     assert [str(x)[:10] for x in book.x] == ["2026-10-01", "2026-10-02"]

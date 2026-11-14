@@ -8,9 +8,13 @@ number with no reference point cannot be read.
   Trade Approval    Proposed next trade, stop-state advisory, and approve/reject.
   Exposure          Net and gross for the live book against the stored target.
   Performance       MTD return, volatility, Sharpe, max drawdown, account value, cost.
-  Book P&L by sleeve  Where the account's result came from, carry versus price.
+  Book P&L by sleeve  Where the account's result came from, carry versus price,
+                    as two charts: a dated cumulative timeline, then the period
+                    split per sleeve. Separate figures, so neither borrows the
+                    other's x-axis.
   Risk contribution  Share of book risk by sleeve and by name.
-  Today's result    The run's dollars, kept apart.
+  Morning execution run  What the morning run filled, and what those fills earned
+                    from their fill price to the close.
 
 Visual system:
 
@@ -37,7 +41,6 @@ from datetime import date, datetime, timezone
 
 import pandas as pd
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import streamlit as st
 
 from dashboard.signal_history import render_signal_history
@@ -83,6 +86,12 @@ GROSS_FLAG_X = 2.05       # above this is a mark-to-market overshoot between run
 GROSS_FLOOR_X = 1.80      # the floor observed across the recorded snapshots
 RISK_TICKER_FLAG_PCT = 40.0   # one position above 40% of book risk is concentration
 RISK_SLEEVE_FLAG_PCT = 60.0   # one sleeve above 60% of book risk is concentration
+
+# Shown with the concentration warning. The flag is a monitor: nothing in the
+# signal caps a name's share of book risk, so the line says what the limit is not.
+MONITOR_ONLY_NOTE = (
+    "Monitor only: sizing is per-name vol and does not cap risk share."
+)
 
 PLOTLY_CONFIG = {
     "displayModeBar": True,
@@ -590,7 +599,7 @@ def _book_pnl_snapshot(
     nav_source: str | None = None,
     nav_session: str | None = None,
 ) -> dict:
-    """The 1-day P&L value, from the same run as the NAV card.
+    """The official daily P&L value, from the same run as the NAV card.
 
     The evening signal writes daily_sleeve_pnl after the close, one row per sleeve
     per session, and its book_total is that session's book P&L measured on the book
@@ -910,6 +919,105 @@ def _cumulative_sleeve_pnl(
     return cumulative
 
 
+def _fill_to_close_mark(
+    attr_rows: list[dict],
+    sleeve_rows: list[dict],
+) -> dict | None:
+    """Shares traded x (close - fill) for the latest session, as the email reports it.
+
+    This is the traded part of the session, not a slippage measure and not a
+    cost-inclusive mark. Sells are negative shares, so a sell below the close gives
+    up the difference and its sign falls out of the arithmetic.
+
+    The evening job computes it with risk.execution_pnl from the broker's fills and
+    stores the per-sleeve split in daily_sleeve_pnl.execution_pnl -- the same split
+    the summary email prints on its "Execution P&L" line. That column wins here so
+    the page and the email cannot disagree about one session.
+
+    Sessions written before that column existed fall back to live_attribution's
+    gross_pnl, which feed_attribution built from the same fill notional. net_pnl is
+    deliberately not used: it has the day's turnover cost subtracted, which is the
+    number that made the page read -$8.74 while the email said +$0.87.
+    """
+    session: str | None = None
+    by_sleeve: dict[str, float] = {}
+    source = "evening signal"
+
+    if sleeve_rows:
+        frame = pd.DataFrame(sleeve_rows)
+        if {"trade_date", "sleeve", "execution_pnl"} <= set(frame.columns):
+            frame = frame.copy()
+            frame["execution_pnl"] = pd.to_numeric(
+                frame["execution_pnl"], errors="coerce"
+            )
+            frame = frame.dropna(subset=["execution_pnl"])
+            if not frame.empty:
+                session = max(str(value) for value in frame["trade_date"].unique())
+                latest = frame[frame["trade_date"].astype(str) == session]
+                for _, row in latest.iterrows():
+                    sleeve = str(row.get("sleeve") or "")
+                    if sleeve not in SLEEVE_ORDER:
+                        continue
+                    by_sleeve[sleeve] = by_sleeve.get(sleeve, 0.0) + float(
+                        row["execution_pnl"]
+                    )
+
+    if not by_sleeve and attr_rows:
+        frame = pd.DataFrame(attr_rows)
+        if not frame.empty and "run_date" in frame.columns:
+            session = max(str(value) for value in frame["run_date"].unique())
+            latest = frame[frame["run_date"].astype(str) == session]
+            for _, row in latest.iterrows():
+                sleeve = str(row.get("asset_class") or "")
+                if sleeve not in SLEEVE_ORDER:
+                    continue
+                gross = row.get("gross_pnl")
+                if gross is None or pd.isna(gross):
+                    net = row.get("net_pnl")
+                    cost = row.get("turnover_cost") or 0.0
+                    if net is None or pd.isna(net):
+                        continue
+                    gross = float(net) + float(cost)
+                by_sleeve[sleeve] = by_sleeve.get(sleeve, 0.0) + float(gross)
+            source = "live attribution"
+
+    if not by_sleeve or session is None:
+        return None
+
+    fills = [row for row in attr_rows if str(row.get("run_date")) == str(session)]
+    return {
+        "session": str(session),
+        "by_sleeve": by_sleeve,
+        "total": sum(by_sleeve.values()),
+        "fill_count": len(fills) or None,
+        "source": source,
+    }
+
+
+def _staged_trades(
+    pending_rows: list[dict],
+    state: str,
+    *,
+    auto_approve: bool,
+    decision: str | None,
+) -> bool:
+    """Whether a trade is waiting for this operator's approval right now.
+
+    The window must be open: a delta row on a proposal the execution run has already
+    acted on is history, not a staged trade. There must be at least one non-skip
+    row, and it must not already be rejected. And the decision must actually be the
+    operator's to make: with auto-approve on, the standing instruction is already
+    "execute unless I reject", so no day is waiting on them and the public page has
+    nothing to ask a visitor to sign in for.
+    """
+    return (
+        bool(pending_rows)
+        and state == DECISION_STATE_OPEN
+        and not auto_approve
+        and decision != "reject"
+    )
+
+
 def _active_flags(
     concentration: list[str],
     net_message: str | None,
@@ -964,7 +1072,7 @@ def _render_header(
 ) -> None:
     """Title and the six numbers, each with the run it came from.
 
-    The NAV and 1-day P&L cards are one run apart in time only if something is
+    The NAV and daily P&L cards are one run apart in time only if something is
     wrong: both carry the run timestamp of the NAV the page is showing.
     """
     st.title("Credit Lab | Multi-Asset Trend")
@@ -1005,6 +1113,9 @@ def _render_header(
 
     if concentration:
         st.warning("**Concentration risk** — " + "; ".join(concentration) + ".")
+        # Beside the flag, not on a chart: the warning reports a share of risk, and
+        # nothing in the sizing caps that share.
+        st.caption(MONITOR_ONLY_NOTE)
 
     # Two rows of three. Six cards in one row truncates the values on a
     # 1200px-wide window, and a truncated NAV is worse than no card.
@@ -1014,7 +1125,10 @@ def _render_header(
         delta=run_label,
         delta_color="off",
     )
-    row_one[1].metric("1-day P&L", pnl_value, delta=pnl_delta, delta_color="off")
+    row_one[1].metric(
+        "Daily P&L (close-to-close)", pnl_value,
+        delta=pnl_delta, delta_color="off",
+    )
     row_one[2].metric(
         "Gross", f"{gross_x:.2f}x NAV",
         delta=f"target {sum(abs(float(r.get('target wt') or 0.0)) for r in proposed_rows):.2f}x",
@@ -1040,9 +1154,10 @@ def _render_header(
             st.caption("All clear: no concentration, exposure, drift or stop flags.")
 
     pnl_basis = (
-        f"1-day P&L is the {book_pnl['source']}'s book P&L for the "
-        f"{book_pnl['session']} session ({_fmt_utc(book_pnl['timestamp'])}), the "
-        f"same run as the NAV card."
+        f"Official daily P&L is the {book_pnl['source']}'s close-to-close book "
+        f"P&L for the {book_pnl['session']} session "
+        f"({_fmt_utc(book_pnl['timestamp'])}), the same run as the NAV card. "
+        f"It is the only daily P&L on the page."
         if book_pnl["value"] is not None
         else "No book P&L is recorded yet."
     )
@@ -1315,9 +1430,32 @@ def render(
 
     supabase_ok = bool(os.environ.get("SUPABASE_SECRET_KEY"))
 
+    # Whether a trade is staged is the same question for a signed-in and a
+    # signed-out reader, so it is answered before the auth branch: the window must
+    # be open, at least one row must be an order rather than band noise, the day
+    # must not already be rejected, and the decision must be the operator's to make.
+    # With auto-approve on the standing instruction already answers it, so a
+    # signed-out visitor is not asked to sign in for nothing.
+    today = _today_utc()
+    last_run = _get_last_execution_run()
+    last_run_date = str(last_run["run_date"]) if last_run else None
+    state, window_reason = decision_window(
+        today=today,
+        as_of_date=as_of_date,
+        has_proposal=bool(proposed_rows),
+        last_execution_run_date=last_run_date,
+    )
+    auto_approve = get_auto_approve()
+    existing = fetch_decision_for_date(as_of_date)
+    staged = _staged_trades(
+        pending_rows, state, auto_approve=auto_approve, decision=existing
+    )
+
     if not is_authenticated and secrets_configured:
-        if not pending_rows:
-            st.info("No trades pending today — there is nothing to approve.")
+        if not staged:
+            # Plain information, no prompt: there is nothing an account could
+            # unlock. The advisory stop note above stays readable as it is.
+            st.info(f"No trades pending for {as_of_date}.")
         else:
             st.info("Sign in to approve or reject today's trades.")
             if st.button("Sign in with Google", key="signin_btn"):
@@ -1329,18 +1467,6 @@ def render(
             "SUPABASE_SECRET_KEY in .env and restart."
         )
     else:
-        today = _today_utc()
-        existing = fetch_decision_for_date(as_of_date)
-        last_run = _get_last_execution_run()
-        last_run_date = str(last_run["run_date"]) if last_run else None
-        state, window_reason = decision_window(
-            today=today,
-            as_of_date=as_of_date,
-            has_proposal=bool(proposed_rows),
-            last_execution_run_date=last_run_date,
-        )
-
-        auto_approve = get_auto_approve()
         new_val = st.toggle(
             "Auto-approve: execute every day unless I explicitly reject",
             value=auto_approve,
@@ -1705,19 +1831,13 @@ def render(
             period["trade_date"] = pd.to_datetime(period["trade_date"], errors="coerce")
             period = period[period["trade_date"].isin(xs)]
 
-            fig = make_subplots(
-                rows=2,
-                cols=1,
-                shared_xaxes=True,
-                row_heights=[0.66, 0.34],
-                vertical_spacing=0.16,
-                subplot_titles=(
-                    "Cumulative P&L: one line per sleeve, bold book total",
-                    "Total-period P&L: price vs carry",
-                ),
-            )
+            # The timeline is its own figure with its own date axis. It used to
+            # share an x-axis with the categorical bars below, and the shared axis
+            # took the bars' category type: the dates were in the data and
+            # invisible on the page.
+            timeline = go.Figure()
             for sleeve in SLEEVE_ORDER:
-                fig.add_trace(
+                timeline.add_trace(
                     go.Scatter(
                         x=xs,
                         y=cumulative[sleeve].values,
@@ -1728,11 +1848,9 @@ def render(
                             "%{x|%Y-%m-%d}<br>" + sleeve
                             + " %{y:+,.2f}<extra></extra>"
                         ),
-                    ),
-                    row=1,
-                    col=1,
+                    )
                 )
-            fig.add_trace(
+            timeline.add_trace(
                 go.Scatter(
                     x=xs,
                     y=cumulative["book_total"].values,
@@ -1742,10 +1860,17 @@ def render(
                     hovertemplate=(
                         "%{x|%Y-%m-%d}<br>book total %{y:+,.2f}<extra></extra>"
                     ),
-                ),
-                row=1,
-                col=1,
+                )
             )
+            timeline.update_layout(
+                title="Cumulative P&L by sleeve (timeline)",
+                xaxis_title="session",
+                yaxis_title="cumulative P&L",
+            )
+            # A real date axis with its own ticks. Without this a categorical
+            # axis can still swallow the labels, which was the visible bug.
+            timeline.update_xaxes(type="date", tickformat="%b %d", nticks=8)
+            _plot(timeline, height=380, legend_below=True)
 
             price = (
                 period.groupby("sleeve")["price_pnl"].sum()
@@ -1756,35 +1881,32 @@ def render(
                 .reindex(list(SLEEVE_ORDER)).fillna(0.0)
             )
             labels = [sleeve.capitalize() for sleeve in SLEEVE_ORDER]
-            fig.add_trace(
+            bars = go.Figure()
+            bars.add_trace(
                 go.Bar(
                     x=labels,
                     y=price.values,
                     name="Price",
                     marker_color=[_sleeve_colour(s) for s in SLEEVE_ORDER],
                     hovertemplate="%{x}<br>price %{y:+,.2f}<extra></extra>",
-                ),
-                row=2,
-                col=1,
+                )
             )
-            fig.add_trace(
+            bars.add_trace(
                 go.Bar(
                     x=labels,
                     y=carry.values,
                     name="Carry",
                     marker_color=[_rgba(_sleeve_colour(s), 0.45) for s in SLEEVE_ORDER],
                     hovertemplate="%{x}<br>carry %{y:+,.2f}<extra></extra>",
-                ),
-                row=2,
-                col=1,
+                )
             )
-            fig.update_layout(
-                title="Book P&L by sleeve: cumulative lines, and the period split",
+            bars.update_layout(
+                title="Period P&L by sleeve: price vs carry",
+                xaxis_title="sleeve",
+                yaxis_title="$ over the period",
                 barmode="group",
             )
-            fig.update_yaxes(title_text="cumulative P&L", row=1, col=1)
-            fig.update_yaxes(title_text="$ over the period", row=2, col=1)
-            _plot(fig, height=560, legend_below=True, top=86)
+            _plot(bars, height=320, legend_below=True)
 
             gap = float(
                 cumulative["book_total"].iloc[-1]
@@ -1818,79 +1940,66 @@ def render(
     _section("Risk contribution")
     _render_mctr_pctr(nav, positions_data)
 
-    # ---------------------------------------------------------------- Today's result
-    _section("Today's result")
+    # ---------------------------------------------------------------- Morning execution run
+    _section("Morning execution run")
 
     last_run = df_pnl.iloc[-1] if not df_pnl.empty else None
     run_date = str(last_run["trade_date"]) if last_run is not None else "—"
-    book_pnl = last_run.get("book_pnl") if last_run is not None else None
     cost_today = last_run.get("turnover_cost") if last_run is not None else None
-    nav_at_run = last_run.get("live_nav") if last_run is not None else None
-
-    col_book, col_cost = st.columns(2)
-    if book_pnl is None or pd.isna(book_pnl):
-        col_book.metric("Book P&L (equity move since previous run)", "not recorded yet")
-    else:
-        book_pct = (float(book_pnl) / float(nav_at_run) * 100) if nav_at_run else None
-        col_book.metric(
-            "Book P&L (equity move since previous run)",
-            "$" + f"{float(book_pnl):+,.2f}",
-            delta=f"{book_pct:+.2f}% of NAV" if book_pct is not None else None,
-            delta_color="off",
-        )
+    run_stamp = _fmt_utc(last_run.get("created_at") if last_run is not None else None)
 
     if cost_today is None or pd.isna(cost_today):
-        col_cost.metric("Turnover cost today", "—")
+        st.metric("Turnover cost today", "—")
     else:
-        col_cost.metric("Turnover cost today", _fmt_dollars(float(cost_today)))
+        st.metric("Turnover cost today", _fmt_dollars(float(cost_today)))
 
     cost_total = (
         float(df_pnl["turnover_cost"].fillna(0.0).sum())
         if "turnover_cost" in df_pnl.columns else 0.0
     )
     st.caption(
-        f"Book P&L is the account's equity move since the previous run, on the last "
-        f"morning execution ({run_date}, {_fmt_utc(last_run.get('created_at') if last_run is not None else None)}). "
-        f"Turnover cost is a drag on it, not part of it -- " + f"${cost_total:,.2f}"
+        f"The morning execution run of {run_date} ({run_stamp}). Its book P&L is "
+        f"not repeated here: the page carries one daily number, the official "
+        f"close-to-close P&L in the header. Turnover cost is a drag, not part of "
+        f"the result -- " + "$" + f"{cost_total:,.2f}"
         + f" cumulative over {len(df_pnl)} runs, and a single-digit dollar day is normal."
     )
 
     attr_rows = _get_live_attribution(60)
-    if attr_rows:
-        df_attr = pd.DataFrame(attr_rows)
-        attr_date = str(df_attr["run_date"].max())
-        df_latest = df_attr[df_attr["run_date"] == attr_date]
-        if not df_latest.empty and "asset_class" in df_latest.columns:
-            mark = df_latest.groupby("asset_class")["net_pnl"].sum()
-            mark = mark.reindex([s for s in SLEEVE_ORDER if s in mark.index])
-            total_mark = float(mark.sum())
-            st.markdown(
-                f"**Fill-day mark on {attr_date}'s filled legs, by sleeve "
-                f"(not the book's P&L).**"
-            )
-            mark_colors = []
-            for sleeve in mark.index:
-                mark_colors.append(_sleeve_colour(str(sleeve)))
-            fig = go.Figure(go.Bar(
-                x=[s.capitalize() for s in mark.index],
-                y=mark.values,
-                marker_color=mark_colors,
-                text=["$" + f"{v:+,.2f}" for v in mark.values],
-                textposition="outside",
-                hovertemplate="%{x}<br>%{y:+,.2f}<extra></extra>",
-            ))
-            fig.update_layout(
-                title="Fill-to-close mark on the day's filled legs, by sleeve",
-                yaxis_title="", showlegend=False,
-            )
-            _plot(fig, height=300)
-            st.caption(
-                "$" + f"{total_mark:+,.2f}" + f" across {len(df_latest)} filled leg(s) on "
-                f"{attr_date}, net of their turnover cost. One day, filled legs only, "
-                f"so it is not a period return and not the book's P&L."
-            )
-        else:
-            st.info("No attribution rows for the latest run.")
+    mark = _fill_to_close_mark(attr_rows, sleeve_rows)
+    if mark:
+        sleeves = [s for s in SLEEVE_ORDER if s in mark["by_sleeve"]]
+        st.markdown(
+            f"**Execution P&L on {mark['session']}'s fills, by sleeve "
+            f"(shares traded x (close - fill), sells negative).**"
+        )
+        fig = go.Figure(go.Bar(
+            x=[s.capitalize() for s in sleeves],
+            y=[mark["by_sleeve"][s] for s in sleeves],
+            marker_color=[_sleeve_colour(s) for s in sleeves],
+            text=["$" + f"{mark['by_sleeve'][s]:+,.2f}" for s in sleeves],
+            textposition="outside",
+            hovertemplate="%{x}<br>%{y:+,.2f}<extra></extra>",
+        ))
+        fig.update_layout(
+            title="Fill-to-close mark on the day's filled legs, by sleeve",
+            xaxis_title="sleeve",
+            yaxis_title="fill to close, $",
+            showlegend=False,
+        )
+        _plot(fig, height=300)
+        legs = (
+            f" across {mark['fill_count']} filled leg(s)" if mark["fill_count"] else ""
+        )
+        st.caption(
+            "$" + f"{mark['total']:+,.2f}" + legs
+            + f" on {mark['session']}: shares traded x (close - fill), sells "
+            + "negative, before turnover cost. This is the daily email's "
+            + "Execution P&L definition, so the two figures agree. One day, "
+            + "filled legs only: not a period return."
+        )
+    elif attr_rows:
+        st.info("No fill-to-close mark is recorded for the latest run.")
     else:
         st.info("No live_attribution rows yet -- they populate after an execution run.")
 

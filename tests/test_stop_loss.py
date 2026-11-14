@@ -714,11 +714,12 @@ class TestLeakageLookahead:
         the caller, and that sigma must match compute_trend's output.
         We test this on real close data to ensure the same W=63 convention.
         """
-        from signals.etf_universe import UNIVERSE, load_universe_close
+        from signals.etf_universe import UNIVERSE
         from signals.trend_signal import compute_trend, W_DEFAULT, TRADING_DAYS as ST
+        from tests.conftest import complete_close
 
         try:
-            close = load_universe_close()
+            close = complete_close()
         except FileNotFoundError:
             pytest.skip("No cached close data available")
 

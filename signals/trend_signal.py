@@ -51,6 +51,19 @@ K_DEAD_ZONE_DEFAULT = 0.0    # signal-level hysteresis, off by default (backward
 K_DEAD_ZONE_CANDIDATE = 0.5  # pre-registered T2b default: 0.5x the implied L-day trail_ret std, not tuned
 
 
+class MissingSizingInput(ValueError):
+    """A name in the universe has no value on a date the book is being sized.
+
+    Raised rather than absorbed. Skipping a NaN in a cross-sectional sum makes
+    the gross cap bind on whichever names happen to have data, which silently
+    renormalises every other weight in the row (2026-07-28: SPY 0.2727 ->
+    0.3530 on a session where four names had no close). Refusing to size is
+    the only outcome that cannot be mistaken for a decision.
+
+    A ValueError, so the existing "refuse the run" handling applies unchanged.
+    """
+
+
 def compute_dead_zone(sigma: pd.DataFrame, L: int, k: float) -> pd.DataFrame:
     """Implied dead-zone half-width for the L-day trailing return.
 
@@ -125,6 +138,62 @@ def _hysteresis_signal(
     return signal.where(defined)
 
 
+def _in_universe(close: pd.DataFrame, L: int) -> pd.DataFrame:
+    """Date x ticker mask: the name is expected to be sized on that date.
+
+    The docstring's "leading NaN per column allowed for staggered inception"
+    is what this reproduces. A column's NaN before its first quote is a name
+    that has not started, and a NaN during the L-session trend warmup after
+    that first quote is a name that has started but cannot have a trail_ret
+    yet (L > W, so the sigma warmup is covered). Both are legitimately out of
+    the universe, exactly as today.
+
+    From the L-th session after its first quote onward the name is in the
+    universe, and a NaN there is missing data rather than an absent name --
+    _refuse_missing_values raises on it. The boundary counts sessions since
+    inception, not valid observations: counting valid observations would let
+    a hole during the warmup pass itself off as still warming up.
+    """
+    n = len(close)
+    first_pos = np.full(len(close.columns), float(n))
+    for j, ticker in enumerate(close.columns):
+        first = close[ticker].first_valid_index()
+        if first is not None:
+            first_pos[j] = close.index.get_loc(first)
+    rows = np.arange(n)[:, None]
+    return pd.DataFrame(
+        rows >= first_pos[None, :] + L, index=close.index, columns=close.columns
+    )
+
+
+def _refuse_missing_values(
+    values: pd.DataFrame, in_universe: pd.DataFrame, label: str
+) -> None:
+    """Raise if a name in the universe has no value to size from.
+
+    values is a weight-like frame (raw weights, or held weights) and
+    in_universe says which (date, ticker) pairs are expected to be finite.
+    A NaN outside the universe is an absent name, not an error: it carries no
+    position. A NaN inside it is missing data, and it is named in the error so
+    the operator knows what to look at.
+    """
+    missing = in_universe & values.isna()
+    if not missing.to_numpy().any():
+        return
+    tickers = [t for t in values.columns if missing[t].any()]
+    dates = missing.index[missing.any(axis=1)]
+    affected = (
+        f"first on {dates[0].date()}"
+        if len(dates) == 1
+        else f"first on {dates[0].date()}, on {len(dates)} dates"
+    )
+    raise MissingSizingInput(
+        "cannot size with missing values: "
+        + ", ".join(tickers)
+        + f" ({label}: {affected}; refusing to renormalise the names that remain)"
+    )
+
+
 def compute_trend(
     close: pd.DataFrame,
     L: int = L_DEFAULT,
@@ -179,7 +248,16 @@ def compute_trend(
 
     raw_weight = signal * (v / sigma).clip(upper=w_max)
 
-    gross_raw = raw_weight.abs().sum(axis=1, skipna=True)
+    # Defence in depth: refuse to size a row in which a name that should have a
+    # value does not. Without this, the cap below binds on the names that do
+    # have data and renormalises them over the gap.
+    in_universe = _in_universe(close, L)
+    _refuse_missing_values(raw_weight, in_universe, "compute_trend")
+
+    # A name outside the universe carries no position, so it enters the sum as
+    # an explicit zero rather than being skipped. skipna=True here is what let
+    # four missing closes drop out of the sum and inflate the other four.
+    gross_raw = raw_weight.where(in_universe, 0.0).abs().sum(axis=1, skipna=False)
     scale = (g_max / gross_raw).clip(upper=1.0)
     scale = scale.where(gross_raw > 0, 1.0)
 
@@ -314,7 +392,14 @@ def apply_rebalance_control(
     # a temporary data gap in `desired` (gap in the underlying prices, not
     # a true exit) correctly carries forward the last held value rather
     # than dropping to NaN.
-    gross = held_df.abs().sum(axis=1, skipna=True)
+    #
+    # The same no-silent-skip rule as compute_trend's cap: a name that has
+    # entered the book has a held value on every later date (the loop's state
+    # machine guarantees it), so a NaN there is a bug and is refused. A NaN
+    # before entry is an absent name and counts as an explicit zero.
+    entered = held_df.notna().cummax()
+    _refuse_missing_values(held_df, entered, "apply_rebalance_control")
+    gross = held_df.where(entered, 0.0).abs().sum(axis=1, skipna=False)
     scale = (g_max / gross).clip(upper=1.0)
     scale = scale.where(gross > 0, 1.0)
     return held_df.mul(scale, axis=0)

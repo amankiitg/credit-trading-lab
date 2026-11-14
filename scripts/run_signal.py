@@ -269,13 +269,29 @@ def _run(summary: RunSummary) -> int:
 
     # -- 4. Run v8.2 signal
     from signals.trend_signal import (
+        MissingSizingInput,
         apply_rebalance_control,
         compute_trend,
         shift_to_next_day,
         to_position_matrix,
     )
     with step("4 v8.2 signal pipeline", logger):
-        tidy = compute_trend(close, L=120, long_short=True, k_dead_zone=0.5)
+        try:
+            tidy = compute_trend(close, L=120, long_short=True, k_dead_zone=0.5)
+        except MissingSizingInput as exc:
+            # The sizing layer's own guard refused the frame: a name that should
+            # have a close has none, so no weight can be computed without
+            # renormalising the names that remain. Same outcome as the 4c gate
+            # below -- nothing written, non-zero exit, the tickers and date
+            # named -- but it stops before a single weight exists.
+            logger.error("REFUSING to write a signal for %s: %s", as_of_date, exc)
+            logger.error(
+                "Repair the raw closes (scripts/backfill_raw_gap.py) and re-run. "
+                "Nothing was written, so the stored signal is unchanged."
+            )
+            summary.data_check = f"BLOCKED: {exc}"
+            summary.mark_skip(f"sizing guard blocked the signal for {as_of_date}")
+            return 1
         desired = to_position_matrix(tidy)
         held = apply_rebalance_control(desired, rebal_freq=1, band_pct=0.20)
         target = shift_to_next_day(held)

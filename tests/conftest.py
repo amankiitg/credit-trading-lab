@@ -14,7 +14,33 @@ resolves at call time. `tests/test_alerts.py` is unaffected: it binds
 
 from __future__ import annotations
 
+import numpy as np
+import pandas as pd
 import pytest
+
+
+def complete_close() -> pd.DataFrame:
+    """The real universe, cut to its last session on which every name has a close.
+
+    The checked-in data/raw parquets end with 42 sessions on which SPY, IEF, HYG
+    and LQD have no row while EFA, EEM, TLT and GLD do (the matrix runs to
+    2026-06-15). `compute_trend` refuses a matrix like that now
+    (`MissingSizingInput`): a name that should have a close must not be sized,
+    because the gross cap would otherwise renormalise the names that do have one
+    -- the 2026-07-28 failure in miniature.
+
+    So construction tests run on the last complete session. That still leaves
+    ~4,780 sessions, including every staggered inception and its warmup. The
+    refused case is pinned directly on a NaN row instead
+    (tests/test_trend_signal.py::test_a_nan_row_for_a_started_name_is_refused).
+    """
+    from signals.etf_universe import load_universe_close
+
+    close = load_universe_close()
+    complete = close.notna().all(axis=1).to_numpy()
+    if not complete.any():
+        raise AssertionError("the close matrix has no session with every name present")
+    return close.loc[: close.index[np.flatnonzero(complete)[-1]]]
 
 
 @pytest.fixture(autouse=True)

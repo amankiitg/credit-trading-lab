@@ -30,7 +30,14 @@ import pytest
 from signals.data_quality import missing_latest_close
 from signals.etf_universe import UNIVERSE
 from signals.trend_signal import (
+    G_MAX_DEFAULT,
+    MissingSizingInput,
+    TRADING_DAYS,
+    V_DEFAULT,
+    W_MAX_DEFAULT,
+    _hysteresis_signal,
     apply_rebalance_control,
+    compute_dead_zone,
     compute_trend,
     shift_to_next_day,
     to_position_matrix,
@@ -119,6 +126,31 @@ def _held_weights(close: pd.DataFrame) -> pd.Series:
     return held.iloc[-1]
 
 
+def _held_weights_before_the_sizing_guard(close: pd.DataFrame) -> pd.Series:
+    """The sizes the pre-fix cap produced for `close`, kept for the record.
+
+    `compute_trend` now refuses a frame in which a name that should have a close
+    has none, so the gapped frame cannot be run through it at all. This is the
+    old construction -- identical to compute_trend except for the gross cap,
+    which is what the fix changed -- so the historic number stays pinned as the
+    outcome the guard exists to prevent.
+    """
+    L, W = 120, 63
+    log_ret = np.log(close).diff()
+    trail_ret = close / close.shift(L) - 1.0
+    sigma = log_ret.rolling(W, min_periods=W).std() * np.sqrt(TRADING_DAYS)
+    defined = trail_ret.notna() & sigma.notna()
+    signal = _hysteresis_signal(
+        trail_ret, compute_dead_zone(sigma, L, 0.5), defined, True
+    )
+    raw_weight = signal * (V_DEFAULT / sigma).clip(upper=W_MAX_DEFAULT)
+    gross = raw_weight.abs().sum(axis=1, skipna=True)  # the pre-fix cap: NaN counted as 0
+    scale = (G_MAX_DEFAULT / gross).clip(upper=1.0).where(gross > 0, 1.0)
+    desired = raw_weight.mul(scale, axis=0).where(defined)
+    held = apply_rebalance_control(desired, rebal_freq=1, band_pct=0.20)
+    return held.iloc[-1]
+
+
 # --------------------------------------------------------------- the guard itself
 
 
@@ -156,7 +188,7 @@ def test_the_2026_07_29_renormalisation_reproduces_without_the_hold() -> None:
     described because a hold that guards against nothing would look identical.
     """
     clean = _held_weights(_close_frame(gapped=False))
-    gapped = _held_weights(_close_frame(gapped=True))
+    gapped = _held_weights_before_the_sizing_guard(_close_frame(gapped=True))
 
     # The live book's SPY weight that week was 0.2727; the reproduction lands at
     # 0.2676, which is the same number for the purposes of this test.
@@ -310,12 +342,30 @@ def test_the_held_targets_are_not_renormalised(monkeypatch, no_real_email) -> No
     # The gross the book keeps is the gross it had, not a re-cap of a partial row.
     assert sum(abs(v) for v in STORED_WEIGHTS.values()) == pytest.approx(2.0, abs=0.01)
 
-    # The pipeline's own answer for this session, for contrast: it does renormalise,
-    # and every one of the four names that kept a close is inflated.
-    renormalised = _held_weights(_close_frame(gapped=True))
+    # The pre-fix pipeline's own answer for this session, for contrast: it does
+    # renormalise, and every one of the four names that kept a close is inflated.
+    # (The pipeline itself now refuses the frame -- see the test below.)
+    renormalised = _held_weights_before_the_sizing_guard(_close_frame(gapped=True))
     assert renormalised["SPY"] == pytest.approx(0.3458, abs=0.01)
     for ticker in ("SPY", "EEM", "TLT", "GLD"):
         assert abs(renormalised[ticker]) > abs(STORED_WEIGHTS[ticker]), ticker
+
+
+def test_the_sizing_layer_refuses_the_gapped_frame_outright() -> None:
+    """Defence in depth: the hold is no longer the only thing standing in the way.
+
+    Even with `run_signal` bypassed, `compute_trend` refuses to size the session
+    the four names are missing, and names them. That is what stops the gross cap
+    from renormalising the four names that did have a close.
+    """
+    with pytest.raises(MissingSizingInput) as excinfo:
+        compute_trend(_close_frame(gapped=True), L=120, long_short=True, k_dead_zone=0.5)
+
+    message = str(excinfo.value)
+    assert message.startswith("cannot size with missing values: ")
+    for ticker in GAPPED:
+        assert ticker in message, (ticker, message)
+    assert GAP_SESSION in message, message
 
 
 def test_a_complete_session_still_sizes_normally(monkeypatch, no_real_email) -> None:

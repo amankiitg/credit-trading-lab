@@ -34,13 +34,14 @@ from risk.attribution import (
     rolling_factor_regression,
 )
 from signals.dividends import load_dividend_matrix
-from signals.etf_universe import RAW_DIR, UNIVERSE, load_universe_close
+from signals.etf_universe import RAW_DIR, UNIVERSE
+from tests.conftest import complete_close
 
 
 @pytest.fixture(scope="module")
 def close() -> pd.DataFrame:
     assert (RAW_DIR / "SPY.parquet").exists(), "run signals.etf_universe.ingest() first"
-    return load_universe_close()
+    return complete_close()
 
 
 @pytest.fixture(scope="module")

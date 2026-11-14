@@ -11,7 +11,8 @@ import pytest
 
 from backtest.multi_asset import annualized_turnover, run_multi_asset
 from execution.costs import CostParams
-from signals.etf_universe import UNIVERSE, load_universe_close
+from signals.etf_universe import UNIVERSE
+from tests.conftest import complete_close
 from signals.trend_signal import compute_trend, shift_to_next_day, to_position_matrix
 
 NOTIONAL = 1_000_000.0
@@ -75,7 +76,7 @@ def test_b1_unshifted_weight_is_a_lookahead_bug_demonstration() -> None:
 
 
 def test_b1_no_lookahead_on_real_universe() -> None:
-    close = load_universe_close()
+    close = complete_close()
     tidy = compute_trend(close)
     target = shift_to_next_day(to_position_matrix(tidy))
 
@@ -123,7 +124,7 @@ def test_annualized_turnover_hand_worked_example() -> None:
 
 
 def test_annualized_turnover_real_universe_is_finite_and_positive() -> None:
-    close = load_universe_close()
+    close = complete_close()
     tidy = compute_trend(close)
     target = shift_to_next_day(to_position_matrix(tidy))
     t = annualized_turnover(target)
@@ -132,7 +133,7 @@ def test_annualized_turnover_real_universe_is_finite_and_positive() -> None:
 
 
 def test_target_columns_match_universe() -> None:
-    close = load_universe_close()
+    close = complete_close()
     tidy = compute_trend(close)
     target = shift_to_next_day(to_position_matrix(tidy))
     assert set(target.columns) == set(UNIVERSE)

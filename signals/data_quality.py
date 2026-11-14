@@ -54,6 +54,37 @@ def find_row_gaps(close: pd.DataFrame) -> list[dict]:
     return gaps
 
 
+def missing_latest_close(close: pd.DataFrame) -> list[str]:
+    """Tickers with no usable close on the latest session in the matrix.
+
+    This is the "the session's close is not in yet" case, and it is deliberately
+    separate from `find_row_gaps`. A gap is a hole relative to the universe, which
+    is a data error; a missing latest close is usually a publication lag, which is
+    transient. Both make the signal unbuildable, but they call for different
+    behaviour: a hole is repaired and blocks, a lag is held -- the book keeps the
+    targets it already has rather than being resized from seven eighths of the
+    universe (see `scripts/run_signal.py` step 3d).
+
+    Returns tickers in column order, empty when every column has a finite,
+    positive close on the last row.
+    """
+    if close.empty:
+        return list(close.columns)
+    latest = close.iloc[-1]
+    missing: list[str] = []
+    for ticker in close.columns:
+        value = latest.get(ticker)
+        if pd.isna(value):
+            missing.append(ticker)
+            continue
+        try:
+            if float(value) <= 0.0:
+                missing.append(ticker)
+        except (TypeError, ValueError):
+            missing.append(ticker)
+    return missing
+
+
 def check_signal_ready(
     close: pd.DataFrame,
     sigma: pd.DataFrame,

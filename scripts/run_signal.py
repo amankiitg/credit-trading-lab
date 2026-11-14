@@ -242,15 +242,56 @@ def _run(summary: RunSummary) -> int:
     if _lookup_error:
         summary.extra.append(f"Gap repair: not available ({_lookup_error})")
 
+    # -- 3d. Missing closes on the latest session: HOLD, never resize.
+    #
+    #        On 2026-07-28 four names (EFA, HYG, IEF, LQD) had no close for that
+    #        session while the other four did. The signal was still computed: the
+    #        four became NaN, `apply_rebalance_control` carried their previous
+    #        weights forward, the joint gross cap renormalised the remaining four
+    #        to their uncapped v/sigma (SPY 0.2727 -> 0.3530), and then the final
+    #        re-cap scaled the whole row down. SPY was reported with a weight a
+    #        third larger than its own signal implies, for one session, and
+    #        nothing said so.
+    #
+    #        Sizing a book from a session that only seven eighths of the universe
+    #        has traded is never right: the missing names' weights are stale and
+    #        the present names' have been renormalised to fill the gap. So if any
+    #        ticker lacks the latest close, no target is sized at all. The stored
+    #        target weights are left exactly as they were, which is the same book
+    #        the execution job sized from yesterday, and the email says [HOLD].
+    from signals.data_quality import missing_latest_close
+
+    missing = missing_latest_close(close)
+    if missing:
+        return _hold_previous_targets(
+            summary, missing, as_of_date=as_of_date, today=today
+        )
+
     # -- 4. Run v8.2 signal
     from signals.trend_signal import (
+        MissingSizingInput,
         apply_rebalance_control,
         compute_trend,
         shift_to_next_day,
         to_position_matrix,
     )
     with step("4 v8.2 signal pipeline", logger):
-        tidy = compute_trend(close, L=120, long_short=True, k_dead_zone=0.5)
+        try:
+            tidy = compute_trend(close, L=120, long_short=True, k_dead_zone=0.5)
+        except MissingSizingInput as exc:
+            # The sizing layer's own guard refused the frame: a name that should
+            # have a close has none, so no weight can be computed without
+            # renormalising the names that remain. Same outcome as the 4c gate
+            # below -- nothing written, non-zero exit, the tickers and date
+            # named -- but it stops before a single weight exists.
+            logger.error("REFUSING to write a signal for %s: %s", as_of_date, exc)
+            logger.error(
+                "Repair the raw closes (scripts/backfill_raw_gap.py) and re-run. "
+                "Nothing was written, so the stored signal is unchanged."
+            )
+            summary.data_check = f"BLOCKED: {exc}"
+            summary.mark_skip(f"sizing guard blocked the signal for {as_of_date}")
+            return 1
         desired = to_position_matrix(tidy)
         held = apply_rebalance_control(desired, rebal_freq=1, band_pct=0.20)
         target = shift_to_next_day(held)
@@ -385,6 +426,104 @@ def _run(summary: RunSummary) -> int:
     with step("6 record run", logger):
         record_run("run_signal", today)
 
+    _post_run_bookkeeping(summary, today, as_of_date)
+
+    logger.info("run_signal complete for %s", today)
+    return 0
+
+
+def _hold_previous_targets(
+    summary: RunSummary,
+    missing: list[str],
+    *,
+    as_of_date: str,
+    today: str,
+) -> int:
+    """Do not size anything: keep the stored targets and report a [HOLD].
+
+    The stored `signal_target_weights`, `signal_as_of_date` and
+    `signal_close_prices` are deliberately not written. They already describe the
+    book the execution job is holding, and rewriting them from a session that is
+    missing closes is exactly the failure this branch exists to prevent. No
+    decision row is written either, so the morning job cannot approve a proposal
+    that was never made.
+    """
+    import json
+
+    from dashboard.supabase_client import get_setting
+
+    names = ", ".join(sorted(missing))
+    logger.error(
+        "HOLD: %d ticker(s) have no close for %s: %s. Not sizing new targets; "
+        "the stored target weights stay unchanged.",
+        len(missing), as_of_date, names,
+    )
+
+    held_as_of = get_setting("signal_as_of_date")
+    held_raw = get_setting("signal_target_weights")
+    held: dict = {}
+    if held_raw:
+        try:
+            held = json.loads(held_raw)
+        except ValueError:
+            logger.error("stored signal_target_weights is not valid JSON -- cannot hold")
+            held = {}
+
+    if not held:
+        # Nothing to hold is not a hold. A first run with no closes is a real
+        # failure, and pretending otherwise would leave the book unsized.
+        logger.error(
+            "no stored target weights to hold for %s -- failing the run instead",
+            as_of_date,
+        )
+        summary.failure = (
+            f"no close for {names} on {as_of_date} and no previous target weights "
+            f"to hold"
+        )
+        return 1
+
+    logger.info(
+        "holding targets from %s unchanged: %s",
+        held_as_of or "(unknown date)",
+        {t: round(float(v), 4) for t, v in held.items() if v is not None},
+    )
+
+    summary.mark_hold(missing, held_as_of=str(held_as_of) if held_as_of else None)
+    summary.held_targets = {
+        ticker: round(float(weight), 4)
+        for ticker, weight in held.items()
+        if weight is not None
+    }
+    # The signal in force is the previous one, not the incomplete session.
+    summary.signal_as_of = str(held_as_of) if held_as_of else None
+    summary.data_check = f"HOLD (missing closes: {names})"
+
+    # Bookkeeping still runs: the snapshot refresh and the sleeve decomposition are
+    # reads that never size anything, and skipping them would put a hole in the
+    # dashboard's evening series for every held session.
+    _post_run_bookkeeping(summary, today, as_of_date)
+
+    # The run is deliberately NOT recorded in cron_runs. A held session is often a
+    # publication lag, and leaving it unrecorded is what lets the job be re-run by
+    # hand once the closes land -- the same reason the stale-signal guard in
+    # run_execution leaves it unwritten.
+    logger.warning(
+        "run not recorded in cron_runs: a re-run after the %s closes are published "
+        "will size normally",
+        as_of_date,
+    )
+    return 0
+
+
+def _post_run_bookkeeping(summary: RunSummary, today: str, as_of_date: str) -> None:
+    """Steps 7, 8 and 8b -- reads and writes that can never touch the signal.
+
+    Split out so a held session still refreshes the sizing basis and stores its
+    close series. Both callers have already written (or deliberately not written)
+    their signal by the time this runs.
+    """
+    from execution.job_guard import JobTimeout, step, step_budget
+
     # -- 7. Refresh the cached position snapshot and live_nav from Alpaca.
     #        The proposal in Panel H and the next morning's execution are both sized
     #        from that snapshot, on purpose, so it has to be refreshed after the
@@ -460,9 +599,6 @@ def _run(summary: RunSummary) -> int:
                     "and the order file are unaffected",
                     type(exc).__name__, exc,
                 )
-
-    logger.info("run_signal complete for %s", today)
-    return 0
 
 
 if __name__ == "__main__":

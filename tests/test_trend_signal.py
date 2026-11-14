@@ -20,9 +20,11 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from signals.etf_universe import RAW_DIR, UNIVERSE, load_universe_close
+from signals.etf_universe import RAW_DIR, UNIVERSE
+from tests.conftest import complete_close
 from signals.trend_signal import (
     BAND_PCT_CANDIDATE,
+    MissingSizingInput,
     G_MAX_DEFAULT,
     K_DEAD_ZONE_CANDIDATE,
     L_DEFAULT,
@@ -56,7 +58,11 @@ def _synthetic_close(n: int = 400, seed: int = 0) -> pd.DataFrame:
 @pytest.fixture(scope="module")
 def real_close() -> pd.DataFrame:
     assert (RAW_DIR / "SPY.parquet").exists(), "run signals.etf_universe.ingest() first"
-    return load_universe_close()
+    # The raw parquets end with 42 sessions on which four names have no row, which
+    # compute_trend now refuses (see tests.conftest.complete_close). Construction is
+    # checked on the last session every name has a close; the refused case is
+    # test_a_nan_row_for_a_started_name_is_refused.
+    return complete_close()
 
 
 @pytest.fixture(scope="module")
@@ -158,6 +164,67 @@ def test_point_in_time_membership_real_universe(real_close: pd.DataFrame, real_t
             violations.append((t, gap))
     assert violations == [], f"point-in-time violations (ticker, gap): {violations}"
 
+
+# ---------------------------------------------------------------- the sizing guard
+
+def test_a_nan_row_for_a_started_name_is_refused() -> None:
+    """The 2026-07-28 shape: a NaN where a name should have a close.
+
+    Four of eight names had no close for one session. The old gross cap summed
+    with skipna=True, so the gap left the sum and the four names that did have a
+    close were renormalised upward (SPY 0.2727 -> 0.3530). The row is refused
+    instead, and the tickers are named.
+    """
+    close = _synthetic_close()  # every name starts on row 0, so all are in the universe
+    close.loc[close.index[-1], ["A", "C"]] = np.nan
+
+    with pytest.raises(
+        MissingSizingInput, match=r"cannot size with missing values: A, C"
+    ) as excinfo:
+        compute_trend(close)
+
+    # The date is in the message too, so an operator can go and look at it.
+    assert str(close.index[-1].date()) in str(excinfo.value)
+
+def test_a_nan_inside_a_name_s_warmup_is_refused_once_it_is_in_the_universe() -> None:
+    """A hole after inception is missing data, not an absent name.
+
+    The name has started, so the session is one it should have traded. The
+    first `L` sessions after its first quote are the documented warmup and are
+    out of the universe, which hides the hole for a while (sigma is NaN for
+    W sessions, all inside the warmup). It cannot hide for good: the hole makes
+    trail_ret itself NaN L sessions later, by which point the name is in the
+    universe, so the guard refuses it rather than sizing from a window it
+    cannot measure.
+    """
+    close = _synthetic_close()
+    close.iloc[10, close.columns.get_loc("B")] = np.nan
+
+    with pytest.raises(MissingSizingInput, match=r"cannot size with missing values: B"):
+        compute_trend(close)
+
+def test_a_leading_nan_is_still_out_of_the_universe() -> None:
+    """Staggered inception must keep working exactly as the docstring says.
+
+    A name that has not started is out of the universe and carries no weight;
+    it is not missing data and must not stop the book from being sized.
+    """
+    n = 400
+    idx = pd.bdate_range("2018-01-01", periods=n)
+    rng = np.random.default_rng(3)
+    close = pd.DataFrame(
+        {"EARLY": 100 * np.exp(np.cumsum(rng.normal(0, 0.01, n)))}, index=idx
+    )
+    late = 100 * np.exp(np.cumsum(rng.normal(0, 0.01, n)))
+    late[:200] = np.nan
+    close["LATE"] = late
+
+    tidy = compute_trend(close)  # must not raise
+
+    sub = tidy[tidy["ticker"] == "LATE"]
+    in_universe_from = 200 + L_DEFAULT
+    assert sub["weight"].iloc[:in_universe_from].isna().all()
+    assert sub["weight"].iloc[in_universe_from:].notna().all()
 
 # ---------------------------------------------------------------- E3 / bounds: leverage + per-name cap
 
@@ -622,7 +689,7 @@ def test_hysteresis_masks_to_nan_before_warmup_and_on_gap_days() -> None:
 
 
 def test_hysteresis_no_lookahead_real_universe() -> None:
-    close = load_universe_close()
+    close = complete_close()
     cutoff = close.index[len(close) // 2]
     baseline = compute_trend(close, k_dead_zone=K_DEAD_ZONE_CANDIDATE)
 

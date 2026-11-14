@@ -109,8 +109,13 @@ def test_the_2026_09_24_gap_shape_is_caught() -> None:
 
     The hole is what makes the 63 day rolling vol NaN, which is why the gate
     checks both the row gap and the sigma, not just one of them.
+
+    The sizing layer refuses this frame outright now (`compute_trend` raises
+    `MissingSizingInput` -- defence in depth, see
+    tests/test_trend_signal.py), so the sigma it would have produced is built
+    here directly to keep the gate's own contract under test.
     """
-    from signals.trend_signal import compute_trend
+    from signals.trend_signal import W_DEFAULT, TRADING_DAYS, compute_trend
 
     n = 200
     idx = pd.date_range("2026-01-01", periods=n, freq="B")
@@ -123,8 +128,12 @@ def test_the_2026_09_24_gap_shape_is_caught() -> None:
     # Mimic load_universe_close's outer join with one session missing for five names.
     close.loc[idx[-2], gapped] = np.nan
 
-    tidy = compute_trend(close, L=120, long_short=True, k_dead_zone=0.5)
-    sigma = tidy.pivot(index="date", columns="ticker", values="sigma").sort_index()
+    # Nothing may be sized from this matrix at all.
+    with pytest.raises(ValueError, match="cannot size with missing values"):
+        compute_trend(close, L=120, long_short=True, k_dead_zone=0.5)
+
+    log_ret = np.log(close).diff()
+    sigma = log_ret.rolling(W_DEFAULT, min_periods=W_DEFAULT).std() * np.sqrt(TRADING_DAYS)
 
     # The symptom the live run showed: sigma NaN from the missing session on.
     for t in gapped:

@@ -71,6 +71,9 @@ def _render(monkeypatch, *, sleeve_rows, positions=()):
     monkeypatch.setattr(operational, "fetch_decision_for_date", lambda d: None)
     monkeypatch.setattr(operational, "fetch_last_cron_run", lambda job: None)
     monkeypatch.setattr(operational, "_risk_snapshot", lambda nav, pos: None)
+    # The signal-history block at the foot of the page has its own tests and its
+    # own live-price fetch; this module is about the sleeve block alone.
+    monkeypatch.setattr(operational, "render_signal_history", lambda: None)
     operational._get_last_execution_run.clear()
     operational._get_last_signal_run.clear()
 

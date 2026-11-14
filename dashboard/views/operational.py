@@ -40,6 +40,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 
+from dashboard.signal_history import render_signal_history
 from dashboard.supabase_client import (
     fetch_daily_sleeve_pnl,
     fetch_decision_for_date,
@@ -1889,3 +1890,8 @@ def render(
             st.info("No attribution rows for the latest run.")
     else:
         st.info("No live_attribution rows yet -- they populate after an execution run.")
+
+    # ---------------------------------------------------------------- Signal history
+    # Last block on the page, collapsed: eight small price-vs-trend charts with
+    # the stored book weight, from 120 sessions before the first live session.
+    render_signal_history()

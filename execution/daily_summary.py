@@ -33,6 +33,7 @@ from typing import Callable
 logger = logging.getLogger("daily_summary")
 
 OK = "[OK]"
+HOLD = "[HOLD]"
 SKIP = "[SKIP]"
 FAIL = "[FAIL]"
 
@@ -73,6 +74,13 @@ class RunSummary:
     rejected: list[str] = field(default_factory=list)
     gap_fills: list[str] = field(default_factory=list)
     data_check: str | None = None
+    # The hold: tickers whose latest close was missing, and the date of the target
+    # weights the run deliberately kept. Both are only set by `mark_hold`.
+    missing_closes: list[str] = field(default_factory=list)
+    held_targets_as_of: str | None = None
+    # The weights that stay in force, so the email shows what the book is actually
+    # holding rather than only that it was not resized.
+    held_targets: dict = field(default_factory=dict)
     # The basis refresh: how many position rows were rewritten and at what NAV, or
     # why it failed. A failed refresh is reported in the body and lifts the subject to
     # at least [SKIP], because a stale sizing basis is a real operational problem that
@@ -95,6 +103,22 @@ class RunSummary:
         """Record a deliberate no-op so the subject reads [SKIP] and not [OK]."""
         self.status = SKIP
         self.reason = reason
+
+    def mark_hold(self, tickers: list[str], held_as_of: str | None = None) -> None:
+        """Record a hold: no new targets were sized, the previous ones stay in force.
+
+        Distinct from a skip on purpose. A skip says the job had nothing to do; a
+        hold says the job had something to do and refused to do it from incomplete
+        data, so the book keeps the targets it already has. The subject names the
+        tickers because that is what an operator needs to act on.
+        """
+        self.status = HOLD
+        self.missing_closes = sorted(tickers)
+        self.held_targets_as_of = held_as_of
+        self.reason = (
+            "held the previous targets: no close for "
+            + ", ".join(self.missing_closes)
+        )
 
     def record_basis_refresh(self, report: dict) -> None:
         """Record the outcome of execution.snapshot.refresh_snapshot.
@@ -241,7 +265,7 @@ class RunSummary:
 
 # Severity order for the subject line. A failed basis refresh lifts a clean run to
 # [SKIP], but must never soften a real failure, so the code only ever moves up.
-_SEVERITY: dict[str, int] = {OK: 0, SKIP: 1, FAIL: 2}
+_SEVERITY: dict[str, int] = {OK: 0, HOLD: 1, SKIP: 2, FAIL: 3}
 
 
 def _base_status(summary: RunSummary) -> str:
@@ -269,13 +293,27 @@ def status_for(summary: RunSummary) -> str:
     nobody reads. Escalation is one-way: a [FAIL] run stays [FAIL].
     """
     status = _base_status(summary)
+    if status == HOLD:
+        # A deliberate hold outranks a bookkeeping problem: the reason the book was
+        # not resized is the fact the operator has to see, and the failed refresh is
+        # stated in its own body line.
+        return HOLD
     if summary.basis_failed and _SEVERITY[status] < _SEVERITY[SKIP]:
         return SKIP
     return status
 
 
 def subject_for(summary: RunSummary) -> str:
-    return f"{status_for(summary)} {summary.job} {summary.run_date}"
+    """The inbox is the alert: the status, the job and the date -- or the hold.
+
+    A hold names the tickers instead of the job, because "three names had no close"
+    is the thing to act on and the job/date are already in the body.
+    """
+    status = status_for(summary)
+    if status == HOLD:
+        tickers = ", ".join(summary.missing_closes)
+        return f"{HOLD} missing closes: {tickers}" if tickers else f"{HOLD} {summary.job}"
+    return f"{status} {summary.job} {summary.run_date}"
 
 
 def body_for(summary: RunSummary, last_step: str | None = None) -> str:
@@ -293,6 +331,25 @@ def body_for(summary: RunSummary, last_step: str | None = None) -> str:
         lines.append(f"Signal as_of_date: {summary.signal_as_of}")
     if summary.data_check:
         lines.append(f"Data check: {summary.data_check}")
+    if summary.status == HOLD or summary.held_targets_as_of:
+        held = (
+            f"Targets held unchanged from {summary.held_targets_as_of}"
+            if summary.held_targets_as_of
+            else "Targets held unchanged"
+        )
+        lines.append(
+            held + "; no new sizes were computed, and no weights were "
+            "renormalised across the names that did have a close."
+        )
+    if summary.held_targets:
+        lines.append(
+            "Held targets: "
+            + ", ".join(
+                f"{ticker} {float(weight):+.4f}"
+                for ticker, weight in sorted(summary.held_targets.items())
+                if weight is not None
+            )
+        )
     if summary.gap_fills:
         lines.append("Gap fills: " + "; ".join(summary.gap_fills))
 

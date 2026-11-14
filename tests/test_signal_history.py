@@ -155,23 +155,28 @@ class TestFigure:
         fig = signal_history.ticker_figure("SPY", history, window)
 
         by_name = {trace.name: trace for trace in fig.data}
-        assert set(by_name) == {"close", "120-session lookback", "position weight"}
+        base = signal_history.TREND_BASE_LEGEND
+        assert set(by_name) == {"close", base, "position weight", "trend score"}
         assert by_name["close"].line.color == "#1d4ed8"
         assert by_name["close"].line.dash in (None, "solid")
-        assert by_name["120-session lookback"].line.color == "#1d4ed8"
-        assert by_name["120-session lookback"].line.dash == "dash"
+        assert by_name[base].line.color == "#1d4ed8"
+        assert by_name[base].line.dash == "dash"
         assert by_name["position weight"].line.color == signal_history.WEIGHT_COLOR
         assert by_name["position weight"].line.shape == "hv"
 
-        # The weight is on the secondary axis.
-        assert fig.data[-1].yaxis == "y2"
+        # The weight is on the top panel's secondary axis; the score is below it.
+        assert by_name["position weight"].yaxis == "y2"
+        assert by_name["trend score"].yaxis == "y3"
         assert fig.layout.yaxis2.zeroline is True
         assert fig.layout.yaxis2.tickformat == ".0%"
+        assert fig.layout.yaxis3.zeroline is True
+        assert fig.layout.yaxis3.tickformat == ".0%"
 
         assert fig.layout.hovermode == "x unified"
         assert fig.layout.xaxis.fixedrange is True
         assert fig.layout.yaxis.fixedrange is True
         assert fig.layout.yaxis2.fixedrange is True
+        assert fig.layout.yaxis3.fixedrange is True
         assert fig.layout.xaxis.range == (window[0], window[-1])
 
     def test_hover_names_date_close_lookback_and_weight(self) -> None:
@@ -186,10 +191,69 @@ class TestFigure:
 
         templates = {trace.name: (trace.hovertemplate or "") for trace in fig.data}
         assert "close" in templates["close"]
-        assert "lookback close" in templates["120-session lookback"]
+        assert "close 120 sessions ago (signal lookback base, NOT a moving average)" in (
+            templates[signal_history.TREND_BASE_LEGEND]
+        )
         assert "weight" in templates["position weight"]
-        # Unified hover supplies the date header for all three traces.
+        assert "trend score" in templates["trend score"]
+        # Unified hover supplies the date header for all four traces.
         assert fig.layout.hovermode == "x unified"
+
+    def test_trend_score_is_the_close_over_the_lookback_minus_one(self) -> None:
+        closes = _closes()
+        weights = _weights("2026-05-04", "2026-06-30")
+        first_live = weights["trade_date"].min()
+        window = signal_history.history_window(closes, first_live)
+        history = signal_history.build_ticker_history(
+            closes, weights, "SPY", window, first_live
+        )
+
+        full = closes["SPY"]
+        for session in (window[0], window[60], window[-1]):
+            pos = full.index.get_loc(session)
+            expected = full.iloc[pos] / full.iloc[pos - 120] - 1.0
+            assert history["trend_score"].loc[session] == pytest.approx(expected)
+
+    def test_dead_zone_uses_each_tickers_own_vol(self) -> None:
+        index = pd.bdate_range("2025-01-01", periods=200)
+        calm = pd.Series(100.0, index=index)
+        wild = pd.Series(100.0, index=index)
+        calm.iloc[1::2] = 100.01
+        wild.iloc[1::2] = 110.0
+        closes = pd.DataFrame({"SPY": calm, "EFA": wild})
+
+        spy_vol = signal_history.realised_vol(closes, "SPY")
+        efa_vol = signal_history.realised_vol(closes, "EFA")
+        assert spy_vol is not None and spy_vol > 0
+        assert efa_vol is not None and efa_vol > 1.0
+
+        spy_band = signal_history.dead_zone_half_width(spy_vol)
+        efa_band = signal_history.dead_zone_half_width(efa_vol)
+        assert spy_band is not None and spy_band > 0
+        assert efa_band == pytest.approx(
+            0.5 * efa_vol * (120 / 252) ** 0.5
+        )
+        assert efa_band > spy_band
+
+    def test_the_lower_panel_draws_the_dead_zone_and_names_its_width(self) -> None:
+        closes = _closes()
+        weights = _weights("2026-05-04", "2026-06-30")
+        first_live = weights["trade_date"].min()
+        window = signal_history.history_window(closes, first_live)
+        history = signal_history.build_ticker_history(
+            closes, weights, "GLD", window, first_live
+        )
+        band = history["dead_zone"]
+        assert band is not None and band > 0
+
+        fig = signal_history.ticker_figure("GLD", history, window)
+        rects = [s for s in fig.layout.shapes if s.type == "rect"]
+        assert len(rects) == 1
+        assert rects[0].y0 == pytest.approx(-band)
+        assert rects[0].y1 == pytest.approx(band)
+        assert fig.layout.yaxis3.title.text == "trend score"
+        notes = " ".join(str(a.text) for a in fig.layout.annotations)
+        assert f"dead zone ±{band:.1%}" in notes
 
     @pytest.mark.parametrize(
         "ticker,colour",

@@ -70,6 +70,7 @@ def _render(
     pnl_rows=(PNL_ROW,),
     positions=(),
     proposed_rows=(),
+    risk=None,
 ):
     """Render the real app with every read stubbed."""
     monkeypatch.delenv("GOOGLE_CLIENT_ID", raising=False)
@@ -93,7 +94,7 @@ def _render(
     )
     monkeypatch.setattr(operational, "_get_last_signal_run", lambda: SIGNAL_RUN)
     monkeypatch.setattr(operational, "_get_last_execution_run", lambda: EXECUTION_RUN)
-    monkeypatch.setattr(operational, "_risk_snapshot", lambda nav, pos: None)
+    monkeypatch.setattr(operational, "_risk_snapshot", lambda nav, pos: risk)
 
     at = AppTest.from_file(str(APP), default_timeout=600)
     at.run()
@@ -109,14 +110,14 @@ def _metrics(at) -> dict:
 def test_the_pnl_card_reads_the_evening_signals_session(monkeypatch) -> None:
     metrics = _metrics(_render(monkeypatch))
 
-    assert metrics["1-day P&L"].value == "$+1,605.70"
-    assert metrics["1-day P&L"].delta == "+1.59% · 2026-11-12 22:31 UTC"
+    assert metrics["Daily P&L (close-to-close)"].value == "$+1,605.70"
+    assert metrics["Daily P&L (close-to-close)"].delta == "+1.59% · 2026-11-12 22:31 UTC"
 
 
 def test_the_pnl_card_is_not_the_morning_execution_row(monkeypatch) -> None:
     metrics = _metrics(_render(monkeypatch))
 
-    assert "1,308.15" not in metrics["1-day P&L"].value
+    assert "1,308.15" not in metrics["Daily P&L (close-to-close)"].value
 
 
 def test_both_cards_carry_the_same_run_timestamp(monkeypatch) -> None:
@@ -125,7 +126,7 @@ def test_both_cards_carry_the_same_run_timestamp(monkeypatch) -> None:
     assert metrics["NAV"].delta == "evening signal 2026-11-12 22:31 UTC"
     # The card is narrow enough to ellipsise a delta, so the P&L label carries
     # the timestamp itself; the two cards still name the same run minute.
-    assert metrics["1-day P&L"].delta.endswith("2026-11-12 22:31 UTC")
+    assert metrics["Daily P&L (close-to-close)"].delta.endswith("2026-11-12 22:31 UTC")
 
 
 def test_the_caption_names_the_pnl_run_and_session(monkeypatch) -> None:
@@ -133,7 +134,8 @@ def test_the_caption_names_the_pnl_run_and_session(monkeypatch) -> None:
     captions = " ".join(str(c.value) for c in at.caption)
 
     assert (
-        "1-day P&L is the evening signal's book P&L for the 2026-11-12 session"
+        "Official daily P&L is the evening signal's close-to-close book "
+        "P&L for the 2026-11-12 session"
         in captions
     )
 
@@ -141,8 +143,8 @@ def test_the_caption_names_the_pnl_run_and_session(monkeypatch) -> None:
 def test_pnl_falls_back_to_the_morning_row_when_no_session_is_stored(monkeypatch) -> None:
     metrics = _metrics(_render(monkeypatch, sleeve_rows=[]))
 
-    assert metrics["1-day P&L"].value == "$+1,308.15"
-    assert metrics["1-day P&L"].delta == "+1.30% · 2026-11-12 15:32 UTC"
+    assert metrics["Daily P&L (close-to-close)"].value == "$+1,308.15"
+    assert metrics["Daily P&L (close-to-close)"].delta == "+1.30% · 2026-11-12 15:32 UTC"
 
 
 def test_the_flags_card_lists_each_flag_as_a_sentence(monkeypatch) -> None:
@@ -187,3 +189,32 @@ def test_every_flag_is_kept_in_full_by_the_helper() -> None:
 
 def test_no_flags_leaves_the_card_clear() -> None:
     assert operational._active_flags([], None, None, None, []) == []
+
+
+def test_the_concentration_flag_carries_the_monitor_only_note(monkeypatch) -> None:
+    """The risk-share flag is a monitor; sizing does not cap that share."""
+    import pandas as pd
+
+    risk = {
+        "risk_df": pd.DataFrame(
+            {"pctr": [0.42, 0.31, 0.19, 0.08]},
+            index=["GLD", "SPY", "TLT", "HYG"],
+        ),
+        "sleeve_tbl": pd.DataFrame(
+            {"pctr": [0.42, 0.31, 0.19, 0.08]},
+            index=["commodity", "equity", "rates", "credit"],
+        ),
+        "port_vol": 0.089,
+    }
+
+    at = _render(monkeypatch, risk=risk)
+    text = " ".join(str(c.value) for c in at.caption)
+
+    assert "**Concentration risk**" in " ".join(
+        str(e.value) for e in at.get("warning")
+    )
+    assert operational.MONITOR_ONLY_NOTE in text
+    assert (
+        operational.MONITOR_ONLY_NOTE
+        == "Monitor only: sizing is per-name vol and does not cap risk share."
+    )

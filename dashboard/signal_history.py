@@ -4,13 +4,16 @@ The last block on the Trade Approval page. One small chart per ticker answers a
 question the rest of the page cannot: is the position in this name aligned with the
 price trend the signal measures, and when did the book's weight move?
 
-Each chart has two axes:
+Each chart has two panels:
 
-  - left  -- the daily close (solid, sleeve colour) and the close from
+  - top   -- the daily close (solid, sleeve colour), the close from
              ``TREND_LOOKBACK_SESSIONS`` trading sessions earlier (dashed, same
-             colour). Where the two cross is where the 120-session trend flips.
-  - right -- the book's stored position weight in that ticker (grey step line)
-             with a zero line, so a short is visibly below zero.
+             colour), and on the right axis the book's stored position weight
+             (grey step line) with a zero line, so a short is visibly below zero.
+  - below -- the trend score, ``close / close_L - 1``, with a zero line and the
+             signal's dead zone shaded: +/- 0.5 x that ticker's own realised vol
+             x sqrt(L / 252). A weight flip only happens once the score leaves
+             the band, so the two panels can be read against the same sessions.
 
 The window starts ``PRE_TRADING_SESSIONS`` sessions before the first live trading
 session, so the lookback base is already meaningful on the day the book started.
@@ -27,6 +30,7 @@ the book held none, and a session with no stored snapshot holds the previous wei
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -36,6 +40,24 @@ from signals.etf_universe import ASSET_CLASS, UNIVERSE
 
 # The trend base the signal compares today's close against.
 TREND_LOOKBACK_SESSIONS: int = 120
+
+# The trend signal's vol estimate: 63-session realised vol, annualised, and the
+# pre-registered dead-zone multiple (signals/trend_signal.py). The band on the
+# lower panel must use the same units as the signal it is explaining.
+VOL_WINDOW_SESSIONS: int = 63
+TRADING_DAYS: int = 252
+DEAD_ZONE_MULTIPLE: float = 0.5
+
+# The dashed line is a shifted close, not an average. Say so everywhere it is
+# labelled: the distinction is the whole point of the chart.
+TREND_BASE_LABEL: str = (
+    "close 120 sessions ago (signal lookback base, NOT a moving average)"
+)
+# Same label with a line break, so a 230px-wide chart legend can show all of it
+# instead of clipping the end. Hover and the section legend use the flat string.
+TREND_BASE_LEGEND: str = (
+    "close 120 sessions ago <br>(signal lookback base, NOT a moving average)"
+)
 
 # Sessions of history to show *before* the first live session. This is the same
 # number as the trend lookback: it puts the lookback base on screen from the first
@@ -189,15 +211,19 @@ def build_ticker_history(
     sessions: pd.DatetimeIndex,
     first_live_session: pd.Timestamp | None,
 ) -> dict:
-    """Series for one chart: close, 120-session lookback close, weight, and gaps."""
+    """Series for one chart: close, lookback close, trend score, band, weight."""
     if ticker not in closes.columns:
         empty = pd.Series(index=sessions, dtype=float)
         return {
             "price": empty,
             "lookback": empty.copy(),
+            "trend_score": empty.copy(),
             "weight": None,
+            "vol": None,
+            "dead_zone": None,
             "has_price": False,
             "has_lookback": False,
+            "has_trend_score": False,
             "has_weight": False,
         }
 
@@ -205,16 +231,54 @@ def build_ticker_history(
     price = full.reindex(sessions)
     # shift() counts rows in the fetch's session index, which is trading days.
     lookback = full.shift(TREND_LOOKBACK_SESSIONS).reindex(sessions)
+    trend_score = price / lookback - 1.0
     weight = weight_series(weights, ticker, sessions, first_live_session)
+    vol = realised_vol(closes, ticker)
+    band = dead_zone_half_width(vol)
 
     return {
         "price": price,
         "lookback": lookback,
+        "trend_score": trend_score,
         "weight": weight,
+        "vol": vol,
+        "dead_zone": band,
         "has_price": bool(price.notna().sum() >= 2),
         "has_lookback": bool(lookback.notna().any()),
+        "has_trend_score": bool(trend_score.notna().sum() >= 2),
         "has_weight": weight is not None,
     }
+
+
+def realised_vol(closes: pd.DataFrame, ticker: str) -> float | None:
+    """The ticker's own annualised 63-session realised vol, at the last session.
+
+    Same estimate the trend signal uses for position sizing and for the dead
+    zone: std(log returns, window=63) * sqrt(252). This is a fixed reference
+    for the chart's shaded band: one vol per ticker, not a cross-sectional
+    average and not a rolling ribbon.
+    """
+    if ticker not in closes.columns:
+        return None
+    series = closes[ticker].astype(float).dropna()
+    if len(series) < VOL_WINDOW_SESSIONS + 1:
+        return None
+    log_ret = np.log(series).diff()
+    vol = log_ret.rolling(
+        VOL_WINDOW_SESSIONS, min_periods=VOL_WINDOW_SESSIONS
+    ).std().iloc[-1]
+    if not np.isfinite(vol) or vol <= 0:
+        return None
+    return float(vol * np.sqrt(TRADING_DAYS))
+
+
+def dead_zone_half_width(vol: float | None) -> float | None:
+    """Half-width of the signal's dead zone: k * sigma * sqrt(L / 252)."""
+    if vol is None or not np.isfinite(vol) or vol <= 0:
+        return None
+    return float(
+        DEAD_ZONE_MULTIPLE * vol * np.sqrt(TREND_LOOKBACK_SESSIONS / TRADING_DAYS)
+    )
 
 
 def _price_range(price: pd.Series, lookback: pd.Series) -> list[float]:
@@ -242,11 +306,36 @@ def ticker_figure(
     history: dict,
     sessions: pd.DatetimeIndex,
 ) -> go.Figure:
-    """One small dual-axis chart. Fixed ranges, unified hover, no scroll zoom."""
+    """One ticker: price and weight on top, trend score and dead zone below."""
     from dashboard.views.operational import NEUTRAL_COLOR
 
     colour = _sleeve_colour(ticker)
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.11,
+        row_heights=[0.62, 0.38],
+        specs=[[{"secondary_y": True}], [{"secondary_y": False}]],
+    )
+
+    band = history.get("dead_zone")
+    if band is not None:
+        # Shaded first so both lines stay on top of it. The band is a visual
+        # scale for the score: crossing it, not merely crossing zero, is what
+        # moves the book's weight under the signal's hysteresis rule.
+        fig.add_shape(
+            type="rect",
+            xref="x2 domain",
+            yref="y3",
+            x0=0,
+            x1=1,
+            y0=-band,
+            y1=band,
+            fillcolor="rgba(138,138,138,0.16)",
+            line_width=0,
+            layer="below",
+        )
 
     if history["has_price"]:
         fig.add_trace(
@@ -266,9 +355,9 @@ def ticker_figure(
                 x=sessions,
                 y=history["lookback"].values,
                 mode="lines",
-                name="120-session lookback",
+                name=TREND_BASE_LEGEND,
                 line=dict(color=colour, width=1.5, dash="dash"),
-                hovertemplate="lookback close %{y:,.2f}<extra></extra>",
+                hovertemplate=TREND_BASE_LABEL + " %{y:,.2f}<extra></extra>",
             ),
             secondary_y=False,
         )
@@ -284,13 +373,26 @@ def ticker_figure(
             ),
             secondary_y=True,
         )
+    if history["has_trend_score"]:
+        fig.add_trace(
+            go.Scatter(
+                x=sessions,
+                y=history["trend_score"].values,
+                mode="lines",
+                name="trend score",
+                line=dict(color=colour, width=1.8),
+                hovertemplate="trend score %{y:.2%}<extra></extra>",
+            ),
+            row=2,
+            col=1,
+        )
 
     fig.update_layout(
         title=dict(text=f"{ticker} · {ASSET_CLASS.get(ticker, '')}", font=dict(size=13)),
-        height=300,
+        height=460,
         margin=dict(l=8, r=8, t=36, b=8),
         hovermode="x unified",
-        showlegend=False,
+        showlegend=True,
         bargap=0.1,
     )
     fig.update_xaxes(
@@ -303,8 +405,11 @@ def ticker_figure(
         secondary_y=False,
         fixedrange=True,
         range=_price_range(history["price"], history["lookback"]),
+        automargin=True,
         showgrid=True,
         gridcolor="rgba(0,0,0,0.06)",
+        row=1,
+        col=1,
     )
     fig.update_yaxes(
         title_text="weight",
@@ -316,7 +421,36 @@ def ticker_figure(
         zerolinecolor=NEUTRAL_COLOR,
         zerolinewidth=1,
         showgrid=False,
+        automargin=True,
+        row=1,
+        col=1,
     )
+    fig.update_yaxes(
+        title_text="trend score",
+        fixedrange=True,
+        range=_trend_range(history["trend_score"], band),
+        tickformat=".0%",
+        zeroline=True,
+        zerolinecolor=NEUTRAL_COLOR,
+        zerolinewidth=1,
+        showgrid=True,
+        gridcolor="rgba(0,0,0,0.06)",
+        automargin=True,
+        row=2,
+        col=1,
+    )
+    if band is not None:
+        fig.add_annotation(
+            text=f"dead zone ±{band:.1%}",
+            xref="x2 domain",
+            yref="y3 domain",
+            x=0.99,
+            y=1.06,
+            xanchor="right",
+            yanchor="bottom",
+            showarrow=False,
+            font=dict(size=9, color=NEUTRAL_COLOR),
+        )
 
     notes: list[str] = []
     if not history["has_price"]:
@@ -339,15 +473,39 @@ def ticker_figure(
     return fig
 
 
+def _trend_range(score: pd.Series, band: float | None) -> list[float]:
+    """Y-range for the lower panel, always including zero and the dead zone."""
+    values = score.dropna()
+    lows = []
+    highs = []
+    if not values.empty:
+        lows.append(float(values.min()))
+        highs.append(float(values.max()))
+    if band is not None:
+        lows.append(-band)
+        highs.append(band)
+    if not lows:
+        return [-0.1, 0.1]
+    low = min(lows)
+    high = max(highs)
+    pad = (high - low) * 0.08 if high > low else max(abs(high) * 0.1, 0.01)
+    return [low - pad, high + pad]
+
+
 def _legend_slot(container) -> None:
-    """The ninth grid slot: what the three lines mean."""
+    """The ninth grid slot: what the lines and the band mean."""
     container.markdown(
         "**How to read these charts**\n\n"
         "- **Solid line** — the daily close, in the sleeve colour.\n"
-        "- **Dashed line** — the close 120 trading sessions earlier, the trend base. "
-        "Where it crosses the solid line is where the trend flips.\n"
+        "- **Dashed line** — close 120 sessions ago (signal lookback base, NOT a "
+        "moving average). Where it crosses the solid line is where the trend flips.\n"
         "- **Grey step line** — the book's position weight in that ticker, on the "
         "right axis. The zero line separates long from short.\n\n"
+        "- **Trend score (lower panel)** — close / close 120 sessions ago − 1, "
+        "on the same sessions. The shaded band is the dead zone, ±0.5 × that "
+        "ticker's own 63-session realised vol × √(120/252); the signal only flips "
+        "when the score leaves the band, so watch the band edges against the "
+        "weight steps above.\n\n"
         "Colour is the asset class: equity blue, rates green, credit violet, "
         "commodity amber."
     )
@@ -391,7 +549,13 @@ def render_grid(closes: pd.DataFrame, weights: pd.DataFrame) -> None:
         for column, ticker in zip(columns, tickers):
             history = build_ticker_history(closes, weights, ticker, window, first_live)
             with column:
-                _plot(ticker_figure(ticker, history, window), height=300, top=36)
+                _plot(
+                    ticker_figure(ticker, history, window),
+                    height=460,
+                    top=36,
+                    legend_below=True,
+                    legend_font_size=8,
+                )
         # The ninth cell shares the last row so the grid stays 3x3.
         if row_index == len(rows) - 1:
             for column in columns[len(tickers):]:
@@ -404,9 +568,11 @@ def render_signal_history() -> None:
     with st.expander("Signal history by ticker", expanded=False):
         st.caption(
             "Each ticker's close against its 120-session trend base, with the book's "
-            "position weight over the same window. Closes are the live source the risk "
-            "panel reads; weights are the stored daily positions. Nothing is "
-            "zero-filled: a ticker without history says so on its own chart."
+            "position weight over the same window. The lower panel is the trend score "
+            "with the signal's dead zone shaded at each ticker's own 63-session "
+            "realised vol. Closes are the live source the risk panel reads; weights "
+            "are the stored daily positions. Nothing is zero-filled: a ticker without "
+            "history says so on its own chart."
         )
 
         try:

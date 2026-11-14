@@ -817,6 +817,7 @@ def _plot(
     height: int = 320,
     legend_below: bool = False,
     top: int = 40,
+    legend_font_size: int | None = None,
 ) -> None:
     # A figure with subplot titles needs more headroom, or Plotly draws the main
     # title into the first subplot's title.
@@ -825,6 +826,8 @@ def _plot(
     if legend_below:
         legend = dict(orientation="h", yanchor="top", y=-0.18, xanchor="left", x=0)
         margin["b"] = 80
+    if legend_font_size is not None:
+        legend["font"] = {"size": legend_font_size}
     # Fixed axes: the wheel never zooms and a drag never pans, whatever the page
     # does around the chart. Pair this with scrollZoom=False in PLOTLY_CONFIG.
     fig.update_xaxes(fixedrange=True)

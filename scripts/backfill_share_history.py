@@ -28,7 +28,7 @@ from __future__ import annotations
 import argparse
 import sys
 from collections import defaultdict
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -126,17 +126,28 @@ def main(argv: list[str] | None = None) -> int:
     if client is None:
         raise SystemExit("no Alpaca client: ALPACA_PAPER_* must be set")
 
+    # The window starts BEFORE the first snapshot, not at it. The first stored day is
+    # already a position that trades produced, so a running sum starting there would be
+    # zero on a day the account was not flat -- the earlier MCP rebuild of the same
+    # ledger showed fills on 2026-06-17, the session before the first snapshot. And it
+    # ends a day after today, because the activity endpoint's ``until`` is exclusive:
+    # asking for today returns the session up to midnight UTC and silently drops
+    # everything after 20:00 ET.
     first = min(str(row["trade_date"]) for row in stored)
-    fills = fetch_all_fills(client, first, datetime.now(SESSION_TZ).strftime("%Y-%m-%d"))
+    window_start = (date.fromisoformat(first) - timedelta(days=90)).isoformat()
+    window_end = (
+        datetime.now(SESSION_TZ).date() + timedelta(days=1)
+    ).isoformat()
+    fills = fetch_all_fills(client, window_start, window_end)
     if not fills:
         raise SystemExit("the fill ledger returned nothing; refusing to write a flat book")
 
     first_fill = min(session_of(f) for f in fills)
-    last_fill = max(session_of(f) for f in fills)
     calendars = sorted(
         {str(row["trade_date"]) for row in stored} | {session_of(f) for f in fills}
     )
-    sessions = [s for s in calendars if first_fill <= s <= last_fill]
+    sessions = [s for s in calendars if s >= first_fill]
+    last_fill = max(session_of(f) for f in fills)
     levels = build_levels(fills, sessions)
 
     # Cross-check against the snapshots: the series must describe the same book.
@@ -157,10 +168,16 @@ def main(argv: list[str] | None = None) -> int:
     if worst > 0.01:
         raise SystemExit("cross-check failed: refusing to write a series that disagrees")
 
+    # Every universe ticker on every session: the book is the universe, and a name it
+    # does not hold is 0 shares, not an unknown. (A SESSION with no row is still
+    # unknown -- that is a different statement, and the chart draws it as a gap.)
+    from signals.etf_universe import UNIVERSE
+
     rows = [
-        {"session_date": session, "ticker": ticker, "shares": shares, "source": args.source}
+        {"session_date": session, "ticker": ticker,
+         "shares": levels[session].get(ticker, 0.0), "source": args.source}
         for session in sessions
-        for ticker, shares in levels[session].items()
+        for ticker in UNIVERSE
     ]
     print(f"{len(rows)} row(s) across {len(sessions)} session(s) and "
           f"{len({r['ticker'] for r in rows})} ticker(s)")

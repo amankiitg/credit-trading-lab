@@ -74,6 +74,14 @@ WEIGHT_TTL_SECS: int = 600
 
 WEIGHT_COLOR: str = "#8a8a8a"
 
+# The first session ``public.positions`` carries a shares column for (measured: 288
+# cells from this date). Before it, the only record of how many shares the book held is
+# the fill rebuild in ``share_history``; from it onward the snapshot is the live source,
+# written every morning by the execution job and every evening by the snapshot refresh.
+# So the chart reads BOTH and switches at this date, which is what keeps it updating
+# after the rebuild without inventing numbers before it.
+SHARE_SNAPSHOT_FROM: pd.Timestamp = pd.Timestamp("2026-09-28")
+
 # The share-count line sits on the lower panel's right axis. It has to be legible
 # against the sleeve-coloured score AND against the band, so it is a darker neutral
 # than the weight line rather than a second grey of the same value.
@@ -274,38 +282,59 @@ def weight_series(
 
 def shares_series(
     share_history: pd.DataFrame,
+    positions: pd.DataFrame | None,
     ticker: str,
     sessions: pd.DatetimeIndex,
 ) -> pd.Series | None:
-    """The book's SHARE COUNT in ``ticker``, as a daily series with GAPS.
+    """The book's SHARE COUNT in ``ticker``, two sources joined at one date, with GAPS.
 
-    Deliberately NOT the weight's step rule. The weight is a snapshot: a session with
-    no snapshot holds the previous weight, and a snapshot without the ticker means it
-    was not held. A daily share history is a measurement per session, so a session it
-    does not cover is unknown -- the line breaks there instead of inventing a carry
-    forward or a zero. Before 2026-06-18 the account held nothing and the series simply
-    has no rows; after the last stored session it has none either.
+    Before ``SHARE_SNAPSHOT_FROM`` (2026-09-28): ``share_history``, the end-of-day series
+    rebuilt from the broker's fills. ``positions`` has no share column that far back, so
+    without this the line simply stopped -- which is the bug this whole change started
+    from.
 
-    None when there is no data for this ticker at all, which omits the axis rather
-    than drawing one flat line at zero.
+    From that date on: ``positions.shares``, the live snapshot written every morning by
+    the execution job and every evening by the snapshot refresh. The rebuild stops at
+    the day it was run, so this half is what keeps the chart current tomorrow and after
+    -- and on the 288 cells where both exist they agree to 0.000000, so the switch is
+    invisible in the line.
+
+    Deliberately NOT the weight's step rule: neither source is carried forward, and
+    neither is zero-filled. A session absent from both is unknown -- the line breaks
+    there -- and the chart says "no position data". None when the ticker has nothing on
+    either side, which omits the axis rather than drawing a flat zero.
     """
-    if share_history is None or share_history.empty or sessions.empty:
-        return None
-    if "shares" not in share_history.columns:
+    if sessions.empty:
         return None
 
-    rows = share_history[share_history["ticker"] == ticker]
-    if rows.empty or rows["shares"].notna().sum() == 0:
-        return None
+    history = pd.Series(index=sessions, dtype=float)
+    if share_history is not None and not share_history.empty and "shares" in share_history.columns:
+        rows = share_history[share_history["ticker"] == ticker]
+        if not rows.empty:
+            history = (
+                rows.dropna(subset=["shares"])
+                .set_index("session_date")["shares"]
+                .reindex(sessions)
+            )
 
-    series = (
-        rows.dropna(subset=["shares"])
-        .set_index("session_date")["shares"]
-        .reindex(sessions)
-    )
-    if series.notna().sum() == 0:
+    held = pd.Series(index=sessions, dtype=float)
+    if positions is not None and not positions.empty and "shares" in positions.columns:
+        rows = positions[positions["ticker"] == ticker]
+        if not rows.empty:
+            # No fill, no carry: a session with no snapshot did not measure anything.
+            held = (
+                rows.dropna(subset=["shares"])
+                .set_index("trade_date")["shares"]
+                .reindex(sessions)
+            )
+
+    after = sessions >= SHARE_SNAPSHOT_FROM
+    combined = history.copy()
+    combined[after] = held[after].combine_first(history[after])
+
+    if combined.notna().sum() == 0:
         return None
-    return series.astype(float)
+    return combined.astype(float)
 
 
 def build_ticker_history(
@@ -341,7 +370,7 @@ def build_ticker_history(
     lookback = full.shift(TREND_LOOKBACK_SESSIONS).reindex(sessions)
     trend_score = price / lookback - 1.0
     weight = weight_series(weights, ticker, sessions, first_live_session)
-    shares = shares_series(share_history, ticker, sessions) if share_history is not None else None
+    shares = shares_series(share_history, weights, ticker, sessions)
     vol = realised_vol(closes, ticker)
     band = dead_zone_half_width(vol)
 

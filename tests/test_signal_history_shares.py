@@ -39,7 +39,7 @@ def test_a_covered_session_is_the_measured_value() -> None:
     sessions = pd.bdate_range("2026-01-05", periods=5)
     frame = _share_history(sessions, [100.0, 120.0, 120.0, 90.0, 90.0])
 
-    series = signal_history.shares_series(frame, "SPY", sessions)
+    series = signal_history.shares_series(frame, None, "SPY", sessions)
 
     assert series.tolist() == [100.0, 120.0, 120.0, 90.0, 90.0]
 
@@ -50,7 +50,7 @@ def test_a_session_with_no_row_is_a_gap_not_a_carry_forward_and_not_zero() -> No
         [sessions[0], sessions[1], sessions[3]], [100.0, 120.0, 90.0]
     )
 
-    series = signal_history.shares_series(frame, "SPY", sessions)
+    series = signal_history.shares_series(frame, None, "SPY", sessions)
 
     assert series.loc[sessions[0]] == pytest.approx(100.0)
     assert np.isnan(series.loc[sessions[2]]), "no row is unknown, not the previous level"
@@ -61,7 +61,7 @@ def test_dates_before_the_series_starts_are_gaps_too() -> None:
     sessions = pd.bdate_range("2026-01-05", periods=5)
     frame = _share_history([sessions[3], sessions[4]], [50.0, 50.0])
 
-    series = signal_history.shares_series(frame, "SPY", sessions)
+    series = signal_history.shares_series(frame, None, "SPY", sessions)
 
     assert series.loc[sessions[:3]].isna().all(), (
         "the book had no position data before this point, and 0 would say it held nothing"
@@ -73,9 +73,9 @@ def test_a_ticker_absent_from_the_history_omits_the_axis() -> None:
     sessions = pd.bdate_range("2026-01-05", periods=4)
     frame = _share_history(sessions, [10.0, 10.0, 10.0, 10.0], ticker="TLT")
 
-    assert signal_history.shares_series(frame, "SPY", sessions) is None
+    assert signal_history.shares_series(frame, None, "SPY", sessions) is None
     assert signal_history.shares_series(
-        pd.DataFrame(columns=["session_date", "ticker", "shares"]), "SPY", sessions
+        pd.DataFrame(columns=["session_date", "ticker", "shares"]), None, "SPY", sessions
     ) is None
 
 
@@ -129,3 +129,59 @@ def test_the_upper_line_says_held_because_that_is_what_it_is() -> None:
     names = [t.name for t in fig.data]
     assert "held weight" in names and "position weight" not in names
     assert fig.layout.yaxis2.title.text == "held weight"
+
+# ------------------------------------------------------------------ after the rebuild
+
+def _positions(sessions, shares, ticker: str = "SPY") -> pd.DataFrame:
+    """A positions frame: the snapshot the execution job writes, date by date."""
+    return pd.DataFrame(
+        [{"trade_date": d, "ticker": ticker, "weight": 0.25, "shares": v}
+         for d, v in zip(sessions, shares)]
+    )
+
+
+def test_the_line_keeps_going_after_the_rebuild_ends() -> None:
+    """The rebuild is a one-off; the snapshot is written every day after it.
+
+    The chart has to keep updating tomorrow, so after the cutover the line is read
+    from positions.shares. A chart that only read share_history would freeze on the
+    day the backfill ran, which is the same class of bug as the blank line it
+    replaced.
+    """
+    sessions = pd.bdate_range("2026-09-25", periods=6)  # straddles the cutover
+    history = _share_history([sessions[0], sessions[1]], [10.0, 12.0])  # stops early
+    positions = _positions(sessions[3:], [12.0, 14.0, 14.0])
+
+    series = signal_history.shares_series(history, positions, "SPY", sessions)
+
+    assert series.loc[sessions[0]] == pytest.approx(10.0), "pre-cutover: from the rebuild"
+    assert np.isnan(series.loc[sessions[2]]), "no data in either source yet"
+    assert series.loc[sessions[3]] == pytest.approx(12.0), "post-cutover: from positions"
+    assert series.loc[sessions[5]] == pytest.approx(14.0), "and it keeps going"
+
+
+def test_after_the_cutover_the_other_source_fills_a_hole() -> None:
+    sessions = pd.bdate_range("2026-09-28", periods=3)
+    history = _share_history(sessions, [20.0, 21.0, 22.0])
+    positions = _positions([sessions[0]], [20.0])  # only the first snapshot
+
+    series = signal_history.shares_series(history, positions, "SPY", sessions)
+
+    assert series.tolist() == [20.0, 21.0, 22.0], (
+        "a gap only where BOTH sources are missing"
+    )
+
+
+def test_a_duplicate_date_never_disagrees_with_the_snapshot() -> None:
+    """The overlap is 288 cells with a 0.000000 difference; positions still wins.
+
+    It is the live source, so if the two ever do disagree the chart should show the
+    snapshot the execution job actually wrote, not a reconstruction.
+    """
+    sessions = pd.bdate_range("2026-09-28", periods=2)
+    history = _share_history(sessions, [20.0, 21.0])
+    positions = _positions(sessions, [20.5, 21.5])
+
+    series = signal_history.shares_series(history, positions, "SPY", sessions)
+
+    assert series.tolist() == [20.5, 21.5]

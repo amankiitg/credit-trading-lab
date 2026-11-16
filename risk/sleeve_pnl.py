@@ -550,29 +550,60 @@ def record_daily_sleeve_pnl(*, as_of_date: str, log=None, client: object | None 
         # decomposition is the product and the execution split is an extra. Written in
         # two shapes rather than attempted-and-retried so a failed write is never mistaken
         # for a missing column.
-        from dashboard.supabase_client import execution_column_exists
+        from dashboard.supabase_client import (
+            distribution_column_exists,
+            execution_column_exists,
+        )
+
+        has_execution_column = execution_column_exists()
+        has_distribution_column = distribution_column_exists()
+        execution_report = report["execution"] or {}
+        execution_by_sleeve = execution_report.get("by_sleeve") or {}
+        has_execution = execution_report.get("status") == "ok"
+        # A named read failure is not "no distributions": writing a zero there would put
+        # the old permanent assumption back into the stored data, where the bridge reads
+        # it and cannot tell it from a measured quiet session.
+        distribution_by_sleeve = execution_report.get("distribution_by_sleeve") or {}
+        distribution_known = execution_report.get("distribution_reason") is None
 
         rows = result.rows
-        if execution_column_exists():
-            execution_by_sleeve = (report["execution"] or {}).get("by_sleeve") or {}
-            has_execution = (report["execution"] or {}).get("status") == "ok"
-            rows = [
-                {
-                    **row,
-                    "execution_pnl": (
+        if has_execution_column or has_distribution_column:
+            shaped_rows = []
+            for row in result.rows:
+                shaped = dict(row)
+                if has_execution_column:
+                    shaped["execution_pnl"] = (
                         float(execution_by_sleeve.get(row["sleeve"], 0.0))
                         if has_execution
                         else None
-                    ),
-                }
-                for row in result.rows
-            ]
-        else:
+                    )
+                if has_distribution_column:
+                    shaped["distribution_pnl"] = (
+                        float(distribution_by_sleeve.get(row["sleeve"], 0.0))
+                        if distribution_known
+                        else None
+                    )
+                shaped_rows.append(shaped)
+            rows = shaped_rows
+
+        if not has_execution_column:
             report["execution_column"] = "missing"
             log.warning(
                 "execution column missing, run migration: daily_sleeve_pnl.execution_pnl "
                 "does not exist, so %s is written with carry, price and total only; the "
                 "execution split still reaches the email and the reconciliation",
+                as_of_date,
+            )
+        if not has_distribution_column:
+            # Not fatal: the session's own reconciliation still carries both legs of the
+            # timing item. What is lost is the bridge's ability to see the pay date, and
+            # it goes on saying so rather than drawing the accrual as a live add-back.
+            report["distribution_column"] = "missing"
+            log.warning(
+                "distribution column missing, run migration: "
+                "daily_sleeve_pnl.distribution_pnl does not exist, so the bridge for %s "
+                "cannot reverse the add-back on the pay date; the reconciliation still "
+                "counts it",
                 as_of_date,
             )
 

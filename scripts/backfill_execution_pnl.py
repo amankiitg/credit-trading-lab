@@ -31,7 +31,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -53,7 +53,13 @@ DEFAULT_END = "2026-11-06"
 
 
 def _closes(start: str, end: str) -> pd.DataFrame:
-    frames = fetch_closes(list(UNIVERSE), start, end)
+    # yfinance treats `end` as EXCLUSIVE. Asking for 2026-10-01..2026-11-06 therefore
+    # returned nothing after 2026-11-05, and the backfill silently skipped a session that
+    # has nine fills and -5.95 of execution P&L -- a missing session is indistinguishable
+    # from a quiet one once it is absent from the close matrix. One day of padding is
+    # what makes "through 2026-11-06" mean the 6th.
+    inclusive_end = (date.fromisoformat(end) + timedelta(days=1)).isoformat()
+    frames = fetch_closes(list(UNIVERSE), start, inclusive_end)
     matrix = pd.DataFrame({t: f["close"] for t, f in frames.items()}).sort_index()
     matrix.index = pd.to_datetime(matrix.index)
     return matrix
@@ -85,10 +91,22 @@ def build_plan(start: str, end: str, *, log=print) -> list[dict]:
         if stamp not in close.index:
             log(f"{session}: no close for that session, skipped")
             continue
-        fills = fetch_session_fills(client, session)
+        try:
+            fills = fetch_session_fills(client, session)
+        except Exception as exc:
+            # A failed read is NOT a quiet session. Writing 0.0 here would assert that
+            # nothing traded, which is the same collapse of "unreadable" into "empty"
+            # that the reconciliation code was fixed to stop making.
+            log(f"{session}: fill read failed ({type(exc).__name__}) -- left NULL")
+            plan.append({"session": session, "fills": None, "total": None,
+                         "by_sleeve": None, "skipped": [], "reason": "fill read failed"})
+            continue
+
+        # No fills on a readable ledger is a measured zero, not a missing value: it is
+        # written as 0.0 so the bridge can tell "traded nothing" from "never measured".
         if not fills:
             plan.append({"session": session, "fills": 0, "total": 0.0, "by_sleeve": {},
-                         "skipped": [], "reason": "no fills"})
+                         "skipped": [], "reason": None})
             continue
         pnl = execution_pnl(
             fills, close.loc[stamp].dropna().to_dict(),
@@ -116,8 +134,9 @@ def apply_plan(plan: list[dict], *, log=print) -> int:
         raise SystemExit("no Supabase client: SUPABASE_URL/SUPABASE_SECRET_KEY must be set")
     written = 0
     for entry in plan:
-        if entry.get("reason") == "no fills" and entry.get("fills") == 0:
-            pass  # a genuinely quiet session is still a measured zero, not a null
+        if entry.get("by_sleeve") is None:
+            log(f"{entry['session']}: skipped, no measurement ({entry.get('reason')})")
+            continue
         by_sleeve = entry.get("by_sleeve") or {}
         for sleeve in ("equity", "rates", "credit", "commodity"):
             resp = (
@@ -146,10 +165,14 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     plan = build_plan(args.start, args.end)
-    rows = 4 * len(plan)
-    total = sum(entry.get("total") or 0.0 for entry in plan)
+    writable = [entry for entry in plan if entry.get("by_sleeve") is not None]
+    rows = 4 * len(writable)
+    total = sum(entry.get("total") or 0.0 for entry in writable)
+    unmeasured = len(plan) - len(writable)
     print()
     print(f"{len(plan)} session(s), {rows} row(s), execution P&L {total:+.2f}")
+    if unmeasured:
+        print(f"{unmeasured} session(s) left NULL: the fill read failed")
 
     if not plan:
         return 0

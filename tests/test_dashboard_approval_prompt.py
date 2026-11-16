@@ -120,12 +120,21 @@ def test_a_staged_trade_still_asks_for_sign_in(monkeypatch) -> None:
     assert {b.label for b in at.button} == {"Sign in with Google"}
 
 
-def test_a_settled_proposal_shows_no_trades_pending_and_no_prompt(monkeypatch) -> None:
-    """The execution run already acted on the proposal: nothing to approve."""
+def test_a_settled_proposal_names_the_orders_and_needs_no_approval(monkeypatch) -> None:
+    """The execution run already acted: the orders are history, not pending.
+
+    The table still lists them, so the panel names them and says why no decision
+    is waiting, instead of claiming there are no trades.
+    """
     at = _render(monkeypatch, last_run=TODAY)
 
     text = _text(at)
-    assert f"No trades pending for {YESTERDAY}." in text
+    assert "1 order for the next morning run: SPY $+35,000 (buy)" in text
+    assert (
+        "Approval: not needed — the morning run for this signal has already happened."
+        in text
+    )
+    assert "No trades pending" not in text
     assert "Sign in to approve or reject" not in text
     assert {b.label for b in at.button} == set()
     # The advisory stop note is information, not a call to action.
@@ -137,17 +146,21 @@ def test_a_proposal_with_only_band_noise_shows_no_trades_pending(monkeypatch) ->
     at = _render(monkeypatch, rows=SKIPS, last_run=YESTERDAY)
 
     text = _text(at)
-    assert f"No trades pending for {YESTERDAY}." in text
+    assert (
+        f"No trades pending for {YESTERDAY} — every delta is inside the ±$250 band."
+        in text
+    )
     assert "Sign in to approve or reject" not in text
     assert {b.label for b in at.button} == set()
 
 
-def test_a_lagged_signal_shows_no_trades_pending(monkeypatch) -> None:
+def test_a_lagged_signal_still_names_its_orders(monkeypatch) -> None:
     lagged = (date.fromisoformat(YESTERDAY) - timedelta(days=2)).isoformat()
     at = _render(monkeypatch, as_of=lagged, last_run=YESTERDAY)
 
     text = _text(at)
-    assert f"No trades pending for {lagged}." in text
+    assert "1 order for the next morning run: SPY $+35,000 (buy)" in text
+    assert "Approval:" in text
     assert "Sign in to approve or reject" not in text
 
 
@@ -160,7 +173,11 @@ def test_auto_approve_means_nothing_is_waiting_for_a_decision(monkeypatch) -> No
     at = _render(monkeypatch, auto_approve=True)
 
     text = _text(at)
-    assert f"No trades pending for {YESTERDAY}." in text
+    assert "1 order for the next morning run: SPY $+35,000 (buy)" in text
+    assert (
+        "Approval: not needed — auto-approve is ON, so the run executes unless "
+        "you reject."
+    ) in text
     assert "Sign in to approve or reject" not in text
     assert {b.label for b in at.button} == set()
     assert "ADVISORY (not traded)" in text
@@ -170,5 +187,9 @@ def test_a_rejected_day_has_nothing_pending(monkeypatch) -> None:
     at = _render(monkeypatch, decision="reject")
 
     text = _text(at)
-    assert f"No trades pending for {YESTERDAY}." in text
+    assert "1 order for the next morning run: SPY $+35,000 (buy)" in text
+    assert (
+        "Approval: not needed — today is rejected, so no trades will execute."
+        in text
+    )
     assert "Sign in to approve or reject" not in text

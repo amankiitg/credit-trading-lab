@@ -139,6 +139,37 @@ def test_the_timeline_has_a_visible_date_axis_and_the_bars_do_not(monkeypatch) -
     assert bars.layout.yaxis.title.text == "$ over the period"
 
 
+
+def test_the_price_and_carry_legend_uses_neutral_swatches(monkeypatch) -> None:
+    """The legend says which bar is price and which is carry, so it is grey.
+
+    A sleeve colour in the legend would read as a fifth, colourless sleeve: the
+    bars themselves already carry the asset-class colour.
+    """
+    figures = _capture_plots(monkeypatch)
+    _render(monkeypatch, sleeve_rows=ROWS)
+
+    bars = figures[1]
+    legend_traces = [t for t in bars.data if t.showlegend]
+    assert [t.name for t in legend_traces] == ["Price", "Carry"]
+    # Solid grey against light grey: two shades of the same neutral, no sleeve
+    # colour in either swatch.
+    assert legend_traces[0].marker.color == operational.NEUTRAL_COLOR
+    assert legend_traces[1].marker.color == operational._rgba(
+        operational.NEUTRAL_COLOR, 0.35
+    )
+    assert legend_traces[1].marker.color != legend_traces[0].marker.color
+    priced = [t for t in bars.data if t.name == "Price" and type(t).__name__ == "Bar"]
+    assert len(priced) == 1 and priced[0].showlegend is False
+
+
+def test_the_bridge_says_why_it_cannot_run_without_stored_closes(monkeypatch) -> None:
+    at = _render(monkeypatch, sleeve_rows=ROWS)
+
+    text = _text(at)
+    assert "The period bridge needs a stored close" in text
+    assert "**Period bridge.**" not in text
+
 def test_no_stored_session_means_no_chart_and_a_reason(monkeypatch) -> None:
     figures = _capture_plots(monkeypatch)
     at = _render(monkeypatch, sleeve_rows=[])

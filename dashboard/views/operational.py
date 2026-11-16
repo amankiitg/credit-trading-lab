@@ -1018,6 +1018,284 @@ def _staged_trades(
     )
 
 
+def _fmt_cost(value: float | None) -> str:
+    """A cost as the dollars it took, with no sign.
+
+    Turnover cost is a drag that is already subtracted wherever it is used, so a
+    plus sign in front of it reads as a gain. This shows the amount and nothing
+    else; the label says it is a cost.
+    """
+    if value is None:
+        return "—"
+    return f"${abs(float(value)):,.2f}"
+
+
+def _metric_card(col, label: str, value: str, note: str | None = None) -> None:
+    """One metric with its provenance as a caption, not as st.metric's delta.
+
+    The note used to be the delta argument. A delta draws an arrow and a colour
+    beside the number, which reads as "this moved up or down"; these notes are
+    provenance ("evening signal 22:31 UTC", "target 2.00x"), so they belong in a
+    caption under the card where they cannot be read as a change.
+    """
+    col.metric(label, value)
+    if note:
+        col.caption(note)
+
+
+def _order_summary(pending_rows: list[dict]) -> str | None:
+    """The orders a proposal is staging, or None when every row is band noise.
+
+    A row inside the delta band is not an order: the execution layer skips it, so
+    "no trades pending" printed beside a table that shows a $253 sell is wrong.
+    This names every row that is an order, with its signed delta.
+    """
+    if not pending_rows:
+        return None
+    parts = []
+    for row in pending_rows:
+        ticker = str(row.get("ticker") or "?")
+        try:
+            delta_text = f"${float(row.get('delta ($)')):+,.0f}"
+        except (TypeError, ValueError):
+            delta_text = "—"
+        action = str(row.get("action") or "").strip()
+        parts.append(f"{ticker} {delta_text}" + (f" ({action})" if action else ""))
+    noun = "order" if len(pending_rows) == 1 else "orders"
+    return f"{len(pending_rows)} {noun} for the next morning run: " + ", ".join(parts)
+
+
+def _approval_status(*, state: str, auto_approve: bool, decision: str | None) -> str:
+    """Whether a human has to act on the staged orders, in one sentence."""
+    if decision == "reject":
+        return "Approval: not needed — today is rejected, so no trades will execute."
+    if decision == "approve":
+        return "Approval: already approved — the next morning run executes these."
+    if auto_approve:
+        return (
+            "Approval: not needed — auto-approve is ON, so the run executes "
+            "unless you reject."
+        )
+    if state == DECISION_STATE_LOCKED:
+        return (
+            "Approval: not needed — the morning run for this signal has already "
+            "happened."
+        )
+    if state == DECISION_STATE_NO_SIGNAL:
+        return "Approval: not available yet — waiting for the next signal."
+    return "Approval: needed before the next morning run."
+
+
+def _period_bridge(
+    nav_frame: pd.DataFrame,
+    df_sleeve: pd.DataFrame,
+    df_pnl: pd.DataFrame,
+    *,
+    start: date | None,
+) -> tuple[list[dict], dict]:
+    """The period's NAV move, decomposed into the terms that should explain it.
+
+        NAV change = book P&L (price + carry)
+                   + cumulative execution P&L
+                   + paper short-distribution add-back
+                   - turnover cost
+                   + residual
+
+    The NAV change is measured on official close NAVs, so it is read from the
+    session BEFORE the first P&L session to the last session that has both a
+    stored close and a stored sleeve row. A session whose close is not stored yet
+    is left out of every term rather than half-counted.
+
+    Execution P&L is only stored from 2026-11-09. A session before it has no
+    value, and this reports that as "not stored" instead of a zero that would
+    silently vanish into the residual: only sessions where all four sleeve rows
+    carry a value are summed, and the count is part of the note.
+
+    Returns (rows, summary). rows is the table the page draws; summary is the same
+    numbers for tests and for the caption.
+    """
+    summary: dict = {
+        "first": None, "last": None, "base": None,
+        "nav_change": None, "book": None, "price": None, "carry": None,
+        "execution": None, "execution_sessions": 0, "sessions": 0,
+        "add_back": None, "cost": None, "residual": None, "residual_pct": None,
+    }
+    if df_sleeve.empty or nav_frame.empty:
+        return [], summary
+
+    sleeve = df_sleeve.copy()
+    sleeve["trade_date"] = sleeve["trade_date"].astype(str)
+    if start is not None:
+        sleeve = sleeve[sleeve["trade_date"] >= start.isoformat()]
+    if "book_total" in sleeve.columns:
+        sleeve = sleeve.dropna(subset=["book_total"])
+    if sleeve.empty:
+        return [], summary
+
+    navs = nav_frame.copy()
+    navs["session"] = pd.to_datetime(navs["trade_date"], errors="coerce").dt.date
+    navs = navs.dropna(subset=["session", "nav"])
+    by_session = {
+        session.isoformat(): float(value)
+        for session, value in zip(navs["session"], navs["nav"])
+    }
+    sessions = sorted(set(sleeve["trade_date"]) & set(by_session))
+    if not sessions:
+        return [], summary
+    base_candidates = [s for s in by_session if s < sessions[0]]
+    if not base_candidates:
+        return [], summary
+    base = max(base_candidates)
+
+    period = sleeve[sleeve["trade_date"].isin(sessions)]
+    book = float(period["total"].sum())
+    price = float(period["price_pnl"].sum())
+    carry = float(period["carry_pnl"].sum())
+    # Paper never debits a short its distributions, so the short leg is added back.
+    # The conservative reading is the negative part of the book's carry: a long
+    # payout needs no adjustment because the broker already paid it.
+    add_back = float(-period.loc[period["carry_pnl"] < 0, "carry_pnl"].sum())
+
+    execution_sessions: list[str] = []
+    execution = 0.0
+    if "execution_pnl" in period.columns:
+        for session, values in period.groupby("trade_date")["execution_pnl"]:
+            if values.notna().all():
+                execution_sessions.append(str(session))
+                execution += float(values.sum())
+    execution_value = execution if execution_sessions else None
+
+    cost = None
+    runs = 0
+    if not df_pnl.empty and "turnover_cost" in df_pnl.columns:
+        log = df_pnl.copy()
+        log["trade_date"] = log["trade_date"].astype(str)
+        log = log[log["trade_date"].isin(sessions)]
+        runs = len(log)
+        cost = float(log["turnover_cost"].fillna(0.0).astype(float).sum())
+
+    nav_change = by_session[sessions[-1]] - by_session[base]
+    residual = None
+    if execution_value is not None:
+        residual = nav_change - (
+            book + execution_value + add_back - float(cost or 0.0)
+        )
+
+    summary.update({
+        "first": sessions[0], "last": sessions[-1], "base": base,
+        "nav_change": nav_change, "book": book, "price": price, "carry": carry,
+        "execution": execution_value,
+        "execution_sessions": len(execution_sessions),
+        "sessions": len(sessions), "add_back": add_back, "cost": cost,
+        "residual": residual,
+        "residual_pct": (
+            residual / by_session[sessions[-1]] * 100
+            if residual is not None and by_session[sessions[-1]] else None
+        ),
+    })
+
+    missing = len(sessions) - len(execution_sessions)
+    rows = [
+        {
+            "term": "NAV change (official closes)",
+            "amount": f"${nav_change:+,.2f}",
+            "note": (
+                f"{base} close ${by_session[base]:,.2f} to "
+                f"{sessions[-1]} close ${by_session[sessions[-1]]:,.2f}"
+            ),
+        },
+        {
+            "term": "Cumulative book P&L",
+            "amount": f"${book:+,.2f}",
+            "note": (
+                f"price ${price:+,.2f} + carry ${carry:+,.2f}, "
+                f"{len(sessions)} session(s)"
+            ),
+        },
+        {
+            "term": "Cumulative execution P&L",
+            "amount": (
+                f"${execution_value:+,.2f}"
+                if execution_value is not None else "not stored"
+            ),
+            "note": (
+                (
+                    f"{len(execution_sessions)} of {len(sessions)} session(s) stored"
+                    + (
+                        f"; not stored for {missing} session(s) before 2026-11-09"
+                        if missing else ""
+                    )
+                )
+                if execution_sessions
+                else "no session in this period has a stored execution P&L"
+            ),
+        },
+        {
+            "term": "Paper short-distribution add-back",
+            "amount": f"${add_back:+,.2f}",
+            "note": "paper never debits a short its distributions; long payouts are already in carry",
+        },
+        {
+            "term": "Turnover cost (subtracted)",
+            "amount": _fmt_cost(cost),
+            "note": f"{runs} morning run(s) in the period",
+        },
+        {
+            "term": "Residual",
+            "amount": f"${residual:+,.2f}" if residual is not None else "—",
+            "note": "what the terms above do not explain",
+        },
+    ]
+    return rows, summary
+
+
+def _render_period_bridge(
+    nav_frame: pd.DataFrame,
+    df_sleeve: pd.DataFrame,
+    df_pnl: pd.DataFrame,
+    *,
+    start: date | None,
+) -> dict:
+    """Draw the period bridge table under the Book P&L charts."""
+    rows, summary = _period_bridge(nav_frame, df_sleeve, df_pnl, start=start)
+    if not rows:
+        st.info(
+            "The period bridge needs a stored close before the first P&L session "
+            "and at least one session with both a close and sleeve rows."
+        )
+        return summary
+
+    st.markdown(
+        "**Period bridge.** Does the account's NAV move equal the book's own P&L? "
+        "Each row is one term of the identity below; the residual is what is left "
+        "over, and it should stay near zero."
+    )
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+    missing = summary["sessions"] - summary["execution_sessions"]
+    parts = [
+        "NAV change (official closes) = book P&L (price + carry) + execution P&L "
+        "+ paper short-distribution add-back - turnover cost + residual."
+    ]
+    if summary["residual"] is not None:
+        parts.append(
+            f"Residual ${summary['residual']:+,.2f}"
+            + (
+                f" ({summary['residual_pct']:+.2f}% of NAV)"
+                if summary["residual_pct"] is not None else ""
+            )
+            + "."
+        )
+    if missing:
+        parts.append(
+            f"Execution P&L is stored for {summary['execution_sessions']} of "
+            f"{summary['sessions']} sessions; the {missing} without it are before "
+            "2026-11-09, and their traded part sits in the residual, not in a zero."
+        )
+    st.caption(" ".join(parts))
+    return summary
+
+
 def _active_flags(
     concentration: list[str],
     net_message: str | None,
@@ -1120,31 +1398,23 @@ def _render_header(
     # Two rows of three. Six cards in one row truncates the values on a
     # 1200px-wide window, and a truncated NAV is worse than no card.
     row_one = st.columns(3)
-    row_one[0].metric(
-        "NAV", "$" + f"{nav_snapshot['value']:,.2f}",
-        delta=run_label,
-        delta_color="off",
+    target_gross_x = sum(abs(float(r.get("target wt") or 0.0)) for r in proposed_rows)
+    target_net_pct = sum(float(r.get("target wt") or 0.0) for r in proposed_rows) * 100
+    _metric_card(row_one[0], "NAV", "$" + f"{nav_snapshot['value']:,.2f}", run_label)
+    _metric_card(
+        row_one[1], "Daily P&L (close-to-close)", pnl_value, pnl_delta
     )
-    row_one[1].metric(
-        "Daily P&L (close-to-close)", pnl_value,
-        delta=pnl_delta, delta_color="off",
-    )
-    row_one[2].metric(
-        "Gross", f"{gross_x:.2f}x NAV",
-        delta=f"target {sum(abs(float(r.get('target wt') or 0.0)) for r in proposed_rows):.2f}x",
-        delta_color="off",
+    _metric_card(
+        row_one[2], "Gross", f"{gross_x:.2f}x NAV", f"target {target_gross_x:.2f}x"
     )
     row_two = st.columns(3)
-    row_two[0].metric(
-        "Net", f"{net_pct:+.1f}%",
-        delta="$" + f"{net_usd:+,.0f} · target "
-              f"{sum(float(r.get('target wt') or 0.0) for r in proposed_rows) * 100:+.1f}%",
-        delta_color="off",
+    _metric_card(
+        row_two[0], "Net", f"{net_pct:+.1f}%",
+        "$" + f"{net_usd:+,.0f} · target {target_net_pct:+.1f}%",
     )
-    row_two[1].metric(
-        "Book vol", book_vol_value,
-        delta="annualized, 120-session covariance",
-        delta_color="off",
+    _metric_card(
+        row_two[1], "Book vol", book_vol_value,
+        "annualized, 120-session covariance",
     )
     with row_two[2].container(border=True):
         st.metric("Active risk flags", str(len(flags)))
@@ -1451,15 +1721,28 @@ def render(
         pending_rows, state, auto_approve=auto_approve, decision=existing
     )
 
+    order_summary = _order_summary(pending_rows)
+    approval = _approval_status(
+        state=state, auto_approve=auto_approve, decision=existing
+    )
+
     if not is_authenticated and secrets_configured:
-        if not staged:
+        if order_summary is None:
             # Plain information, no prompt: there is nothing an account could
             # unlock. The advisory stop note above stays readable as it is.
-            st.info(f"No trades pending for {as_of_date}.")
+            st.info(
+                f"No trades pending for {as_of_date} — every delta is inside the "
+                "±$250 band."
+            )
         else:
-            st.info("Sign in to approve or reject today's trades.")
-            if st.button("Sign in with Google", key="signin_btn"):
-                st.login("google")
+            # A row outside the band is an order. The panel names it and says
+            # whether a decision is waiting, instead of "no trades pending"
+            # beside a table that lists a sell.
+            st.info(order_summary + "\n\n" + approval)
+            if staged:
+                st.info("Sign in to approve or reject today's trades.")
+                if st.button("Sign in with Google", key="signin_btn"):
+                    st.login("google")
     elif not supabase_ok:
         st.warning(
             "Supabase credentials not configured -- the decision window cannot be read "
@@ -1467,6 +1750,8 @@ def render(
             "SUPABASE_SECRET_KEY in .env and restart."
         )
     else:
+        if order_summary is not None:
+            st.info(order_summary + "\n\n" + approval)
         new_val = st.toggle(
             "Auto-approve: execute every day unless I explicitly reject",
             value=auto_approve,
@@ -1561,17 +1846,17 @@ def render(
     )
 
     col_net, col_gross = st.columns(2)
-    col_net.metric(
+    _metric_card(
+        col_net,
         "Net exposure",
         "$" + f"{net_usd:+,.0f}",
-        delta=f"{net_pct:+.1f}% of NAV vs target {target_net_pct:+.1f}%",
-        delta_color="off",
+        f"{net_pct:+.1f}% of NAV vs target {target_net_pct:+.1f}%",
     )
-    col_gross.metric(
+    _metric_card(
+        col_gross,
         "Gross exposure (= leverage)",
         f"{gross_x:.2f}x NAV",
-        delta=f"target {target_gross_x:.2f}x, hard cap {float(G_MAX_DEFAULT):.2f}x",
-        delta_color="off",
+        f"target {target_gross_x:.2f}x, hard cap {float(G_MAX_DEFAULT):.2f}x",
     )
 
     st.markdown(f"**{longs} long, {shorts} short.**")
@@ -1668,29 +1953,29 @@ def render(
 
     stats = _performance_stats(window_nav)
     perf_cols = st.columns(4)
-    perf_cols[0].metric(
+    _metric_card(
+        perf_cols[0],
         "MTD return",
         f"{stats['mtd_pct']:+.2f}%" if stats["mtd_pct"] is not None else "—",
-        delta="month to date",
-        delta_color="off",
+        "month to date",
     )
-    perf_cols[1].metric(
+    _metric_card(
+        perf_cols[1],
         "Annualized vol",
         f"{stats['ann_vol_pct']:.2f}%" if stats["ann_vol_pct"] is not None else "—",
-        delta="daily NAV returns",
-        delta_color="off",
+        "daily NAV returns",
     )
-    perf_cols[2].metric(
+    _metric_card(
+        perf_cols[2],
         "Sharpe",
         f"{stats['sharpe']:.2f}" if stats["sharpe"] is not None else "—",
-        delta="annualized, zero risk-free",
-        delta_color="off",
+        "annualized, zero risk-free",
     )
-    perf_cols[3].metric(
+    _metric_card(
+        perf_cols[3],
         "Max drawdown",
         f"{stats['max_dd_pct']:.2f}%" if stats["max_dd_pct"] is not None else "—",
-        delta="peak to trough",
-        delta_color="off",
+        "peak to trough",
     )
 
     if nav_history_error:
@@ -1882,6 +2167,21 @@ def render(
             )
             labels = [sleeve.capitalize() for sleeve in SLEEVE_ORDER]
             bars = go.Figure()
+            # The legend says which bar is price and which is carry, so its
+            # swatches are neutral: solid grey against light grey. A sleeve
+            # colour in the legend would read as a fifth, colourless sleeve.
+            for name, shade in (("Price", NEUTRAL_COLOR), ("Carry", _rgba(NEUTRAL_COLOR, 0.35))):
+                bars.add_trace(
+                    go.Scatter(
+                        x=[labels[0]],
+                        y=[None],
+                        mode="markers",
+                        marker=dict(color=shade, size=10, symbol="square"),
+                        name=name,
+                        hoverinfo="skip",
+                        showlegend=True,
+                    )
+                )
             bars.add_trace(
                 go.Bar(
                     x=labels,
@@ -1889,6 +2189,7 @@ def render(
                     name="Price",
                     marker_color=[_sleeve_colour(s) for s in SLEEVE_ORDER],
                     hovertemplate="%{x}<br>price %{y:+,.2f}<extra></extra>",
+                    showlegend=False,
                 )
             )
             bars.add_trace(
@@ -1898,6 +2199,7 @@ def render(
                     name="Carry",
                     marker_color=[_rgba(_sleeve_colour(s), 0.45) for s in SLEEVE_ORDER],
                     hovertemplate="%{x}<br>carry %{y:+,.2f}<extra></extra>",
+                    showlegend=False,
                 )
             )
             bars.update_layout(
@@ -1922,14 +2224,22 @@ def render(
             )
             st.caption(
                 "Bars: each sleeve's total over the period, solid for the price move "
-                "and lighter for distributions received (carry). Colour is the asset "
-                "class; the sign of the bar is its direction."
+                "and lighter for distributions paid on shorts (negative) or received "
+                "on longs (carry). Colour is the asset class; the sign of the bar is "
+                "its direction."
             )
             if float(period["carry_pnl"].abs().sum()) == 0.0:
                 st.caption(
                     "Carry is 0.00 in every recorded session: no distribution is "
                     "recorded for those dates."
                 )
+
+            # Under the charts, the identity that ties them to the account's own
+            # NAV move: the charts say where the money came from, the bridge says
+            # whether that adds up to what the broker reported.
+            _render_period_bridge(
+                official_nav, df_sleeve, df_pnl, start=history_start
+            )
     else:
         st.info(
             "No sleeve P&L recorded yet. The signal cron writes one row per sleeve per "
@@ -1951,18 +2261,36 @@ def render(
     if cost_today is None or pd.isna(cost_today):
         st.metric("Turnover cost today", "—")
     else:
-        st.metric("Turnover cost today", _fmt_dollars(float(cost_today)))
+        st.metric("Turnover cost today", _fmt_cost(float(cost_today)))
 
+    # The cumulative cost is scoped like every chart above it: the period the
+    # reader picked. It used to sum the whole pnl_log, so a 21-day window compared
+    # a month of cost against a day's P&L.
+    period_runs = df_pnl
+    if (
+        history_start is not None
+        and not df_pnl.empty
+        and "trade_date" in df_pnl.columns
+    ):
+        period_runs = df_pnl[
+            pd.to_datetime(df_pnl["trade_date"], errors="coerce")
+            >= pd.Timestamp(history_start)
+        ]
     cost_total = (
-        float(df_pnl["turnover_cost"].fillna(0.0).sum())
-        if "turnover_cost" in df_pnl.columns else 0.0
+        float(period_runs["turnover_cost"].fillna(0.0).astype(float).sum())
+        if "turnover_cost" in period_runs.columns else 0.0
+    )
+    cost_scope = (
+        f"over the {len(period_runs)} runs in this period"
+        if history_start is not None
+        else f"all-time over {len(period_runs)} runs"
     )
     st.caption(
         f"The morning execution run of {run_date} ({run_stamp}). Its book P&L is "
         f"not repeated here: the page carries one daily number, the official "
         f"close-to-close P&L in the header. Turnover cost is a drag, not part of "
-        f"the result -- " + "$" + f"{cost_total:,.2f}"
-        + f" cumulative over {len(df_pnl)} runs, and a single-digit dollar day is normal."
+        f"the result -- " + _fmt_cost(cost_total)
+        + f" {cost_scope}, and a single-digit dollar day is normal."
     )
 
     attr_rows = _get_live_attribution(60)

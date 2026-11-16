@@ -74,6 +74,14 @@ WEIGHT_TTL_SECS: int = 600
 
 WEIGHT_COLOR: str = "#8a8a8a"
 
+# The first session ``public.positions`` carries a shares column for (measured: 288
+# cells from this date). Before it, the only record of how many shares the book held is
+# the fill rebuild in ``share_history``; from it onward the snapshot is the live source,
+# written every morning by the execution job and every evening by the snapshot refresh.
+# So the chart reads BOTH and switches at this date, which is what keeps it updating
+# after the rebuild without inventing numbers before it.
+SHARE_SNAPSHOT_FROM: pd.Timestamp = pd.Timestamp("2026-09-28")
+
 # The share-count line sits on the lower panel's right axis. It has to be legible
 # against the sleeve-coloured score AND against the band, so it is a darker neutral
 # than the weight line rather than a second grey of the same value.
@@ -134,6 +142,45 @@ def load_stored_weights() -> pd.DataFrame:
         frame["shares"] = pd.to_numeric(frame["shares"], errors="coerce")
     frame = frame.dropna(subset=["trade_date", "ticker"])
     return frame.drop_duplicates(subset=["trade_date", "ticker"], keep="last")
+
+
+@st.cache_data(ttl=WEIGHT_TTL_SECS, show_spinner=False)
+def load_share_history() -> pd.DataFrame:
+    """End-of-day share counts from ``public.share_history``, one row per session per ticker.
+
+    A daily series, not a snapshot of the book, so it is read on its own rather than
+    folded into the position rows: the positions table only started carrying a
+    ``shares`` column on 2026-09-28, and that is why the lower panel was blank before
+    October even though the weight line above it started in June.
+
+    An absent table returns an empty frame and the chart says "no position data". A
+    fabricated zero would say the account held nothing, which is the one thing this
+    axis must never claim without evidence.
+    """
+    from dashboard.supabase_client import get_supabase_client
+
+    empty = pd.DataFrame(columns=["session_date", "ticker", "shares"])
+    client = get_supabase_client()
+    if client is None:
+        return empty
+    try:
+        resp = (
+            client.table("share_history")
+            .select("session_date,ticker,shares")
+            .limit(20000)
+            .execute()
+        )
+    except Exception:
+        return empty
+
+    rows = resp.data or []
+    if not rows:
+        return empty
+    frame = pd.DataFrame(rows)
+    frame["session_date"] = pd.to_datetime(frame["session_date"], errors="coerce")
+    frame["shares"] = pd.to_numeric(frame["shares"], errors="coerce")
+    frame = frame.dropna(subset=["session_date", "ticker"])
+    return frame.drop_duplicates(subset=["session_date", "ticker"], keep="last")
 
 
 def trading_sessions(closes: pd.DataFrame) -> pd.DatetimeIndex:
@@ -234,21 +281,60 @@ def weight_series(
 
 
 def shares_series(
-    positions: pd.DataFrame,
+    share_history: pd.DataFrame,
+    positions: pd.DataFrame | None,
     ticker: str,
     sessions: pd.DatetimeIndex,
-    first_live_session: pd.Timestamp | None,
 ) -> pd.Series | None:
-    """The book's SHARE COUNT in ``ticker``, on the same step rule as the weight.
+    """The book's SHARE COUNT in ``ticker``, two sources joined at one date, with GAPS.
 
-    Same snapshots, same carry-forward, same zero before the first live session:
-    the two lines have to describe one book, or the panel would say the position
-    changed when only the notional did.
+    Before ``SHARE_SNAPSHOT_FROM`` (2026-09-28): ``share_history``, the end-of-day series
+    rebuilt from the broker's fills. ``positions`` has no share column that far back, so
+    without this the line simply stopped -- which is the bug this whole change started
+    from.
 
-    None when the table predates the column, which omits the axis rather than
-    drawing a book that held nothing.
+    From that date on: ``positions.shares``, the live snapshot written every morning by
+    the execution job and every evening by the snapshot refresh. The rebuild stops at
+    the day it was run, so this half is what keeps the chart current tomorrow and after
+    -- and on the 288 cells where both exist they agree to 0.000000, so the switch is
+    invisible in the line.
+
+    Deliberately NOT the weight's step rule: neither source is carried forward, and
+    neither is zero-filled. A session absent from both is unknown -- the line breaks
+    there -- and the chart says "no position data". None when the ticker has nothing on
+    either side, which omits the axis rather than drawing a flat zero.
     """
-    return _position_series(positions, ticker, sessions, first_live_session, "shares")
+    if sessions.empty:
+        return None
+
+    history = pd.Series(index=sessions, dtype=float)
+    if share_history is not None and not share_history.empty and "shares" in share_history.columns:
+        rows = share_history[share_history["ticker"] == ticker]
+        if not rows.empty:
+            history = (
+                rows.dropna(subset=["shares"])
+                .set_index("session_date")["shares"]
+                .reindex(sessions)
+            )
+
+    held = pd.Series(index=sessions, dtype=float)
+    if positions is not None and not positions.empty and "shares" in positions.columns:
+        rows = positions[positions["ticker"] == ticker]
+        if not rows.empty:
+            # No fill, no carry: a session with no snapshot did not measure anything.
+            held = (
+                rows.dropna(subset=["shares"])
+                .set_index("trade_date")["shares"]
+                .reindex(sessions)
+            )
+
+    after = sessions >= SHARE_SNAPSHOT_FROM
+    combined = history.copy()
+    combined[after] = held[after].combine_first(history[after])
+
+    if combined.notna().sum() == 0:
+        return None
+    return combined.astype(float)
 
 
 def build_ticker_history(
@@ -257,6 +343,8 @@ def build_ticker_history(
     ticker: str,
     sessions: pd.DatetimeIndex,
     first_live_session: pd.Timestamp | None,
+    *,
+    share_history: pd.DataFrame | None = None,
 ) -> dict:
     """Series for one chart: close, lookback close, trend score, band, weight."""
     if ticker not in closes.columns:
@@ -282,7 +370,7 @@ def build_ticker_history(
     lookback = full.shift(TREND_LOOKBACK_SESSIONS).reindex(sessions)
     trend_score = price / lookback - 1.0
     weight = weight_series(weights, ticker, sessions, first_live_session)
-    shares = shares_series(weights, ticker, sessions, first_live_session)
+    shares = shares_series(share_history, weights, ticker, sessions)
     vol = realised_vol(closes, ticker)
     band = dead_zone_half_width(vol)
 
@@ -437,9 +525,12 @@ def ticker_figure(
                 x=sessions,
                 y=history["weight"].values,
                 mode="lines",
-                name="position weight",
+                # Held, not target: the row is written from the live Alpaca book after
+                # the trade (and by the evening snapshot refresh), so it is what the
+                # account actually owned, never the signal's intended weight.
+                name="held weight",
                 line=dict(color=WEIGHT_COLOR, width=1.6, shape="hv"),
-                hovertemplate="weight %{y:.1%}<extra></extra>",
+                hovertemplate="held weight %{y:.1%}<extra></extra>",
             ),
             secondary_y=True,
         )
@@ -477,6 +568,10 @@ def ticker_figure(
                     name="shares held",
                     line=dict(color=SHARES_COLOR, width=1.4, shape="hv"),
                     hovertemplate="shares held %{y:,.2f}<extra></extra>",
+                    # Default, stated for the reader: a session with no stored share
+                    # count breaks the line. Joining across it would draw a position
+                    # change nobody measured.
+                    connectgaps=False,
                 ),
                 row=2,
                 col=1,
@@ -508,7 +603,7 @@ def ticker_figure(
         col=1,
     )
     fig.update_yaxes(
-        title_text="weight",
+        title_text="held weight",
         secondary_y=True,
         fixedrange=True,
         range=_weight_range(history["weight"]),
@@ -571,7 +666,14 @@ def ticker_figure(
     elif not history["has_lookback"]:
         notes.append(f"{TREND_LOOKBACK_SESSIONS}-session lookback unavailable for {ticker}.")
     if history["weight"] is None:
-        notes.append(f"No stored position weight for {ticker}.")
+        notes.append(f"No stored held weight for {ticker}.")
+    shares = history.get("shares")
+    if shares is None:
+        notes.append(f"No position data for {ticker}: the share axis is omitted, not zeroed.")
+    elif shares.isna().any():
+        # A gap is the honest mark for a session the daily series does not cover, so it
+        # is named on the chart instead of being left for the reader to notice.
+        notes.append("no position data")
     for i, note in enumerate(notes):
         fig.add_annotation(
             text=note,
@@ -627,7 +729,11 @@ def _legend_slot(container) -> None:
     )
 
 
-def render_grid(closes: pd.DataFrame, weights: pd.DataFrame) -> None:
+def render_grid(
+    closes: pd.DataFrame,
+    weights: pd.DataFrame,
+    share_history: pd.DataFrame | None = None,
+) -> None:
     """Eight ticker charts in a 3x3 grid; Streamlit stacks the columns on phones."""
     from dashboard.views.operational import _plot
 
@@ -659,11 +765,19 @@ def render_grid(closes: pd.DataFrame, weights: pd.DataFrame) -> None:
             f"{window[-1].date()}."
         )
 
+    share_history = (
+        share_history if share_history is not None
+        else pd.DataFrame(columns=["session_date", "ticker", "shares"])
+    )
+
     rows = [UNIVERSE[i:i + 3] for i in range(0, len(UNIVERSE), 3)]
     for row_index, tickers in enumerate(rows):
         columns = st.columns(3)
         for column, ticker in zip(columns, tickers):
-            history = build_ticker_history(closes, weights, ticker, window, first_live)
+            history = build_ticker_history(
+                closes, weights, ticker, window, first_live,
+                share_history=share_history,
+            )
             with column:
                 _plot(
                     ticker_figure(ticker, history, window),
@@ -714,4 +828,4 @@ def render_signal_history() -> None:
                 "still live closes."
             )
 
-        render_grid(closes, weights)
+        render_grid(closes, weights, load_share_history())

@@ -156,16 +156,16 @@ class TestFigure:
 
         by_name = {trace.name: trace for trace in fig.data}
         base = signal_history.TREND_BASE_LEGEND
-        assert set(by_name) == {"close", base, "position weight", "trend score"}
+        assert set(by_name) == {"close", base, "held weight", "trend score"}
         assert by_name["close"].line.color == "#1d4ed8"
         assert by_name["close"].line.dash in (None, "solid")
         assert by_name[base].line.color == "#1d4ed8"
         assert by_name[base].line.dash == "dash"
-        assert by_name["position weight"].line.color == signal_history.WEIGHT_COLOR
-        assert by_name["position weight"].line.shape == "hv"
+        assert by_name["held weight"].line.color == signal_history.WEIGHT_COLOR
+        assert by_name["held weight"].line.shape == "hv"
 
         # The weight is on the top panel's secondary axis; the score is below it.
-        assert by_name["position weight"].yaxis == "y2"
+        assert by_name["held weight"].yaxis == "y2"
         assert by_name["trend score"].yaxis == "y3"
         assert fig.layout.yaxis2.zeroline is True
         assert fig.layout.yaxis2.tickformat == ".0%"
@@ -194,7 +194,7 @@ class TestFigure:
         assert "close 120 sessions ago (signal lookback base, NOT a moving average)" in (
             templates[signal_history.TREND_BASE_LEGEND]
         )
-        assert "weight" in templates["position weight"]
+        assert "held weight" in templates["held weight"]
         assert "trend score" in templates["trend score"]
         # Unified hover supplies the date header for all four traces.
         assert fig.layout.hovermode == "x unified"

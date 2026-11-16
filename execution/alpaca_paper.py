@@ -455,6 +455,99 @@ def fetch_session_fills(client, session_date: str) -> list[dict]:
     return fills
 
 
+# ---------------------------------------------------------------- distributions
+
+# The activity types that move cash for a distribution. CDIV is what the paper account
+# books for an ordinary cash dividend; the rest are the variants Alpaca can return for
+# the same event (capital-gain, return-of-capital, tax-exempt). They are read together
+# because the question being answered is "what did the broker take out of this account
+# on this date", and a variant read as absent would understate that.
+DIVIDEND_ACTIVITY_TYPES: tuple[str, ...] = (
+    "DIV", "DIVCGL", "DIVCGS", "DIVROC", "DIVTXEX",
+)
+
+
+def fetch_session_dividends(client, session_date: str) -> list[dict]:
+    """The distributions the broker booked ON this session, as a read, never an order.
+
+    This exists because the reconciliation assumed the opposite. The economic book
+    accrues a short position's distribution on the EX-date, so the sleeve P&L books the
+    carry there; paper does not, because the cash leaves the account on the PAY date,
+    about three sessions later. Adding back the ex-date accrual therefore explains the
+    ex-date and then leaves the pay date with a few hundred dollars of "unexplained"
+    loss. The measured case: four CDIV rows on 2026-11-05 (IEF -91.26, TLT -113.25,
+    LQD -100.39, HYG -131.25, -436.15 total) against a -413.50 residual on the same
+    session.
+
+    So the pay date has to be observable, and the broker's own ledger is the only
+    authority on it. Rows are returned in broker shape; the caller decides the sign and
+    the sleeve split.
+
+    A failed read RAISES ActivitiesReadError for the same reason fetch_session_fills
+    does: "no distributions this session" is a fact about the account, while an
+    unreadable ledger is a fact about the read, and collapsing the two would silently
+    restore the permanent gap this function exists to close.
+    """
+    from datetime import date as _date, timedelta
+
+    day = _date.fromisoformat(session_date)
+
+    # Distributions are stamped with a plain session date, but created_at is UTC and can
+    # land after midnight; the window is wide on both sides and the exact-date filter
+    # below is what decides, so the widening can only ever miss nothing.
+    params = {
+        "activity_types": ",".join(DIVIDEND_ACTIVITY_TYPES),
+        "after": f"{(day - timedelta(days=2)).isoformat()}T00:00:00Z",
+        "until": f"{(day + timedelta(days=2)).isoformat()}T00:00:00Z",
+        "direction": "asc",
+        "page_size": 100,
+    }
+
+    rows: list[dict] = []
+    for _page in range(10):
+        try:
+            activities = client.get("/account/activities", data=params)
+        except Exception as exc:
+            logger.error(
+                "fetch_session_dividends(%s) could not read the activity history: %s",
+                session_date, exc,
+            )
+            raise ActivitiesReadError(
+                f"activity history read failed: {type(exc).__name__}: {exc}"
+            ) from exc
+
+        if not isinstance(activities, list):
+            raise ActivitiesReadError(
+                "activity history read returned "
+                f"{type(activities).__name__}, not a list"
+            )
+
+        for item in activities:
+            dump = getattr(item, "model_dump", None)
+            if callable(dump):
+                rows.append(dump())
+            elif isinstance(item, dict):
+                rows.append(item)
+            else:
+                rows.append(dict(item))
+
+        if len(activities) < params["page_size"]:
+            break
+        last_id = activities[-1].get("id") if isinstance(activities[-1], dict) else None
+        if not last_id:
+            logger.warning(
+                "fetch_session_dividends(%s): a full page with no id to page from; "
+                "%d distribution row(s) may be missing", session_date, len(activities),
+            )
+            break
+        params = {**params, "page_token": last_id}
+
+    # The session is the activity's own date, not its created_at: a dividend dated
+    # 2026-11-05 is the pay date the equity change belongs to, whatever timezone the
+    # broker stamped the row with.
+    return [row for row in rows if str(row.get("date") or "") == session_date]
+
+
 # ---------------------------------------------------------------- positions
 
 def get_live_book(

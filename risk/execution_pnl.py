@@ -381,29 +381,82 @@ def reconcile(
     }
 
 
-def short_distribution_note(carry_short: float) -> str | None:
-    """Why paper equity will not match an economic decomposition on a short book.
+def broker_distribution_debit(
+    rows: Iterable[Mapping], *, sleeve_of: Mapping[str, str] | None = None
+) -> tuple[float, dict[str, float]]:
+    """The cash the broker moved for distributions this session, and its sleeve split.
 
-    The broker does not debit a paper account for the distributions a short position
-    owes. The decomposition does, because the short owes them. The difference is not an
-    error in either number and has to be named, or every reconciliation on a short book
-    reads as a few hundred dollars of unexplained loss.
+    A distribution reads positive when the account is long and receives it and negative
+    when it is short and owes it. Only the negative side needs an adjustment: paper
+    credits the long side on the pay date exactly as the book's carry credits it on the
+    ex-date, so the two already agree there.
 
-    Only the SHORT leg diverges: paper credits the long leg's dividends as it should.
-    The argument is therefore the carry on short positions only, and a session with no
-    short distribution has nothing to explain -- it must say nothing. The old signature
-    took the whole book's carry and compared it against a hard-coded zero, so on any
-    non-ex-date (carry 0.00) it printed "paper already carries the distributions", which
-    asserts a fact about the broker that was never measured and is false: on 2026-11-09
-    it said this while there was no distribution in the session at all.
+    The measured ledger on the 2026-11-05 pay date was four CDIV rows -- IEF -91.26,
+    TLT -113.25, LQD -100.39, HYG -131.25 -- against a -413.50 residual on that same
+    session. That is the whole discrepancy, and it is a date, not an error.
+    """
+    total = 0.0
+    by_sleeve: dict[str, float] = {}
+    for row in rows or ():
+        try:
+            amount = float(row.get("net_amount") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if amount >= 0.0:
+            continue
+        total += amount
+        if sleeve_of is not None:
+            sleeve = sleeve_of.get(str(row.get("symbol") or ""))
+            if sleeve:
+                by_sleeve[sleeve] = by_sleeve.get(sleeve, 0.0) + amount
+    return total, by_sleeve
+
+
+def distribution_add_back(carry_short: float, broker_debit: float) -> float:
+    """The paper-side timing item, with both of its legs.
+
+    The economic book accrues a short's distribution on the EX-date, so the sleeve row
+    books the carry there. Paper does not: the cash leaves the account on the PAY date,
+    and until then its equity sits above the economic book by the accrual. Adding the
+    accrual back is therefore correct only BETWEEN those two dates.
+
+    Once the broker's dividend activity appears, the same money has moved, so the item
+    has to be reversed rather than kept: the pay date's reconciliation needs the debit
+    as a negative term or it inherits the accrual as an unexplained loss. Over a period
+    that contains both dates the two legs cancel, which is the state the dashboard
+    bridge should show.
+    """
+    return -float(carry_short or 0.0) + float(broker_debit or 0.0)
+
+
+def short_distribution_note(
+    carry_short: float, broker_debit: float = 0.0
+) -> str | None:
+    """Name the timing item, on whichever side of the pay date this session sits.
+
+    Only the SHORT leg diverges between the two books: paper credits a long position's
+    distribution as it should. A session with nothing on either side has nothing to
+    explain and must say nothing.
+
+    The earlier version of this note asserted that paper never debits a short its
+    distributions. That was measured false on 2026-11-05, when the broker booked four
+    CDIV debits: paper does debit them, on the pay date. A note that states an
+    unmeasured broker behaviour is worse than no note, because it names a permanent
+    cause for what is a three-day timing difference.
     """
     carry_short = float(carry_short or 0.0)
-    if abs(carry_short) < 0.005:
-        return None
-    return (
-        "paper does not debit short distributions: equity is higher than the "
-        f"economic book by {-carry_short:,.2f} dollars"
-    )
+    broker_debit = float(broker_debit or 0.0)
+    if abs(broker_debit) >= 0.005:
+        return (
+            f"paper debited {-broker_debit:,.2f} for short distributions on the pay "
+            "date: the ex-date add-back is reversed here, so the timing item closes"
+        )
+    if abs(carry_short) >= 0.005:
+        return (
+            "paper has not debited the short distribution yet: equity is higher than "
+            f"the economic book by {-carry_short:,.2f} dollars until the pay date"
+        )
+    return None
 
 
 # ---------------------------------------------------------------- the daily job's hook
@@ -449,6 +502,9 @@ def record_prior_reconciliation(
         "execution_total": None,
         "fill_count": 0,
         "carry_short": float(carry_short or 0.0),
+        "distribution_debit": 0.0,
+        "distribution_by_sleeve": {},
+        "distribution_reason": None,
     }
 
     try:
@@ -456,6 +512,7 @@ def record_prior_reconciliation(
             EquityHistoryReadError,
             connect,
             fetch_equity_history,
+            fetch_session_dividends,
             fetch_session_fills,
         )
 
@@ -477,6 +534,22 @@ def record_prior_reconciliation(
         report["execution_total"] = pnl.total
         report["fill_count"] = pnl.fill_count
 
+        # The pay date of a distribution is only observable at the broker. A failed read
+        # is named rather than read as "no distributions": the silent zero is the
+        # assumption that produced a permanent gap in the first place.
+        debit_total, debit_by_sleeve = 0.0, {}
+        try:
+            debit_total, debit_by_sleeve = broker_distribution_debit(
+                fetch_session_dividends(client, session), sleeve_of=ASSET_CLASS
+            )
+            report["distribution_debit"] = debit_total
+            report["distribution_by_sleeve"] = debit_by_sleeve
+        except Exception as exc:
+            report["distribution_reason"] = f"{type(exc).__name__}: {exc}"
+            log.warning(
+                "prior reconciliation: distributions for %s unavailable: %s", session, exc
+            )
+
         try:
             equity = fetch_equity_history(client, session)
         except EquityHistoryReadError as exc:
@@ -492,14 +565,18 @@ def record_prior_reconciliation(
             )
             return report
 
-        expected = float(book_total) + pnl.total - float(carry_short or 0.0)
+        expected = (
+            float(book_total) + pnl.total + distribution_add_back(carry_short, debit_total)
+        )
         report["reconciliation"] = reconcile(expected, change)
         if report["reconciliation"]["warn"]:
             log.warning(
                 "prior-session reconciliation for %s does not reconcile: pipeline "
-                "%.2f + execution %.2f + paper add-back %.2f vs equity change %.2f "
-                "(gap %.2f)",
-                session, book_total, pnl.total, -float(carry_short or 0.0), change,
+                "%.2f + execution %.2f + paper add-back %.2f (ex-date accrual %.2f, "
+                "pay-date debit %.2f) vs equity change %.2f (gap %.2f)",
+                session, book_total, pnl.total,
+                distribution_add_back(carry_short, debit_total),
+                -float(carry_short or 0.0), debit_total, change,
                 report["reconciliation"]["gap"],
             )
         return report
@@ -557,6 +634,9 @@ def record_execution_component(
         "close_equity": {},
         "carry_short": short_carry,
         "paper_add_back": -short_carry,
+        "distribution_debit": 0.0,
+        "distribution_by_sleeve": {},
+        "distribution_reason": None,
         "note": short_distribution_note(short_carry),
     }
 
@@ -565,6 +645,7 @@ def record_execution_component(
             EquityHistoryReadError,
             connect,
             fetch_equity_history,
+            fetch_session_dividends,
             fetch_session_fills,
         )
 
@@ -587,6 +668,23 @@ def record_execution_component(
         report["by_sleeve"] = pnl.by_sleeve
         report["fill_count"] = pnl.fill_count
         report["skipped"] = pnl.skipped
+
+        # The other half of the timing item. A distribution the broker has already paid
+        # is not an add-back any more: the cash is gone from the account, so it belongs
+        # in the expectation with a negative sign or the pay date reads as a loss nobody
+        # can place. Read here, where the session's ledger is already open.
+        debit_total, debit_by_sleeve = 0.0, {}
+        try:
+            debit_total, debit_by_sleeve = broker_distribution_debit(
+                fetch_session_dividends(client, session), sleeve_of=ASSET_CLASS
+            )
+            report["distribution_debit"] = debit_total
+            report["distribution_by_sleeve"] = debit_by_sleeve
+        except Exception as exc:
+            report["distribution_reason"] = f"{type(exc).__name__}: {exc}"
+            log.warning("distributions for %s unavailable: %s", session, exc)
+        report["paper_add_back"] = distribution_add_back(short_carry, debit_total)
+        report["note"] = short_distribution_note(short_carry, debit_total)
 
         # Equity comes from the portfolio history, not from a NAV sampled at the 10:31
         # execution run: a decomposition measured close to close cannot be reconciled
@@ -618,12 +716,13 @@ def record_execution_component(
             )
             return report
 
-        # The paper account never books the distributions a short position owes, so its
-        # equity sits above the economic book by exactly that amount. Adding back the
-        # short leg is the only way the two sides describe the same thing; without it
-        # every short month reads as a few hundred dollars nobody can account for. The
-        # long leg is NOT added back: paper already paid it.
-        add_back = -short_carry
+        # Paper and the economic book disagree about WHEN a short's distribution is
+        # paid, not whether: the book accrues it on the ex-date and paper debits it on
+        # the pay date. The add-back carries both legs of that timing item, so an ex-date
+        # session is explained without a pay-date session inheriting it as residual. The
+        # long leg is NOT adjusted: paper credits it on the pay date and the carry
+        # credits it on the ex-date, which net out on their own.
+        add_back = distribution_add_back(short_carry, debit_total)
         report["paper_add_back"] = add_back
         expected = float(book_total) + pnl.total + add_back
         report["reconciliation"] = reconcile(expected, change)
@@ -651,8 +750,10 @@ def record_execution_component(
         if report["reconciliation"]["warn"]:
             log.warning(
                 "execution P&L does not reconcile for %s: pipeline %.2f + execution "
-                "%.2f + paper add-back %.2f vs equity change %.2f (gap %.2f)",
-                session, book_total, pnl.total, add_back, change,
+                "%.2f + paper add-back %.2f (ex-date accrual %.2f, pay-date debit "
+                "%.2f) vs equity change %.2f (gap %.2f)",
+                session, book_total, pnl.total, add_back, -short_carry, debit_total,
+                change,
                 report["reconciliation"]["gap"],
             )
         return report

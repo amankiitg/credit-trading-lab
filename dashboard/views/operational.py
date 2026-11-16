@@ -1151,10 +1151,22 @@ def _period_bridge(
     book = float(period["total"].sum())
     price = float(period["price_pnl"].sum())
     carry = float(period["carry_pnl"].sum())
-    # Paper never debits a short its distributions, so the short leg is added back.
-    # The conservative reading is the negative part of the book's carry: a long
-    # payout needs no adjustment because the broker already paid it.
-    add_back = float(-period.loc[period["carry_pnl"] < 0, "carry_pnl"].sum())
+    # The short leg's distribution is a timing item with two legs, and the bridge used to
+    # draw only the first. The book accrues it on the ex-date, inside carry_pnl; paper
+    # debits the cash on the PAY date, about three sessions later, and the evening job
+    # stores what it took in distribution_pnl. The accrual alone describes a period that
+    # closes before the pay date; once the pay date is inside the period, the broker's
+    # debit is the same money and cancels it. Over a full ex-to-pay period the term is
+    # therefore zero -- a statement about the book, not a term quietly dropped from the
+    # identity. Only the short side is adjusted: paper credits a long payout on the pay
+    # date and the carry credits it on the ex-date, which net out on their own.
+    accrued = float(-period.loc[period["carry_pnl"] < 0, "carry_pnl"].sum())
+    debited = 0.0
+    if "distribution_pnl" in period.columns:
+        debited = float(
+            period["distribution_pnl"].fillna(0.0).astype(float).sum()
+        )
+    add_back = accrued + debited
 
     execution_sessions: list[str] = []
     execution = 0.0
@@ -1187,6 +1199,7 @@ def _period_bridge(
         "execution": execution_value,
         "execution_sessions": len(execution_sessions),
         "sessions": len(sessions), "add_back": add_back, "cost": cost,
+        "add_back_accrued": accrued, "add_back_debited": debited,
         "residual": residual,
         "residual_pct": (
             residual / by_session[sessions[-1]] * 100
@@ -1233,7 +1246,15 @@ def _period_bridge(
         {
             "term": "Paper short-distribution add-back",
             "amount": f"${add_back:+,.2f}",
-            "note": "paper never debits a short its distributions; long payouts are already in carry",
+            "note": (
+                f"ex-date accrual ${accrued:+,.2f} + broker pay-date debit "
+                f"${debited:+,.2f}"
+                + (
+                    "; pay date in this period, so the item nets out"
+                    if abs(debited) > 0.005
+                    else "; pay date not in this period yet"
+                )
+            ),
         },
         {
             "term": "Turnover cost (subtracted)",

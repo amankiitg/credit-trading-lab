@@ -144,21 +144,26 @@ def test_the_warning_threshold_is_exclusive_at_exactly_the_boundary() -> None:
 
 
 def test_the_short_distribution_adjustment_is_named_not_absorbed() -> None:
-    """Paper never debits a short its distributions; the note has to say so.
+    """The note names which side of the pay date the session sits on.
 
-    A session with no short distribution has nothing to explain and must say NOTHING.
-    The old note compared the book's carry against a hard-coded zero and so printed
-    "paper already carries the distributions" on every non-ex-date -- on 2026-11-09,
-    where there was no distribution at all. That sentence claims the broker was
-    measured, which it was not, and contradicts the measured fact that paper does not
-    debit a short's distributions.
+    A session with no short distribution on either side has nothing to explain and must
+    say NOTHING. Between the ex-date and the pay date the accrual is still outstanding;
+    once the broker's debit appears the same money has moved and the note says so. The
+    earlier wording asserted that paper never debits a short -- measured false on
+    2026-11-05, when four CDIV debits were booked -- and was removed with the assumption
+    it described.
     """
     note = ep.short_distribution_note(-436.18)
 
-    assert "does not debit short distributions" in note
+    assert "has not debited the short distribution yet" in note
     assert "436.18" in note
 
+    paid = ep.short_distribution_note(0.0, -436.15)
+    assert "debited 436.15 for short distributions on the pay date" in paid
+    assert "reversed" in paid
+
     assert ep.short_distribution_note(0.0) is None
+    assert ep.short_distribution_note(0.0, 0.0) is None
     assert "paper already carries" not in (ep.short_distribution_note(0.0) or "")
 
 

@@ -20,11 +20,16 @@ Tables (created by the user in the Supabase dashboard):
 
   daily_sleeve_pnl (trade_date text, sleeve text, price_pnl float8, carry_pnl float8,
               total float8, book_total float8, created_at timestamptz,
+              execution_pnl float8, distribution_pnl float8,
               PRIMARY KEY (trade_date, sleeve))
              -- one row per session and sleeve, written by the signal cron (v9.8).
              -- trade_date here is the session the P&L belongs to, measured on the
              -- book held at the previous close, and is not necessarily the run date.
              -- The four rows of a session sum to book_total, which is the gate.
+             -- execution_pnl is the traded part of the session. distribution_pnl is the
+             -- cash the broker moved for distributions on that session (negative when
+             -- the book was short): the pay-date half of the add-back the bridge
+             -- carries against the sleeve's ex-date carry.
 
   close_equity (session_date date PK, equity numeric, source text,
               fetched_at timestamptz)
@@ -490,6 +495,25 @@ def execution_column_exists() -> bool:
         return True
     except Exception as exc:
         _log.info("daily_sleeve_pnl.execution_pnl is not there yet: %s", exc)
+        return False
+
+
+def distribution_column_exists() -> bool:
+    """Does public.daily_sleeve_pnl carry the distribution_pnl column yet?
+
+    Same probe, same reason as execution_column_exists: a missing column and a refused
+    write both come back falsy, and guessing which one happened sends someone chasing
+    the wrong thing. Returns False on any error, which is the safe direction -- the
+    caller then writes the columns that certainly exist and says so in the log.
+    """
+    client = get_supabase_client()
+    if client is None:
+        return False
+    try:
+        client.table("daily_sleeve_pnl").select("distribution_pnl").limit(1).execute()
+        return True
+    except Exception as exc:
+        _log.info("daily_sleeve_pnl.distribution_pnl is not there yet: %s", exc)
         return False
 
 

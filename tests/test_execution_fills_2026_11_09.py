@@ -289,7 +289,7 @@ def test_todays_email_has_four_fills_no_distribution_claim_and_a_residual(monkey
     assert "Execution P&L: 4 fills, +0.42 total" in body
     assert "(equity +0.18, rates +0.01, credit +0.22)" in body
     assert "paper already carries the distributions" not in body
-    assert "does not debit short distributions" not in body, "no distribution today"
+    assert "has not debited the short distribution yet" not in body, "no distribution today"
     assert "Reconciliation: pipeline + execution +190.95" in body
     assert "equity change +184.95" in body
     assert "(residual -6.00)" in body
@@ -325,4 +325,4 @@ def test_only_the_short_leg_is_added_back(monkeypatch) -> None:
     )
 
     assert short_owed["paper_add_back"] == pytest.approx(436.1833)
-    assert "does not debit short distributions" in short_owed["note"]
+    assert "has not debited the short distribution yet" in short_owed["note"]

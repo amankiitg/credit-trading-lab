@@ -107,11 +107,23 @@ def _metrics(at) -> dict:
     return {metric.label: metric for metric in at.metric}
 
 
+def _captions(at) -> str:
+    return " ".join(str(c.value) for c in at.caption)
+
+
 def test_the_pnl_card_reads_the_evening_signals_session(monkeypatch) -> None:
-    metrics = _metrics(_render(monkeypatch))
+    at = _render(monkeypatch)
+    metrics = _metrics(at)
 
     assert metrics["Daily P&L (close-to-close)"].value == "$+1,605.70"
-    assert metrics["Daily P&L (close-to-close)"].delta == "+1.59% · 2026-11-12 22:31 UTC"
+    assert "+1.59% · 2026-11-12 22:31 UTC" in _captions(at)
+
+
+def test_no_card_carries_a_delta_arrow(monkeypatch) -> None:
+    """Provenance belongs in a caption; a delta draws an up/down arrow."""
+    at = _render(monkeypatch)
+
+    assert [m.delta for m in at.metric if m.delta] == []
 
 
 def test_the_pnl_card_is_not_the_morning_execution_row(monkeypatch) -> None:
@@ -121,12 +133,12 @@ def test_the_pnl_card_is_not_the_morning_execution_row(monkeypatch) -> None:
 
 
 def test_both_cards_carry_the_same_run_timestamp(monkeypatch) -> None:
-    metrics = _metrics(_render(monkeypatch))
+    at = _render(monkeypatch)
+    captions = _captions(at)
 
-    assert metrics["NAV"].delta == "evening signal 2026-11-12 22:31 UTC"
-    # The card is narrow enough to ellipsise a delta, so the P&L label carries
-    # the timestamp itself; the two cards still name the same run minute.
-    assert metrics["Daily P&L (close-to-close)"].delta.endswith("2026-11-12 22:31 UTC")
+    assert "evening signal 2026-11-12 22:31 UTC" in captions
+    # Both cards name the same run minute in their captions.
+    assert captions.count("2026-11-12 22:31 UTC") >= 2
 
 
 def test_the_caption_names_the_pnl_run_and_session(monkeypatch) -> None:
@@ -141,10 +153,11 @@ def test_the_caption_names_the_pnl_run_and_session(monkeypatch) -> None:
 
 
 def test_pnl_falls_back_to_the_morning_row_when_no_session_is_stored(monkeypatch) -> None:
-    metrics = _metrics(_render(monkeypatch, sleeve_rows=[]))
+    at = _render(monkeypatch, sleeve_rows=[])
+    metrics = _metrics(at)
 
     assert metrics["Daily P&L (close-to-close)"].value == "$+1,308.15"
-    assert metrics["Daily P&L (close-to-close)"].delta == "+1.30% · 2026-11-12 15:32 UTC"
+    assert "+1.30% · 2026-11-12 15:32 UTC" in _captions(at)
 
 
 def test_the_flags_card_lists_each_flag_as_a_sentence(monkeypatch) -> None:

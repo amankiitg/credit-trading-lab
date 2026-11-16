@@ -74,6 +74,11 @@ WEIGHT_TTL_SECS: int = 600
 
 WEIGHT_COLOR: str = "#8a8a8a"
 
+# The share-count line sits on the lower panel's right axis. It has to be legible
+# against the sleeve-coloured score AND against the band, so it is a darker neutral
+# than the weight line rather than a second grey of the same value.
+SHARES_COLOR: str = "#4a4a4a"
+
 
 def _sleeve_colour(ticker: str) -> str:
     """The dashboard's asset-class colour for this ticker."""
@@ -109,15 +114,24 @@ def load_stored_weights() -> pd.DataFrame:
 
     rows = fetch_positions(latest_only=False)
     if not rows:
-        return pd.DataFrame(columns=["trade_date", "ticker", "weight"])
+        return pd.DataFrame(columns=["trade_date", "ticker", "weight", "shares"])
 
     frame = pd.DataFrame(rows)
     if "weight" not in frame.columns:
-        return pd.DataFrame(columns=["trade_date", "ticker", "weight"])
+        return pd.DataFrame(columns=["trade_date", "ticker", "weight", "shares"])
 
-    frame = frame[["trade_date", "ticker", "weight"]].copy()
+    # shares is carried alongside the weight because the two answer different
+    # questions about the same snapshot: the weight says how much of the book, the
+    # share count says how many units the rebalance band actually moved. A table
+    # without the column is a deployment older than the chart, not an error.
+    columns = ["trade_date", "ticker", "weight"]
+    if "shares" in frame.columns:
+        columns.append("shares")
+    frame = frame[columns].copy()
     frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce")
     frame["weight"] = pd.to_numeric(frame["weight"], errors="coerce")
+    if "shares" in frame.columns:
+        frame["shares"] = pd.to_numeric(frame["shares"], errors="coerce")
     frame = frame.dropna(subset=["trade_date", "ticker"])
     return frame.drop_duplicates(subset=["trade_date", "ticker"], keep="last")
 
@@ -155,37 +169,42 @@ def history_window(
     return sessions[start_pos:]
 
 
-def weight_series(
-    weights: pd.DataFrame,
+def _position_series(
+    positions: pd.DataFrame,
     ticker: str,
     sessions: pd.DatetimeIndex,
     first_live_session: pd.Timestamp | None,
+    column: str,
 ) -> pd.Series | None:
-    """The stored book weight in ``ticker``, one value per plotted session.
+    """One stored position column in ``ticker``, one value per plotted session.
 
     - Before the first live session: 0.0, because there was no book.
     - On a stored date with no row for this ticker: 0.0, because the book held none.
-    - On a session with no stored snapshot at all: the previous stored weight (the
+    - On a session with no stored snapshot at all: the previous stored value (the
       step holds), never an interpolated value.
     - A ticker with no stored row ever: ``None`` -- the chart says so.
 
     Returns None rather than a fabricated zero series.
+
+    Shared by the weight and the share count on purpose: the two lines are drawn
+    against the same snapshots, and a session where one is carried forward but the
+    other is not would put two different books on one chart.
     """
-    if weights.empty or sessions.empty:
+    if positions.empty or sessions.empty or column not in positions.columns:
         return None
 
-    ticker_rows = weights[weights["ticker"] == ticker]
-    if ticker_rows.empty or ticker_rows["weight"].notna().sum() == 0:
-        # No row at all, or only rows with a null weight: the weight is unknown,
-        # not zero. The chart says so rather than drawing a flat line at 0.
+    ticker_rows = positions[positions["ticker"] == ticker]
+    if ticker_rows.empty or ticker_rows[column].notna().sum() == 0:
+        # No row at all, or only rows with a null value: the value is unknown, not
+        # zero. The chart says so rather than drawing a flat line at 0.
         return None
 
-    stored_dates = pd.DatetimeIndex(sorted(weights["trade_date"].dropna().unique()))
+    stored_dates = pd.DatetimeIndex(sorted(positions["trade_date"].dropna().unique()))
     # Every stored date has a value: the row's weight, or zero when this ticker
     # was not held. This is the distinction between "not held" and "no snapshot".
     by_date = (
-        ticker_rows.dropna(subset=["weight"])
-        .set_index("trade_date")["weight"]
+        ticker_rows.dropna(subset=[column])
+        .set_index("trade_date")[column]
         .reindex(stored_dates)
         .fillna(0.0)
     )
@@ -204,6 +223,34 @@ def weight_series(
     return aligned.astype(float)
 
 
+def weight_series(
+    weights: pd.DataFrame,
+    ticker: str,
+    sessions: pd.DatetimeIndex,
+    first_live_session: pd.Timestamp | None,
+) -> pd.Series | None:
+    """The stored book weight in ``ticker``, on the step rule above."""
+    return _position_series(weights, ticker, sessions, first_live_session, "weight")
+
+
+def shares_series(
+    positions: pd.DataFrame,
+    ticker: str,
+    sessions: pd.DatetimeIndex,
+    first_live_session: pd.Timestamp | None,
+) -> pd.Series | None:
+    """The book's SHARE COUNT in ``ticker``, on the same step rule as the weight.
+
+    Same snapshots, same carry-forward, same zero before the first live session:
+    the two lines have to describe one book, or the panel would say the position
+    changed when only the notional did.
+
+    None when the table predates the column, which omits the axis rather than
+    drawing a book that held nothing.
+    """
+    return _position_series(positions, ticker, sessions, first_live_session, "shares")
+
+
 def build_ticker_history(
     closes: pd.DataFrame,
     weights: pd.DataFrame,
@@ -219,12 +266,14 @@ def build_ticker_history(
             "lookback": empty.copy(),
             "trend_score": empty.copy(),
             "weight": None,
+            "shares": None,
             "vol": None,
             "dead_zone": None,
             "has_price": False,
             "has_lookback": False,
             "has_trend_score": False,
             "has_weight": False,
+            "has_shares": False,
         }
 
     full = closes[ticker].astype(float)
@@ -233,6 +282,7 @@ def build_ticker_history(
     lookback = full.shift(TREND_LOOKBACK_SESSIONS).reindex(sessions)
     trend_score = price / lookback - 1.0
     weight = weight_series(weights, ticker, sessions, first_live_session)
+    shares = shares_series(weights, ticker, sessions, first_live_session)
     vol = realised_vol(closes, ticker)
     band = dead_zone_half_width(vol)
 
@@ -241,12 +291,14 @@ def build_ticker_history(
         "lookback": lookback,
         "trend_score": trend_score,
         "weight": weight,
+        "shares": shares,
         "vol": vol,
         "dead_zone": band,
         "has_price": bool(price.notna().sum() >= 2),
         "has_lookback": bool(lookback.notna().any()),
         "has_trend_score": bool(trend_score.notna().sum() >= 2),
         "has_weight": weight is not None,
+        "has_shares": shares is not None,
     }
 
 
@@ -301,6 +353,23 @@ def _weight_range(weight: pd.Series | None) -> list[float]:
     return [-bound, bound]
 
 
+def _shares_range(shares: pd.Series | None) -> list[float]:
+    """Y-range for the share-count axis, always including zero.
+
+    Zero is in range on purpose: the line crossing it is a long-to-short flip, and
+    it is the one feature of this axis a reader looks for.
+    """
+    if shares is None or shares.dropna().empty:
+        return [0.0, 1.0]
+    values = shares.dropna()
+    low = min(0.0, float(values.min()))
+    high = max(0.0, float(values.max()))
+    if high <= low:
+        return [low - 1.0, high + 1.0]
+    pad = (high - low) * 0.08
+    return [low - pad, high + pad]
+
+
 def ticker_figure(
     ticker: str,
     history: dict,
@@ -316,7 +385,8 @@ def ticker_figure(
         shared_xaxes=True,
         vertical_spacing=0.11,
         row_heights=[0.62, 0.38],
-        specs=[[{"secondary_y": True}], [{"secondary_y": False}]],
+        # Both rows carry a secondary axis: the weight on top, the share count below.
+        specs=[[{"secondary_y": True}], [{"secondary_y": True}]],
     )
 
     band = history.get("dead_zone")
@@ -374,6 +444,14 @@ def ticker_figure(
             secondary_y=True,
         )
     if history["has_trend_score"]:
+        # The dead zone is a property of the ticker, not a series, so it has no trace
+        # of its own to hover. It rides along as customdata on the score line: the
+        # reader then gets the band and the score in the same tooltip, at the session
+        # they are actually looking at, instead of a caption they have to hold in
+        # their head.
+        band_values = (
+            np.full(len(sessions), float(band)) if band is not None else np.zeros(len(sessions))
+        )
         fig.add_trace(
             go.Scatter(
                 x=sessions,
@@ -381,11 +459,29 @@ def ticker_figure(
                 mode="lines",
                 name="trend score",
                 line=dict(color=colour, width=1.8),
-                hovertemplate="trend score %{y:.2%}<extra></extra>",
+                customdata=band_values,
+                hovertemplate=(
+                    "trend score %{y:.2%}<br>"
+                    "dead zone ±%{customdata:.2%}<extra></extra>"
+                ),
             ),
             row=2,
             col=1,
         )
+        if history.get("has_shares"):
+            fig.add_trace(
+                go.Scatter(
+                    x=sessions,
+                    y=history["shares"].values,
+                    mode="lines",
+                    name="shares held",
+                    line=dict(color=SHARES_COLOR, width=1.4, shape="hv"),
+                    hovertemplate="shares held %{y:,.2f}<extra></extra>",
+                ),
+                row=2,
+                col=1,
+                secondary_y=True,
+            )
 
     fig.update_layout(
         title=dict(text=f"{ticker} · {ASSET_CLASS.get(ticker, '')}", font=dict(size=13)),
@@ -439,6 +535,23 @@ def ticker_figure(
         row=2,
         col=1,
     )
+    # Only drawn when the snapshot table has the column: an absent axis is better
+    # than an axis for a book that never existed.
+    if history.get("has_shares"):
+        fig.update_yaxes(
+            title_text="shares held",
+            secondary_y=True,
+            fixedrange=True,
+            range=_shares_range(history["shares"]),
+            tickformat=",.0f",
+            zeroline=True,
+            zerolinecolor=SHARES_COLOR,
+            zerolinewidth=1,
+            showgrid=False,
+            automargin=True,
+            row=2,
+            col=1,
+        )
     if band is not None:
         fig.add_annotation(
             text=f"dead zone ±{band:.1%}",
@@ -501,6 +614,9 @@ def _legend_slot(container) -> None:
         "moving average). Where it crosses the solid line is where the trend flips.\n"
         "- **Grey step line** — the book's position weight in that ticker, on the "
         "right axis. The zero line separates long from short.\n\n"
+        "- **Dark step line (lower panel)** — the share count held in that ticker, on "
+        "the lower panel's right axis, read from the same stored snapshot as the "
+        "weight.\n\n"
         "- **Trend score (lower panel)** — close / close 120 sessions ago − 1, "
         "on the same sessions. The shaded band is the dead zone, ±0.5 × that "
         "ticker's own 63-session realised vol × √(120/252); the signal only flips "
@@ -573,6 +689,11 @@ def render_signal_history() -> None:
             "realised vol. Closes are the live source the risk panel reads; weights "
             "are the stored daily positions. Nothing is zero-filled: a ticker without "
             "history says so on its own chart."
+        )
+        st.caption(
+            "Share count changes for two reasons: a signal flip (score leaves the grey "
+            "band) or a rebalance-band trade (NAV or vol drift beyond 20%); inside the "
+            "grey band only the second can happen."
         )
 
         try:

@@ -62,6 +62,30 @@ def test_opening_from_flat_and_closing_to_flat_are_not_flips() -> None:
     assert ap.should_send_order(target_notional=400.0, current_notional=0.0) is True
 
 
+def test_a_dust_residue_on_the_wrong_side_is_not_a_flip() -> None:
+    """Fifty cents is not a change of thesis.
+
+    The flip exemption exists so a real reversal is never suppressed by the size band.
+    A residue smaller than DUST_THRESHOLD_USD is not a reversal: calling it one would
+    send a close-and-reopen pair -- two legs and two costs -- to move fifty cents that
+    the dust path closes for nothing.
+    """
+    assert ap.is_position_flip(target_notional=5_000.0, current_notional=-0.50) is False
+    assert ap.should_send_order(target_notional=100.0, current_notional=-0.50) is False
+
+    orders = ap.compute_delta_orders({"SPY": 0.001}, {"SPY": -0.50}, paper_nav=100_000.0)
+    assert orders == [], "below the floor, and not a flip: nothing to send"
+
+
+def test_a_real_wrong_side_position_still_flips() -> None:
+    """$500 against a long target is a genuine reversal and must trade."""
+    assert ap.is_position_flip(target_notional=5_000.0, current_notional=-500.0) is True
+    assert ap.should_send_order(target_notional=5_000.0, current_notional=-500.0) is True
+
+    orders = ap.compute_delta_orders({"SPY": 0.05}, {"SPY": -500.0}, paper_nav=100_000.0)
+    assert [o.position_intent for o in orders] == ["buy_to_close", "buy_to_open"]
+
+
 def test_the_absolute_floor_still_applies_to_tiny_positions() -> None:
     """5% of a $2,000 name is $100, so the $250 floor is what decides there."""
     assert ap.min_delta_notional(2_000.0) == pytest.approx(250.0)

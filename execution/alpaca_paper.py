@@ -737,10 +737,15 @@ def is_position_flip(target_notional: float, current_notional: float) -> bool:
 
     Opening from flat and closing to flat are NOT flips: they are one-directional and
     are governed by the size rules like any other delta.
+
+    Nor is a position smaller than DUST_THRESHOLD_USD ($1). A fifty-cent residue on the
+    wrong side of the book is not a change of thesis, and treating it as one would send
+    a full close-and-reopen pair to save a position the dust path already closes. A real
+    $500 wrong-side holding is a different thing: that is a flip and always trades.
     """
     target_n = float(target_notional)
     current_n = float(current_notional)
-    if target_n == 0.0 or current_n == 0.0:
+    if target_n == 0.0 or abs(current_n) < DUST_THRESHOLD_USD:
         return False
     return (target_n > 0.0) != (current_n > 0.0)
 

@@ -370,6 +370,7 @@ def _get_proposed_trade() -> tuple[list[dict], str, float]:
     """
     import json
     from signals.etf_universe import UNIVERSE
+    from execution.alpaca_paper import should_send_order
 
     as_of_date     = get_setting("signal_as_of_date") or "—"
     weights_json   = get_setting("signal_target_weights")
@@ -393,7 +394,10 @@ def _get_proposed_trade() -> tuple[list[dict], str, float]:
         delta            = target_notional - current_notional
         current_w        = current_notional / nav if nav > 0 else 0.0
 
-        if abs(delta) < 250:
+        # The same rule the execution job applies, imported rather than re-typed: a
+        # dashboard that says "skip" for an order the cron will send (or the reverse) is
+        # worse than one that shows no threshold at all.
+        if not should_send_order(target_notional, current_notional):
             action = "skip — within band"
         elif delta > 0:
             action = "buy"

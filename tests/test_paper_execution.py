@@ -1471,17 +1471,23 @@ def test_shortable_filter_blocks_increasing_a_short_but_not_reducing_it() -> Non
     LQD was already short and the signal wanted it shorter, which is a
     sell_to_open. Wanting it less short is a buy_to_close and must be allowed
     even though the asset is not shortable.
+
+    The target weights here are wider than the 2026-11-13 case they come from. That day
+    the two deltas were $290 and $577, which cleared the old flat $250 minimum and do
+    not clear max($250, 5% of the target notional) = about $1,300. The delta maths and
+    the shortable filter are what this test is about, so the weights move rather than
+    the assertion: a same-sign short adjustment still produces one leg each way.
     """
     current = {"LQD": -26_587.58}
     nav = 101_013.45
 
-    increasing = compute_delta_orders({"LQD": -0.266083}, current, paper_nav=nav)
+    increasing = compute_delta_orders({"LQD": -0.30}, current, paper_nav=nav)
     assert [o.position_intent for o in increasing] == ["sell_to_open"]
     assert apply_shortable_filter(increasing, {"LQD": False})[0].guard_status == (
         GUARD_SKIPPED_NOT_SHORTABLE
     )
 
-    reducing = compute_delta_orders({"LQD": -0.257490}, current, paper_nav=nav)
+    reducing = compute_delta_orders({"LQD": -0.22}, current, paper_nav=nav)
     assert [o.position_intent for o in reducing] == ["buy_to_close"]
     assert apply_shortable_filter(reducing, {"LQD": False})[0].guard_status == "PENDING"
 

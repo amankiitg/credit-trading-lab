@@ -75,7 +75,16 @@ MAX_TRADED_NOTIONAL_PER_RUN: float = float(
     os.environ.get("MAX_TRADED_NOTIONAL_PER_RUN", "16000")
 )
 MAX_ORDERS_PER_RUN: int = 20
-DELTA_MIN_NOTIONAL: float = 250.0  # matches Panel H display threshold
+# The absolute floor: below this a delta is noise, whatever the position's size.
+DELTA_MIN_NOTIONAL: float = 250.0
+# ...and the proportional minimum that actually governs a normal-sized position.
+# 5% of the name's own TARGET notional. The signal already bands the WEIGHT at 20% of
+# the desired weight, and a flat $250 sat far inside that band: $250 is 0.8% of a $30k
+# name and 0.1% of a $250k one, so on nearly every session the execution minimum -- not
+# the band -- decided, and the book rebalanced to a few hundred dollars of price drift.
+# Measured on 19 years: 1,825 name-trades a year at $250 against 118 at 5%, for roughly
+# the same ending book and $750/yr less cost.
+EXECUTION_MIN_PCT: float = 0.05
 DUST_THRESHOLD_USD: float = 1.0  # positions below this are closed via close_position
 DRY_RUN_DEFAULT: bool = os.environ.get("DRY_RUN_DEFAULT", "true").lower() != "false"
 PAPER_NAV_DEFAULT: float = 100_000.0
@@ -604,9 +613,11 @@ def diff_positions(
     the entire book rather than only the gaps. Each row is
     {ticker, cached, live, diff (live - cached), material}.
 
-    `material` uses DELTA_MIN_NOTIONAL -- the same threshold execution uses to
-    decide whether a delta is worth trading -- so a row marked material is one
-    the next run would treat as a real position, not day-to-day price noise.
+    `material` uses DELTA_MIN_NOTIONAL, the ABSOLUTE floor of the trading rule, not the
+    whole of it: execution also requires EXECUTION_MIN_PCT (5%) of the target notional
+    (should_send_order), and applying that here would make a drift alert quieter the
+    larger the position. For a reconciliation report the flat floor is the right test:
+    it asks "is this gap real", not "would tonight's run trade it".
     """
     rows: list[dict] = []
     for ticker in UNIVERSE:
@@ -705,6 +716,57 @@ def check_position_drift(
 
 # ---------------------------------------------------------------- order translation
 
+def min_delta_notional(target_notional: float) -> float:
+    """The smallest dollar delta worth sending, for a name of this target size.
+
+    Two floors, whichever is larger:
+
+      - DELTA_MIN_NOTIONAL ($250), absolute. A tiny position must not be traded on
+        noise, and a name whose target is near zero has no sensible percentage.
+      - EXECUTION_MIN_PCT (5%) of the name's own TARGET notional, so the tolerance
+        scales with the position: $1,500 on a $30k name, $12,500 on a $250k one.
+
+    The target, not the current notional: the rule should be a property of where the
+    book is going, and it must not change because price drift moved the position.
+    """
+    return max(float(DELTA_MIN_NOTIONAL), float(EXECUTION_MIN_PCT) * abs(float(target_notional)))
+
+
+def is_position_flip(target_notional: float, current_notional: float) -> bool:
+    """True when the position would have to cross from long to short or back.
+
+    Opening from flat and closing to flat are NOT flips: they are one-directional and
+    are governed by the size rules like any other delta.
+
+    Nor is a position smaller than DUST_THRESHOLD_USD ($1). A fifty-cent residue on the
+    wrong side of the book is not a change of thesis, and treating it as one would send
+    a full close-and-reopen pair to save a position the dust path already closes. A real
+    $500 wrong-side holding is a different thing: that is a flip and always trades.
+    """
+    target_n = float(target_notional)
+    current_n = float(current_notional)
+    if target_n == 0.0 or abs(current_n) < DUST_THRESHOLD_USD:
+        return False
+    return (target_n > 0.0) != (current_n > 0.0)
+
+
+def should_send_order(target_notional: float, current_notional: float) -> bool:
+    """Is this delta worth an order?
+
+    A flip ALWAYS is. A reversal is a change of thesis, not a rebalancing decision, and
+    the percentage band would otherwise let a small holding sit on the wrong side: a
+    $20k long against a $20k short target differs by $40k and clears any band, but a
+    $300 long against a $200 short target does not -- and leaving a name on the wrong
+    side to save a trade is the one error that compounds.
+
+    Everything else must clear max($250, 5% of the target notional).
+    """
+    if is_position_flip(target_notional, current_notional):
+        return True
+    gap = abs(float(target_notional) - float(current_notional))
+    return gap >= min_delta_notional(target_notional)
+
+
 def compute_delta_orders(
     target_weights: dict[str, float],
     current_notionals: dict[str, float],
@@ -730,7 +792,7 @@ def compute_delta_orders(
         current_n = current_notionals.get(ticker, 0.0)
         delta_n = target_n - current_n
 
-        if abs(delta_n) < DELTA_MIN_NOTIONAL:
+        if not should_send_order(target_n, current_n):
             continue
 
         same_sign = (current_n > 0 and target_n > 0) or (current_n < 0 and target_n < 0)

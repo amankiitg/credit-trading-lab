@@ -1959,7 +1959,9 @@ def render(
             yaxis_title="net exposure, % of NAV",
             barmode="group",
         )
-        _plot(fig, height=340)
+        # The legend goes below the plot: at the top right it landed on the chart
+        # title as soon as the column was narrow, which it is on a phone.
+        _plot(fig, height=360, legend_below=True)
         st.caption(
             f"Full bar = the sleeve's current net exposure; pale bar = the signal's "
             f"target for {as_of_date}. {SIGN_NOTE}."

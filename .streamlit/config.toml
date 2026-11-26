@@ -1,0 +1,43 @@
+# Credit Lab page theme: warm paper, near-black ink, one acid accent.
+# The look is the one shipped on the EFB dashboard: paper surfaces, 1px ink rules,
+# square corners, Atkinson Hyperlegible for words and the system monospace for
+# labels. Colours here are the base layer; dashboard/theme.py carries the rules that
+# the theme options cannot express.
+
+[theme]
+base = "light"
+primaryColor = "#e6ff4f"
+backgroundColor = "#f3f0e8"
+secondaryBackgroundColor = "#e9e5dc"
+textColor = "#191713"
+borderColor = "#191713"
+linkColor = "#191713"
+baseRadius = "0"
+buttonRadius = "0"
+dataframeBorderColor = "#191713"
+dataframeHeaderBackgroundColor = "#191713"
+dataframeHeaderTextColor = "#f3f0e8"
+font = "Atkinson Hyperlegible, Arial Narrow, ui-sans-serif, system-ui, sans-serif"
+
+# The word face, self-hosted from dashboard/static and served by Streamlit.
+# No Google Fonts link and no external CDN: these files ship with the app.
+[[theme.fontFaces]]
+family = "Atkinson Hyperlegible"
+url = "app/static/fonts/atkinson-hyperlegible-latin-400-normal.woff2"
+weight = "400"
+style = "normal"
+
+[[theme.fontFaces]]
+family = "Atkinson Hyperlegible"
+url = "app/static/fonts/atkinson-hyperlegible-latin-400-italic.woff2"
+weight = "400"
+style = "italic"
+
+[[theme.fontFaces]]
+family = "Atkinson Hyperlegible"
+url = "app/static/fonts/atkinson-hyperlegible-latin-700-normal.woff2"
+weight = "700"
+style = "normal"
+
+[server]
+enableStaticServing = true

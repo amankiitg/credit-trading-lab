@@ -60,10 +60,22 @@ else:
 
 import streamlit as st  # noqa: E402
 
+from dashboard import theme  # noqa: E402
+
 st.set_page_config(
     page_title="Credit Lab | Multi-Asset Trend",
     page_icon=":test_tube:",
     layout="wide",
+)
+
+# ---------------------------------------------------------------- page look
+# One stylesheet, then the masthead that sits above everything else. Both are
+# display only: they read no data and change no number.
+theme.apply()
+theme.masthead(
+    name="Credit Lab | Multi-Asset Trend",
+    subtitle="built from stored runs, not live broker calls",
+    mark="CL",
 )
 
 # ----------------------------------------------------------------- auth gate

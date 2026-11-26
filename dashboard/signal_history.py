@@ -36,6 +36,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 
+from dashboard import plotly_theme
 from signals.etf_universe import ASSET_CLASS, UNIVERSE
 
 # The trend base the signal compares today's close against.
@@ -72,7 +73,11 @@ HISTORY_LOOKBACK_DAYS: int = 760
 
 WEIGHT_TTL_SECS: int = 600
 
-WEIGHT_COLOR: str = "#8a8a8a"
+# The two neutrals are warm greys from the page's own palette, at the lightness the
+# cool greys they replace had on paper: #8a8a8a for the weight line, #4a4a4a for the
+# share count. The chart template is shared with the rest of the page, so the axes,
+# gridlines and tick labels come from dashboard/plotly_theme.py.
+WEIGHT_COLOR: str = plotly_theme.CHART_NEUTRAL
 
 # The first session ``public.positions`` carries a shares column for (measured: 288
 # cells from this date). Before it, the only record of how many shares the book held is
@@ -85,7 +90,7 @@ SHARE_SNAPSHOT_FROM: pd.Timestamp = pd.Timestamp("2026-09-28")
 # The share-count line sits on the lower panel's right axis. It has to be legible
 # against the sleeve-coloured score AND against the band, so it is a darker neutral
 # than the weight line rather than a second grey of the same value.
-SHARES_COLOR: str = "#4a4a4a"
+SHARES_COLOR: str = "#3e3b34"
 
 
 def _sleeve_colour(ticker: str) -> str:
@@ -490,7 +495,7 @@ def ticker_figure(
             x1=1,
             y0=-band,
             y1=band,
-            fillcolor="rgba(138,138,138,0.16)",
+            fillcolor="rgba(143,137,124,0.16)",
             line_width=0,
             layer="below",
         )
@@ -598,7 +603,7 @@ def ticker_figure(
         range=_price_range(history["price"], history["lookback"]),
         automargin=True,
         showgrid=True,
-        gridcolor="rgba(0,0,0,0.06)",
+        gridcolor=plotly_theme.CHART_GRID,
         row=1,
         col=1,
     )
@@ -625,7 +630,7 @@ def ticker_figure(
         zerolinecolor=NEUTRAL_COLOR,
         zerolinewidth=1,
         showgrid=True,
-        gridcolor="rgba(0,0,0,0.06)",
+        gridcolor=plotly_theme.CHART_GRID,
         automargin=True,
         row=2,
         col=1,

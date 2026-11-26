@@ -43,6 +43,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from dashboard import plotly_theme, theme
 from dashboard.signal_history import render_signal_history
 from dashboard.supabase_client import (
     fetch_daily_sleeve_pnl,
@@ -73,8 +74,12 @@ ASSET_CLASS_COLORS: dict[str, str] = {
 SLEEVE_COLORS: dict[str, str] = ASSET_CLASS_COLORS
 SLEEVE_ORDER: tuple[str, ...] = ("equity", "rates", "credit", "commodity")
 
-NEUTRAL_COLOR = "#8a8a8a"
-BOOK_TOTAL_COLOR = "#111111"
+# Warm equivalents of the two greys these charts used to hard-code, at the same
+# lightness: the mid warm grey for a series that carries no sleeve, and the page ink
+# for the book's own total. Both tokens live in dashboard/plotly_theme.py, so a figure
+# built anywhere on the page paints from the same two values.
+NEUTRAL_COLOR = plotly_theme.CHART_NEUTRAL
+BOOK_TOTAL_COLOR = theme.INK
 
 # Caption fragment wherever a sleeve bar can point either way.
 SIGN_NOTE = "colour is the asset class, the sign of the bar shows direction"
@@ -94,7 +99,9 @@ MONITOR_ONLY_NOTE = (
 )
 
 PLOTLY_CONFIG = {
-    "displayModeBar": True,
+    # The buttons stay one hover away; the mode bar is not drawn over a static
+    # legend, which is where it used to land on a wide window.
+    "displayModeBar": "hover",
     # Scrolling the page must never zoom a chart: the axes are fixedrange below
     # and the wheel never reaches Plotly.
     "scrollZoom": False,
@@ -819,8 +826,14 @@ def _performance_stats(nav_frame: pd.DataFrame) -> dict:
 # ---------------------------------------------------------------- rendering
 
 def _section(title: str) -> None:
-    """One divider and one heading. Called once per section, so never doubled."""
-    st.markdown("---")
+    """One window bar and one heading. Called once per section, so never doubled.
+
+    The bar is drawn by the stylesheet (dashboard/theme.py) from the label it is
+    given: a paper-2 rail with three dots on the left and the section's own name in
+    mono caps on the right, so a section opens the way a card does. It is a rule, not
+    layout, so the section's content does not move.
+    """
+    theme.window_bar(title)
     st.markdown(f"### {title}")
 
 
@@ -837,14 +850,20 @@ def _plot(
     margin = dict(l=10, r=10, t=top, b=10)
     legend = dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     if legend_below:
-        legend = dict(orientation="h", yanchor="top", y=-0.18, xanchor="left", x=0)
-        margin["b"] = 80
+        # Below the plot, and below the axis title too: at y=-0.18 the legend
+        # landed on top of an x-axis title when the chart had one.
+        legend = dict(orientation="h", yanchor="top", y=-0.28, xanchor="left", x=0)
+        margin["b"] = 104
     if legend_font_size is not None:
         legend["font"] = {"size": legend_font_size}
     # Fixed axes: the wheel never zooms and a drag never pans, whatever the page
     # does around the chart. Pair this with scrollZoom=False in PLOTLY_CONFIG.
     fig.update_xaxes(fixedrange=True)
     fig.update_yaxes(fixedrange=True)
+    # One template for every figure on the page: paper behind the plot, ink axes
+    # and gridlines, mono tick labels. Applied here, so no chart can be drawn in
+    # Plotly's default blue-grey.
+    plotly_theme.apply(fig)
     fig.update_layout(
         height=height,
         margin=margin,
@@ -1295,7 +1314,7 @@ def _render_period_bridge(
         "Each row is one term of the identity below; the residual is what is left "
         "over, and it should stay near zero."
     )
-    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+    theme.html_table(pd.DataFrame(rows), numeric=("amount",))
 
     missing = summary["sessions"] - summary["execution_sessions"]
     parts = [
@@ -1378,7 +1397,9 @@ def _render_header(
     The NAV and daily P&L cards are one run apart in time only if something is
     wrong: both carry the run timestamp of the NAV the page is showing.
     """
-    st.title("Credit Lab | Multi-Asset Trend")
+    # The app name is in the masthead (dashboard/app.py), drawn once above the tab
+    # strip. This caption is the page's own lede: the two dates and where they came
+    # from.
     st.caption(
         f"Signal as of {as_of_date} · positions snapshot "
         f"{str(positions_data[0].get('trade_date', '—')) if positions_data else '—'} · "
@@ -1529,42 +1550,46 @@ def _render_mctr_pctr(nav: float, positions_data: list[dict]) -> None:
         yaxis_title="% of total risk",
         showlegend=False,
     )
-    _plot(fig, height=340)
-    st.caption(
-        "Sleeve shares sum to 100%; a negative bar is a sleeve that reduces the "
-        f"book's risk. {SIGN_NOTE}."
+    # The two halves of the same question, side by side at a wide window: which
+    # sleeve, then which name inside it. One chart alone spanned the full width and
+    # was read across 1700 pixels.
+    by_ticker = risk_df.sort_values("pctr", ascending=False)
+    ticker_y = [float(v) * 100 for v in by_ticker["pctr"]]
+    ticker_colors = [_sleeve_colour(_sleeve_of(str(t))) for t in by_ticker.index]
+    ticker_fig = go.Figure(
+        go.Bar(
+            x=list(by_ticker.index),
+            y=ticker_y,
+            marker_color=ticker_colors,
+            hovertemplate=(
+                "%{x}<br>%{y:.2f}% of book risk<br>"
+                "weight %{customdata[0]:+.1%}<extra></extra>"
+            ),
+            customdata=[[float(w)] for w in by_ticker["weight"]],
+        )
+    )
+    ticker_fig.update_layout(
+        title="Share of book risk by ticker",
+        yaxis_title="% of total risk",
+        showlegend=False,
     )
 
-    with st.expander("Per-ticker detail (weight, marginal risk, contribution)"):
-        by_ticker = risk_df.sort_values("pctr", ascending=False)
-        ticker_y = [float(v) * 100 for v in by_ticker["pctr"]]
-        ticker_colors = [_sleeve_colour(_sleeve_of(str(t))) for t in by_ticker.index]
-        fig = go.Figure(
-            go.Bar(
-                x=list(by_ticker.index),
-                y=ticker_y,
-                marker_color=ticker_colors,
-                hovertemplate=(
-                    "%{x}<br>%{y:.2f}% of book risk<br>"
-                    "weight %{customdata[0]:+.1%}<extra></extra>"
-                ),
-                customdata=[[float(w)] for w in by_ticker["weight"]],
-            )
+    sleeve_col, ticker_col = st.columns(2)
+    with sleeve_col:
+        _plot(fig, height=360)
+        st.caption(
+            "Sleeve shares sum to 100%; a negative bar is a sleeve that reduces the "
+            f"book's risk. {SIGN_NOTE}."
         )
-        fig.update_layout(
-            title="Share of book risk by ticker",
-            yaxis_title="% of total risk",
-            showlegend=False,
-        )
-        _plot(fig, height=340)
-        st.dataframe(
-            risk_df[["sleeve", "weight", "mctr", "ctr", "pctr"]].round(4),
-            width="stretch",
-        )
+    with ticker_col:
+        _plot(ticker_fig, height=360)
         st.caption(
             f"Shares sum to {risk_df['pctr'].sum():.4f}. Contribution is annualized "
             f"risk; the share is its fraction of the book's total. {SIGN_NOTE}."
         )
+
+    with st.expander("Per-ticker detail (weight, marginal risk, contribution)"):
+        theme.html_table(risk_df[["sleeve", "weight", "mctr", "ctr", "pctr"]].round(4))
 
 
 def render(
@@ -1716,7 +1741,12 @@ def render(
             st.success(f"{prefix}All positions NORMAL — no stop states active.")
 
     if not df_trade.empty:
-        st.dataframe(df_trade, width="stretch", hide_index=True)
+        theme.html_table(
+            df_trade,
+            numeric=("current ($)", "current wt", "target wt", "delta ($)"),
+            pill_column="risk status",
+            pill_alert=("REDUCED", "STOPPED"),
+        )
 
     pending_rows = [
         r for r in proposed_rows
@@ -2020,98 +2050,112 @@ def render(
             "the next signal run."
         )
 
-    if stats["n_navs"] >= 2:
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=window_nav["trade_date"],
-            y=window_nav["nav"].astype(float),
-            mode="lines+markers",
-            line=dict(color=BOOK_TOTAL_COLOR, width=2),
-            marker=dict(size=4),
-            name="Evening close NAV (official)",
-            customdata=[[_fmt_utc(ts)] for ts in window_nav["timestamp"]],
-            hovertemplate=(
-                "%{x|%Y-%m-%d}<br>official NAV %{y:,.2f}<br>"
-                "%{customdata[0]}<extra></extra>"
-            ),
-        ))
-        if not df_pnl.empty and "live_nav" in df_pnl.columns:
-            morning = df_pnl.dropna(subset=["live_nav"]).copy()
-            morning["trade_date"] = pd.to_datetime(morning["trade_date"], errors="coerce")
-            morning = morning.dropna(subset=["trade_date"]).sort_values("trade_date")
-            if history_start is not None:
-                morning = morning[morning["trade_date"] >= pd.Timestamp(history_start)]
-            if not morning.empty:
-                fig.add_trace(go.Scatter(
-                    x=morning["trade_date"],
-                    y=morning["live_nav"].astype(float),
-                    mode="lines+markers",
-                    line=dict(color=NEUTRAL_COLOR, width=1.5, dash="dot"),
-                    marker=dict(size=3),
-                    name="Morning execution NAV (secondary)",
-                    hovertemplate=(
-                        "%{x|%Y-%m-%d}<br>morning NAV %{y:,.2f}"
-                        "<extra></extra>"
-                    ),
-                ))
-        fig.update_layout(
-            title="Account value — official evening NAV",
-            yaxis_title="account equity",
-        )
-        # The legend names the official and secondary lines; below the plot it
-        # cannot collide with the title at a narrow window.
-        _plot(fig, height=380, legend_below=True)
-        st.caption(
-            "Official NAV is the last stored close, or the evening run's own NAV "
-            "until that close is published: "
-            + f"last ${stats['last_nav']:,.2f} on {stats['last_date']} "
-            + f"({_fmt_utc(stats['last_timestamp'])}). "
-            + "The dotted line is the morning execution NAV, shown only as a "
-            + "secondary reference."
-        )
-    elif not official_nav.empty:
-        st.info(
-            "Only one evening close NAV is recorded in this period. The next run "
-            "starts the account-value line."
-        )
-    else:
-        st.info("No account equity recorded yet -- the chart appears after the first run.")
+    # Value and cost side by side at a wide window, over the one period the page
+    # sets: neither chart is left to span 1700 pixels on its own. Each keeps its own
+    # caption below it, and both are drawn at the same height so the pair reads as
+    # one row.
+    value_col, cost_col = st.columns(2)
 
-    if not df_pnl.empty and "turnover_cost" in df_pnl.columns:
-        runs = df_pnl.copy()
-        runs["trade_date"] = pd.to_datetime(runs["trade_date"], errors="coerce")
-        runs = runs.dropna(subset=["trade_date"]).sort_values("trade_date")
-        if history_start is not None:
-            runs = runs[runs["trade_date"] >= pd.Timestamp(history_start)]
-        if runs.empty:
-            st.info("No turnover-cost rows in this period.")
-        else:
-            costs = runs["turnover_cost"].fillna(0.0).astype(float)
-            total_cost = float(costs.sum())
-            st.markdown(
-                "**Turnover cost per run.** Total over the period "
-                + f"${total_cost:,.2f} over {len(runs)} runs."
-            )
-            fig = go.Figure(go.Bar(
-                x=runs["trade_date"],
-                y=costs,
-                marker_color=NEUTRAL_COLOR,
-                hovertemplate="%{x|%Y-%m-%d}<br>cost %{y:,.2f}<extra></extra>",
-                name="Turnover cost",
+    with value_col:
+        if stats["n_navs"] >= 2:
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=window_nav["trade_date"],
+                y=window_nav["nav"].astype(float),
+                mode="lines+markers",
+                line=dict(color=BOOK_TOTAL_COLOR, width=2),
+                marker=dict(size=4),
+                name="Evening close NAV (official)",
+                customdata=[[_fmt_utc(ts)] for ts in window_nav["timestamp"]],
+                hovertemplate=(
+                    "%{x|%Y-%m-%d}<br>official NAV %{y:,.2f}<br>"
+                    "%{customdata[0]}<extra></extra>"
+                ),
             ))
+            if not df_pnl.empty and "live_nav" in df_pnl.columns:
+                morning = df_pnl.dropna(subset=["live_nav"]).copy()
+                morning["trade_date"] = pd.to_datetime(
+                    morning["trade_date"], errors="coerce"
+                )
+                morning = morning.dropna(subset=["trade_date"]).sort_values("trade_date")
+                if history_start is not None:
+                    morning = morning[morning["trade_date"] >= pd.Timestamp(history_start)]
+                if not morning.empty:
+                    fig.add_trace(go.Scatter(
+                        x=morning["trade_date"],
+                        y=morning["live_nav"].astype(float),
+                        mode="lines+markers",
+                        line=dict(color=NEUTRAL_COLOR, width=1.5, dash="dot"),
+                        marker=dict(size=3),
+                        name="Morning execution NAV (secondary)",
+                        hovertemplate=(
+                            "%{x|%Y-%m-%d}<br>morning NAV %{y:,.2f}"
+                            "<extra></extra>"
+                        ),
+                    ))
             fig.update_layout(
-                title="Turnover cost per run (same period)",
-                yaxis_title="",
-                showlegend=False,
+                title="Account value — official evening NAV",
+                yaxis_title="account equity",
             )
-            _plot(fig, height=260)
+            # The legend names the official and secondary lines; below the plot it
+            # cannot collide with the title at a narrow window.
+            _plot(fig, height=360, legend_below=True)
             st.caption(
-                "Cost is a drag on account value, not the result: a single-digit "
-                "dollar run (0 to 3, 0.00-0.02% of NAV) is normal. Aligned to the "
-                "same period as the other history charts."
+                "Official NAV is the last stored close, or the evening run's own NAV "
+                "until that close is published: "
+                + f"last ${stats['last_nav']:,.2f} on {stats['last_date']} "
+                + f"({_fmt_utc(stats['last_timestamp'])}). "
+                + "The dotted line is the morning execution NAV, shown only as a "
+                + "secondary reference."
             )
-    else:
-        st.info("No turnover-cost rows yet -- the cost chart appears after the first run.")
+        elif not official_nav.empty:
+            st.info(
+                "Only one evening close NAV is recorded in this period. The next run "
+                "starts the account-value line."
+            )
+        else:
+            st.info(
+                "No account equity recorded yet -- the chart appears after the first run."
+            )
+
+    with cost_col:
+        if not df_pnl.empty and "turnover_cost" in df_pnl.columns:
+            runs = df_pnl.copy()
+            runs["trade_date"] = pd.to_datetime(runs["trade_date"], errors="coerce")
+            runs = runs.dropna(subset=["trade_date"]).sort_values("trade_date")
+            if history_start is not None:
+                runs = runs[runs["trade_date"] >= pd.Timestamp(history_start)]
+            if runs.empty:
+                st.info("No turnover-cost rows in this period.")
+            else:
+                costs = runs["turnover_cost"].fillna(0.0).astype(float)
+                total_cost = float(costs.sum())
+                st.markdown(
+                    "**Turnover cost per run.** Total over the period "
+                    + f"${total_cost:,.2f} over {len(runs)} runs."
+                )
+                fig = go.Figure(go.Bar(
+                    x=runs["trade_date"],
+                    y=costs,
+                    marker_color=NEUTRAL_COLOR,
+                    hovertemplate="%{x|%Y-%m-%d}<br>cost %{y:,.2f}<extra></extra>",
+                    name="Turnover cost",
+                ))
+                fig.update_layout(
+                    title="Turnover cost per run (same period)",
+                    yaxis_title="",
+                    showlegend=False,
+                )
+                _plot(fig, height=360)
+                st.caption(
+                    "Cost is a drag on account value, not the result: a single-digit "
+                    "dollar run (0 to 3, 0.00-0.02% of NAV) is normal. Aligned to the "
+                    "same period as the other history charts."
+                )
+        else:
+            st.info(
+                "No turnover-cost rows yet -- the cost chart appears after the first run."
+            )
 
     # ---------------------------------------------------------------- Book P&L by sleeve
     _section("Book P&L by sleeve")
@@ -2180,7 +2224,6 @@ def render(
             # A real date axis with its own ticks. Without this a categorical
             # axis can still swallow the labels, which was the visible bug.
             timeline.update_xaxes(type="date", tickformat="%b %d", nticks=8)
-            _plot(timeline, height=380, legend_below=True)
 
             price = (
                 period.groupby("sleeve")["price_pnl"].sum()
@@ -2233,7 +2276,14 @@ def render(
                 yaxis_title="$ over the period",
                 barmode="group",
             )
-            _plot(bars, height=320, legend_below=True)
+            # The timeline and the period split are one row at a wide window: the
+            # question is where the result came from, and the bars answer the half the
+            # lines cannot. Each figure keeps its own axes inside its own column.
+            timeline_col, bars_col = st.columns(2)
+            with timeline_col:
+                _plot(timeline, height=360, legend_below=True)
+            with bars_col:
+                _plot(bars, height=360, legend_below=True)
 
             gap = float(
                 cumulative["book_total"].iloc[-1]

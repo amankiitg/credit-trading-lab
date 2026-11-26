@@ -36,7 +36,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 
-from dashboard import plotly_theme
+from dashboard import plotly_theme, theme
 from signals.etf_universe import ASSET_CLASS, UNIVERSE
 
 # The trend base the signal compares today's close against.
@@ -662,7 +662,7 @@ def ticker_figure(
             xanchor="right",
             yanchor="bottom",
             showarrow=False,
-            font=dict(size=9, color=NEUTRAL_COLOR),
+            font=dict(size=9, color=theme.MUTED),
         )
 
     notes: list[str] = []
@@ -687,7 +687,7 @@ def ticker_figure(
             x=0.5,
             y=0.5 if not history["has_price"] else 0.92 - 0.09 * i,
             showarrow=False,
-            font=dict(size=10, color=NEUTRAL_COLOR),
+            font=dict(size=10, color=theme.MUTED),
         )
 
     return fig
